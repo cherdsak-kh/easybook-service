@@ -1,0 +1,47 @@
+// Prisma schema — easy-book-app backend.
+// Domain models (User, Resource, Availability, Booking) are added in the
+// domain-modelling task; this sets up the datasource + client generator only.
+//
+// Prisma 7: the connection URL lives in prisma.config.ts (for the CLI/Migrate)
+// and is supplied to PrismaClient at runtime via a driver adapter (@prisma/adapter-pg).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// Which rich menu a user is assigned (matches the two designs in assets/richmenu).
+enum RichMenuType {
+  TYPE_1
+  TYPE_2
+}
+
+/// Whether a user may use the EasyBook app.
+enum AppAccess {
+  PENDING
+  ALLOWED
+  BLOCKED
+}
+
+/// A LINE user, created when they add the Official Account as a friend.
+/// Soft-deleted (deletedAt) on unfollow; restored on re-follow.
+model LineUser {
+  id            String       @id @default(cuid())
+  lineUserId    String       @unique
+  displayName   String?
+  pictureUrl    String?
+  statusMessage String?
+  language      String?
+  richMenuType  RichMenuType @default(TYPE_1)
+  access        AppAccess    @default(PENDING)
+  followedAt    DateTime     @default(now())
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  deletedAt     DateTime?
+
+  @@index([deletedAt])
+  @@map("line_users")
+}
