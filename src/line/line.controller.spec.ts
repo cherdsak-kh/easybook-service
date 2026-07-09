@@ -12,9 +12,7 @@ describe('LineController', () => {
     handleEvents.mockReset().mockResolvedValue(undefined);
     const module: TestingModule = await Test.createTestingModule({
       controllers: [LineController],
-      providers: [
-        { provide: LineWebhookService, useValue: { handleEvents } },
-      ],
+      providers: [{ provide: LineWebhookService, useValue: { handleEvents } }],
     })
       // The signature guard is unit-tested separately; bypass it here.
       .overrideGuard(LineSignatureGuard)

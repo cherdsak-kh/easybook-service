@@ -21,5 +21,13 @@
     "noImplicitAny": false,
     "strictBindCallApply": false,
     "noFallthroughCasesInSwitch": false
-  }
+  },
+
+  // Explicit, rather than relying on tsc's implicit `**/*` default. This is the set of
+  // files the IDE and `npm run typecheck` see. `test/**/*` is IN SCOPE on purpose:
+  // ts-jest cannot type-check it (isolatedModules above puts it in transpile-only mode,
+  // see ts-jest config-set.js -> ts-compiler.js), and tsconfig.build.json excludes it,
+  // so this config is the ONLY thing that type-checks the e2e specs. Do not exclude it.
+  "include": ["src/**/*", "test/**/*", "scripts/**/*", "prisma.config.ts"],
+  "exclude": ["node_modules", "dist"]
 }
