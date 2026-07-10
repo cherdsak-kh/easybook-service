@@ -8,7 +8,9 @@ describe('LineUserController', () => {
   const users = {
     setRichMenuType: jest.fn(),
     applyRichMenu: jest.fn(),
-    toDto: jest.fn((u) => ({ lineUserId: u.lineUserId })),
+    toDto: jest.fn((u: { lineUserId: string }) => ({
+      lineUserId: u.lineUserId,
+    })),
   };
 
   beforeEach(async () => {

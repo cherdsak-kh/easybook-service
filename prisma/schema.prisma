@@ -42,6 +42,76 @@ model LineUser {
   updatedAt     DateTime     @updatedAt
   deletedAt     DateTime?
 
+  /// Back-relation for SystemUser.lineUser (DD-5). VIRTUAL — adds no column to line_users.
+  /// Presence of a SystemUser here is a notification address, never an identity or a session.
+  systemUser SystemUser? @relation("SystemUserLineAccount")
+
   @@index([deletedAt])
   @@map("line_users")
+}
+
+/// Back-office operator role. Distinct from AppAccess (LINE consumer domain) by design.
+enum SystemRole {
+  SUPER_ADMIN
+  ADMIN
+  STAFF
+}
+
+/// A back-office operator. NOT a LINE end-customer — see LineUser.
+///
+/// Two INDEPENDENT lifecycle flags, never conflated (DD-4):
+///   isActive = false  -> temporary, reversible suspension. The user still exists.
+///   deletedAt != null -> soft deletion. The row is retained ONLY so the createdById audit
+///                        chain stays resolvable. Invisible to every API route.
+/// Both must be checked by SessionGuard and by login. See 02_design_log.md §1.1.
+model SystemUser {
+  id String @id @default(cuid())
+
+  /// Always stored lowercase + trimmed. Normalised in the DTO transform AND in the service.
+  /// Plain @unique spans soft-deleted rows: a deleted user's email is permanently burned (DD-6).
+  email String @unique
+
+  /// argon2id digest ("$argon2id$..."). Never selected into any DTO.
+  passwordHash String
+
+  name String
+  role SystemRole @default(STAFF)
+
+  /// Educational-context profile. Free text, NOT enums, by PO decision (DD-7).
+  /// e.g. "Teacher", "Admin Staff", "Director".
+  position String
+  /// e.g. "Computer Science", "Registrar's Office".
+  department String
+  /// Display only. Loosely validated (Thai formats + office extensions).
+  phoneNumber String?
+  /// https URL only. Rendered by the client; the backend NEVER fetches it.
+  profilePictureUrl String?
+
+  isActive    Boolean   @default(true)
+  lastLoginAt DateTime?
+
+  /// Soft delete (DD-4). NEVER exposed in any DTO. Set ONLY by DELETE /system-users/:id,
+  /// cleared ONLY by POST /system-users/:id/restore. Filter `deletedAt: null` when resolving
+  /// a user as an IDENTITY; never filter it when resolving createdById as HISTORY.
+  deletedAt DateTime?
+
+  /// Audit: which SUPER_ADMIN created this row. Null for the seeded first SUPER_ADMIN.
+  /// Resolve WITHOUT a deletedAt filter — a deleted creator must still resolve (DD-4).
+  createdById  String?
+  createdBy    SystemUser?  @relation("SystemUserCreatedBy", fields: [createdById], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  createdUsers SystemUser[] @relation("SystemUserCreatedBy")
+
+  /// Optional 1-to-1 link to a personal LINE account, for future admin notifications (DD-5).
+  /// FK -> LineUser.id (a cuid). NOT LineUser.lineUserId (the LINE-side "U..." identifier).
+  /// Nullable + @unique => at most one SystemUser per LineUser; many SystemUsers may have none.
+  /// NOT settable by ANY endpoint in this feature — absent from CreateSystemUserDto and
+  /// UpdateSystemUserDto alike, so forbidNonWhitelisted 400s any attempt. Grants no authentication.
+  lineUserId String?   @unique
+  lineUser   LineUser? @relation("SystemUserLineAccount", fields: [lineUserId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([createdById])
+  @@map("system_users")
 }

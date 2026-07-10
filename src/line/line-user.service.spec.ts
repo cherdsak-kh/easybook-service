@@ -35,7 +35,13 @@ describe('LineUserService', () => {
       displayName: 'Alice',
     });
 
-    const arg = lineUser.upsert.mock.calls[0][0];
+    const [arg] = lineUser.upsert.mock.calls[0] as [
+      {
+        where: Record<string, unknown>;
+        create: Record<string, unknown>;
+        update: Record<string, unknown>;
+      },
+    ];
     expect(arg.where).toEqual({ lineUserId: 'U123' });
     expect(arg.create.lineUserId).toBe('U123');
     expect(arg.create.displayName).toBe('Alice');
@@ -50,7 +56,9 @@ describe('LineUserService', () => {
     lineUser.updateMany.mockResolvedValue({ count: 1 });
     await service.softDeleteByLineUserId('U123');
 
-    const arg = lineUser.updateMany.mock.calls[0][0];
+    const [arg] = lineUser.updateMany.mock.calls[0] as [
+      { where: Record<string, unknown>; data: Record<string, unknown> },
+    ];
     expect(arg.where).toEqual({ lineUserId: 'U123', deletedAt: null });
     expect(arg.data.deletedAt).toBeInstanceOf(Date);
   });

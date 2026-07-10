@@ -32,7 +32,10 @@ describe('LineSignatureGuard', () => {
   });
 
   it('rejects a request with an invalid signature', () => {
-    const ctx = contextFor(Buffer.from('{"events":[]}'), 'not-a-valid-signature');
+    const ctx = contextFor(
+      Buffer.from('{"events":[]}'),
+      'not-a-valid-signature',
+    );
     expect(() => guard.canActivate(ctx)).toThrow(UnauthorizedException);
   });
 

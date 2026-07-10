@@ -7,7 +7,10 @@ import { LineWebhookService } from './line-webhook.service';
 describe('LineWebhookService', () => {
   let service: LineWebhookService;
   const line = { getProfile: jest.fn(), reply: jest.fn() };
-  const users = { upsertOnFollow: jest.fn(), softDeleteByLineUserId: jest.fn() };
+  const users = {
+    upsertOnFollow: jest.fn(),
+    softDeleteByLineUserId: jest.fn(),
+  };
 
   beforeEach(async () => {
     jest.clearAllMocks();

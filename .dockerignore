@@ -1,0 +1,37 @@
+# Never enters the build context, so it can never end up in ANY layer.
+
+node_modules
+dist
+coverage
+
+# Secrets — never baked into an image. Runtime config arrives via Infisical/env only.
+.env
+.env.*
+!.env.example
+!.env.staging.example
+
+# Tests / test-only source — excluded from the build context entirely; the `build` stage
+# only needs src/**/*.ts (non-spec) and prisma/. Keeping these out also means a stray COPY
+# in the Dockerfile can never accidentally ship a *.spec.ts into the final image.
+test
+**/*.spec.ts
+**/*.e2e-spec.ts
+
+# Planning / docs / repo metadata — not part of the runtime artifact.
+claude_planning
+.git
+.github
+.claude
+.agents
+*.md
+!README.md
+
+# Editor / OS cruft
+.vscode
+.idea
+*.log
+.DS_Store
+Thumbs.db
+
+# Local build/lint caches
+*.tsbuildinfo

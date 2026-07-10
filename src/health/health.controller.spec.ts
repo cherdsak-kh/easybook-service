@@ -1,16 +1,19 @@
+import { ServiceUnavailableException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
-import { PrismaService } from '../prisma/prisma.service';
+import { HealthResponseDto } from './dto/health-response.dto';
 import { HealthController } from './health.controller';
+import { HealthService } from './health.service';
 
 describe('HealthController', () => {
   let controller: HealthController;
-  const queryRaw = jest.fn();
+  const check = jest.fn();
 
   beforeEach(async () => {
-    queryRaw.mockReset();
+    check.mockReset();
+
     const module: TestingModule = await Test.createTestingModule({
       controllers: [HealthController],
-      providers: [{ provide: PrismaService, useValue: { $queryRaw: queryRaw } }],
+      providers: [{ provide: HealthService, useValue: { check } }],
     }).compile();
 
     controller = module.get<HealthController>(HealthController);
@@ -20,19 +23,30 @@ describe('HealthController', () => {
     expect(controller).toBeDefined();
   });
 
-  it('returns ok with uptime, timestamp and db "up" when the DB responds', async () => {
-    queryRaw.mockResolvedValue([{ '?column?': 1 }]);
-    const result = await controller.check();
-    expect(result.status).toBe('ok');
-    expect(typeof result.uptime).toBe('number');
-    expect(() => new Date(result.timestamp)).not.toThrow();
-    expect(result.db).toBe('up');
+  it('returns the readiness snapshot from the service (200 path)', async () => {
+    const snapshot: HealthResponseDto = {
+      status: 'ok',
+      uptime: 12.34,
+      timestamp: new Date().toISOString(),
+      db: 'up',
+      redis: 'up',
+    };
+    check.mockResolvedValue(snapshot);
+
+    await expect(controller.check()).resolves.toEqual(snapshot);
   });
 
-  it('reports db "down" when the DB probe fails', async () => {
-    queryRaw.mockRejectedValue(new Error('no connection'));
-    const result = await controller.check();
-    expect(result.status).toBe('ok');
-    expect(result.db).toBe('down');
+  it('propagates the service 503 so Nest maps it to Service Unavailable', async () => {
+    check.mockRejectedValue(
+      new ServiceUnavailableException({
+        status: 'error',
+        db: 'down',
+        redis: 'up',
+      }),
+    );
+
+    await expect(controller.check()).rejects.toBeInstanceOf(
+      ServiceUnavailableException,
+    );
   });
 });

@@ -30,7 +30,10 @@ export class LineService {
 
   // --- Messaging ---------------------------------------------------------
 
-  reply(replyToken: string, messages: messagingApi.Message[]): Promise<unknown> {
+  reply(
+    replyToken: string,
+    messages: messagingApi.Message[],
+  ): Promise<unknown> {
     return this.client.replyMessage({ replyToken, messages });
   }
 
@@ -44,7 +47,9 @@ export class LineService {
 
   // --- Rich menu management ---------------------------------------------
 
-  async createRichMenu(richMenu: messagingApi.RichMenuRequest): Promise<string> {
+  async createRichMenu(
+    richMenu: messagingApi.RichMenuRequest,
+  ): Promise<string> {
     const { richMenuId } = await this.client.createRichMenu(richMenu);
     return richMenuId;
   }
