@@ -27,6 +27,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Generate Prisma client
+        # Type-aware ESLint rules (no-unsafe-member-access, etc.) resolve Prisma enums/client
+        # methods as `any` without a generated client on disk. `prisma generate` itself never
+        # touches a live database, but Prisma 7's config file (prisma.config.ts) resolves
+        # DATABASE_URL eagerly and throws if it's unset — so a syntactically valid dummy value
+        # is enough here; no real database is required for this step.
+        run: npx prisma generate
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?schema=public
+
       - name: Lint
         run: npm run lint
 
