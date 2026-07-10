@@ -1,4 +1,5 @@
 name: CD (staging)
+run-name: CD - ${{ github.event.workflow_run.head_branch }} staging (by @${{ github.actor }}) -- ${{ github.event.workflow_run.head_commit.message }}
 
 # Fires only after CI (build-and-push) has completed successfully on master, so this workflow
 # never deploys an image that failed lint/test/audit or that never got pushed to GHCR.
