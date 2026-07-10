@@ -53,6 +53,15 @@ COPY . .
 # remove the `@prisma/client` runtime dependency itself, only its generated internals) — this
 # regenerates the client directly into the already-pruned `node_modules`, so it is the final
 # write and nothing afterward can remove it again.
+#
+# Prisma 7 eagerly resolves `prisma.config.ts`, which reads DATABASE_URL, and throws
+# PrismaConfigEnvError if it's unset — even though `prisma generate` never contacts a database
+# (same bug already worked around in .github/workflows/ci.yml). Both `prisma generate` calls
+# below need a value in scope. `ENV` here is intentionally build-stage-scoped: this `build`
+# stage is a throwaway intermediate (never tagged/pushed — only `runtime` and `migrator` are),
+# and `runtime`/`migrator` are separate `FROM node:20-alpine` stages that do NOT inherit any
+# `ENV` set here, so this dummy value never reaches a shipped image or `docker history` of one.
+ENV DATABASE_URL="postgresql://ci:ci@localhost:5432/ci?schema=public"
 RUN npx prisma generate \
     && npm run build \
     && npm prune --omit=dev \
