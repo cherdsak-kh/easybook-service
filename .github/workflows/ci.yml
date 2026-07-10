@@ -1,4 +1,5 @@
 name: CI
+run-name: CI - ${{ github.ref_name }} staging (by @${{ github.actor }}) -- ${{ github.event.head_commit.message }}
 
 # Test/lint (and audit) gate the Docker build+push — the build job only runs if `verify`
 # succeeds, and image push only happens on a push to master (never on a PR), never with `latest`.
