@@ -3,16 +3,19 @@
 # Multi-stage build for easybook-service (NestJS, port 3300).
 #
 # Targets:
-#   deps     - full dependency install (build tooling + prisma CLI), never shipped
-#   build    - compiles TypeScript, generates the Prisma client, prunes devDependencies
-#   migrator - standalone one-shot image: `prisma migrate deploy` only. Ships the `prisma`
-#              CLI (a devDependency) on purpose because the `runtime` target below deliberately
-#              does NOT. Built/pushed as its own tag (see .github/workflows/ci.yml) and run via
-#              `docker run --rm --network easybook-network ...` from the CD workflow, BEFORE the
-#              app container is (re)started. See docs/migration-safety-policy.md.
-#   runtime  - the image that actually serves traffic. Minimal: compiled dist/ + pruned
-#              production node_modules + the Infisical CLI. No devDependencies, no test files,
-#              no source .ts, no secrets baked in at build time.
+#   deps      - full dependency install (build tooling + prisma CLI), never shipped
+#   build     - compiles TypeScript, generates the Prisma client, prunes devDependencies
+#   infisical - fetches + checksum-verifies the standalone Infisical CLI binary ONCE; both
+#               `migrator` and `runtime` below `COPY --from=infisical` it rather than each
+#               re-downloading/re-installing it. Never shipped/tagged itself.
+#   migrator  - standalone one-shot image: `prisma migrate deploy` only. Ships the `prisma`
+#               CLI (a devDependency) on purpose because the `runtime` target below deliberately
+#               does NOT. Built/pushed as its own tag (see .github/workflows/ci.yml) and run via
+#               `docker run --rm --network easybook-network ...` from the CD workflow, BEFORE the
+#               app container is (re)started. See docs/migration-safety-policy.md.
+#   runtime   - the image that actually serves traffic. Minimal: compiled dist/ + pruned
+#               production node_modules + the Infisical CLI. No devDependencies, no test files,
+#               no source .ts, no secrets baked in at build time.
 #
 # Secrets: NOTHING is baked into any layer here. The runtime and migrator entrypoints both run
 # under `infisical run --`, which resolves the actual secrets (DATABASE_URL, SESSION_SECRET,
@@ -57,6 +60,44 @@ RUN npx prisma generate \
     && npx --yes prisma@${PRISMA_VERSION} generate
 
 # ---------------------------------------------------------------------------
+# infisical (shared; NOT the app image — just a fetch stage COPY'd from below)
+# ---------------------------------------------------------------------------
+# The `apk add infisical` package repo (artifacts-cli.infisical.com) started 404/403-ing
+# ("unable to select packages: infisical (no such package)"), breaking `build-and-push`. Fixed
+# by installing the official standalone binary directly from Infisical's GitHub Releases
+# (github.com/Infisical/cli — NOTE this is a separate repo from github.com/Infisical/infisical,
+# whose own releases don't carry CLI binary assets) instead of the apk repo.
+#
+# Deliberately NOT the `curl ... install.sh | bash` one-liner published in Infisical's docs:
+# that script lives on a mutable branch — an unpinned, unverified supply-chain dependency for
+# the exact binary that fetches our production secrets — and it assumes `bash` (Alpine ships
+# busybox `ash`, not `bash`) and working apk resolution (the very thing that's broken).
+#
+# Instead: download the version-PINNED release tarball, verify it against Infisical's
+# published `checksums.txt` for that release (fails the build on mismatch), extract, and
+# install to /usr/local/bin — all in one RUN layer so the tarball/checksum file never persist
+# in an image layer. curl + ca-certificates are only ever installed in THIS throwaway stage;
+# they never reach `migrator` or `runtime`. The binary itself is statically linked (verified:
+# `file` reports "statically linked", no glibc dependency), so it runs unmodified on musl/Alpine.
+FROM alpine:3.20 AS infisical
+# Pinned 2026-07-10 against github.com/Infisical/cli release v0.43.104 (latest at the time of
+# this fix). Confirmed to exist via the GitHub Releases API and verified end-to-end: downloaded
+# cli_0.43.104_linux_amd64.tar.gz, matched its sha256 against the release's checksums.txt, and
+# extracted a valid statically-linked linux/amd64 ELF binary. Bump this ARG (and re-verify the
+# checksum) to upgrade.
+ARG INFISICAL_VERSION=0.43.104
+WORKDIR /tmp
+RUN apk add --no-cache curl ca-certificates \
+    && curl -fsSLO "https://github.com/Infisical/cli/releases/download/v${INFISICAL_VERSION}/cli_${INFISICAL_VERSION}_linux_amd64.tar.gz" \
+    && curl -fsSLO "https://github.com/Infisical/cli/releases/download/v${INFISICAL_VERSION}/checksums.txt" \
+    && grep " cli_${INFISICAL_VERSION}_linux_amd64.tar.gz\$" checksums.txt > cli.sha256 \
+    && sha256sum -c cli.sha256 \
+    && tar xzf "cli_${INFISICAL_VERSION}_linux_amd64.tar.gz" infisical \
+    && mv infisical /usr/local/bin/infisical \
+    && chmod +x /usr/local/bin/infisical \
+    && rm -rf /tmp/*
+
+# ---------------------------------------------------------------------------
 # migrator (one-shot; NOT the app image)
 # ---------------------------------------------------------------------------
 FROM deps AS migrator
@@ -64,14 +105,12 @@ WORKDIR /app
 COPY prisma ./prisma
 COPY prisma.config.ts ./
 
-# Infisical CLI — same install pattern as `runtime` below. `infisical run --` resolves
-# DATABASE_URL at container-start time; that URL MUST resolve `postgres-sv` on the
+# Infisical CLI binary, built + checksum-verified once in the `infisical` stage above and
+# copied in here (no re-download, no apk, no curl/bash in this image). `infisical run --`
+# resolves DATABASE_URL at container-start time; that URL MUST resolve `postgres-sv` on the
 # `easybook-network` Docker network (this container is started with --network easybook-network
 # by the CD workflow), never `localhost` — see docs/migration-safety-policy.md.
-RUN apk add --no-cache curl bash \
-    && curl -1sLf 'https://artifacts-cli.infisical.com/setup.alpine.sh' | sh \
-    && apk add --no-cache infisical \
-    && apk del curl bash
+COPY --from=infisical /usr/local/bin/infisical /usr/local/bin/infisical
 
 ENTRYPOINT ["infisical", "run", "--"]
 CMD ["npx", "prisma", "migrate", "deploy"]
@@ -83,13 +122,11 @@ FROM node:20-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
-# Infisical CLI, installed and its transient install-time deps (curl, bash) removed in the
-# SAME layer so neither lingers in the final image. No token is present at build time — it
-# only arrives via `docker run -e INFISICAL_TOKEN=...` / compose `environment:` at runtime.
-RUN apk add --no-cache curl bash \
-    && curl -1sLf 'https://artifacts-cli.infisical.com/setup.alpine.sh' | sh \
-    && apk add --no-cache infisical \
-    && apk del curl bash
+# Infisical CLI binary, copied in from the shared `infisical` stage above (same
+# checksum-verified binary as `migrator`). No curl/bash/apk step, no transient tooling to
+# clean up, no token present at build time — INFISICAL_TOKEN only arrives via
+# `docker run -e INFISICAL_TOKEN=...` / compose `environment:` at container runtime.
+COPY --from=infisical /usr/local/bin/infisical /usr/local/bin/infisical
 
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
