@@ -73,7 +73,6 @@ jobs:
           username: ${{ secrets.STAGING_SSH_USER }}
           key: ${{ secrets.STAGING_SSH_KEY }}
           envs: IMAGE_TAG,GHCR_OWNER,INFISICAL_TOKEN,INFISICAL_PROJECT_ID,INFISICAL_ENV,GHCR_PULL_USER,GHCR_PULL_TOKEN
-          script_stop: true
           script: |
             set -euo pipefail
             cd ~/easybook-service
