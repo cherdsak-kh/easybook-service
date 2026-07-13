@@ -1,4 +1,8 @@
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import {
+  INestApplication,
+  RequestMethod,
+  ValidationPipe,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import cookieParser from 'cookie-parser';
 import type { Redis } from 'ioredis';
@@ -36,8 +40,13 @@ export function configureApp(app: INestApplication): void {
     credentials: true,
   });
 
-  // 2. Versioned API surface.
-  app.setGlobalPrefix(API_BASE_PATH.replace(/^\//, ''));
+  // 2. Versioned API surface. The root welcome banner (GET /) is excluded from the prefix so
+  //    it answers at the bare origin (http://localhost:3300/) instead of 404-ing; everything
+  //    else — /api/v1/health, /api/v1/line/webhook, etc. — stays under the prefix. `path: '/'`
+  //    with RequestMethod.GET is the reliable form for excluding the root path specifically.
+  app.setGlobalPrefix(API_BASE_PATH.replace(/^\//, ''), {
+    exclude: [{ path: '/', method: RequestMethod.GET }],
+  });
 
   // 3. cookie-parser — required by csrf-csrf.
   app.use(cookieParser());
