@@ -2,6 +2,7 @@ import { DynamicModule, Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerModule } from '@nestjs/throttler';
 import type { Redis } from 'ioredis';
+import { AppController } from './app.controller';
 import { AuthModule } from './auth/auth.module';
 import {
   LOGIN_IP_EMAIL_LIMIT,
@@ -75,5 +76,6 @@ const throttlerModule: DynamicModule = {
     SystemUsersModule,
     // Domain modules (ResourceModule, BookingModule, ...) are added in their own tasks.
   ],
+  controllers: [AppController],
 })
 export class AppModule {}
