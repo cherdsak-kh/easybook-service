@@ -9,7 +9,8 @@ import { SessionGuard } from './session.guard';
 const dbRow = {
   id: 'user-1',
   email: 'ada@easybook.local',
-  name: 'Ada Lovelace',
+  firstName: 'Ada',
+  lastName: 'Lovelace',
   role: SystemRole.SUPER_ADMIN,
   position: 'Director',
   department: 'IT',

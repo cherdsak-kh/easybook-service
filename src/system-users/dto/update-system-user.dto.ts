@@ -22,7 +22,7 @@ const noFieldDefined = (dto: object): boolean =>
   !Object.values(dto).some((v) => v !== undefined);
 
 /**
- * EXACTLY seven optional fields.
+ * EXACTLY eight optional fields.
  *
  * `password`, the password digest, `email`, `lineUserId`, `deletedAt`, `createdById`, `id`,
  * `lastLoginAt`, `createdAt` and `updatedAt` simply do not exist here, so the global
@@ -34,7 +34,7 @@ const noFieldDefined = (dto: object): boolean =>
  * Null semantics fall straight out of the decorator choice, with no service-layer branching,
  * because Prisma already treats `undefined` as *skip* and `null` as *set null*:
  *
- * - `@ValidateIf((_o, v) => v !== undefined)` on the five NOT NULL columns — **not**
+ * - `@ValidateIf((_o, v) => v !== undefined)` on the six NOT NULL columns — **not**
  *   `@IsOptional()`, which skips validation on `null` as well as `undefined` and would let
  *   `{"role": null}` reach a NOT NULL column and 500. `@ValidateIf` lets `null` fall through to
  *   `@IsEnum`/`@IsString`/`@IsBoolean`, producing the `400` AC-62 requires.
@@ -47,20 +47,28 @@ const noFieldDefined = (dto: object): boolean =>
 export class UpdateSystemUserDto {
   /**
    * DD-12: the empty-body constraint must be registered on a property, and it must read
-   * `Object.values(dto).some(v => v !== undefined)` — a key count is always 7 and thus useless.
+   * `Object.values(dto).some(v => v !== undefined)` — a key count is always 8 and thus useless.
    *
-   * `name`'s `@ValidateIf` therefore also has to admit the empty-body case: class-validator skips
-   * **every** validator on a property whose `@ValidateIf` returns false, `@AtLeastOneDefined`
+   * `firstName`'s `@ValidateIf` therefore also has to admit the empty-body case: class-validator
+   * skips **every** validator on a property whose `@ValidateIf` returns false, `@AtLeastOneDefined`
    * included, so a plain `v !== undefined` condition would silently let `{}` through.
    */
   @AtLeastOneDefined({ message: 'At least one field must be provided.' })
-  @ApiPropertyOptional({ example: 'Ada Lovelace', maxLength: 120 })
+  @ApiPropertyOptional({ example: 'Ada', maxLength: 120 })
   @ValidateIf((o: object, v: unknown) => v !== undefined || noFieldDefined(o))
   @Transform(trim)
   @IsString()
   @MinLength(1)
   @MaxLength(120)
-  name?: string;
+  firstName?: string;
+
+  @ApiPropertyOptional({ example: 'Lovelace', maxLength: 120 })
+  @ValidateIf((_o, v: unknown) => v !== undefined)
+  @Transform(trim)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(120)
+  lastName?: string;
 
   @ApiPropertyOptional({ example: 'Teacher', maxLength: 100 })
   @ValidateIf((_o, v: unknown) => v !== undefined)

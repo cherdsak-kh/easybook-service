@@ -83,7 +83,8 @@ export class SystemUsersService {
         data: {
           email: normaliseEmail(dto.email), // defence in depth; the DTO already normalised it
           passwordHash: digest,
-          name: dto.name,
+          firstName: dto.firstName,
+          lastName: dto.lastName,
           role: dto.role,
           position: dto.position,
           department: dto.department,
@@ -185,7 +186,8 @@ export class SystemUsersService {
         // the null semantics need no branching here. There is no code path in this method that
         // reads or writes the password digest.
         data: {
-          name: patch.name,
+          firstName: patch.firstName,
+          lastName: patch.lastName,
           position: patch.position,
           department: patch.department,
           phoneNumber: patch.phoneNumber,

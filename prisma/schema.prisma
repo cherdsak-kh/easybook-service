@@ -74,16 +74,17 @@ model SystemUser {
   /// argon2id digest ("$argon2id$..."). Never selected into any DTO.
   passwordHash String
 
-  name String
-  role SystemRole @default(STAFF)
+  firstName String
+  lastName  String
+  role      SystemRole @default(STAFF)
 
   /// Educational-context profile. Free text, NOT enums, by PO decision (DD-7).
   /// e.g. "Teacher", "Admin Staff", "Director".
-  position String
+  position          String
   /// e.g. "Computer Science", "Registrar's Office".
-  department String
+  department        String
   /// Display only. Loosely validated (Thai formats + office extensions).
-  phoneNumber String?
+  phoneNumber       String?
   /// https URL only. Rendered by the client; the backend NEVER fetches it.
   profilePictureUrl String?
 

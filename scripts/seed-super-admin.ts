@@ -77,7 +77,8 @@ async function main(): Promise<void> {
       create: {
         email,
         passwordHash,
-        name: 'EasyBook (Super Admin)',
+        firstName: 'EasyBook',
+        lastName: '(Super Admin)',
         role: SystemRole.SUPER_ADMIN,
         position,
         department,
