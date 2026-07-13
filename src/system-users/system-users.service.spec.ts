@@ -24,7 +24,8 @@ const ADMIN_ACTOR: Actor = { id: 'ad-1', role: SystemRole.ADMIN };
 const row = {
   id: 'sa-2',
   email: 'other@easybook.local',
-  name: 'Other Super Admin',
+  firstName: 'Other',
+  lastName: 'Super Admin',
   role: SystemRole.SUPER_ADMIN,
   position: 'Director',
   department: 'IT',
@@ -125,7 +126,8 @@ describe('SystemUsersService', () => {
     const dto = {
       email: 'Other@EasyBook.Local',
       password: 'a-long-enough-password',
-      name: 'Other Super Admin',
+      firstName: 'Other',
+      lastName: 'Super Admin',
       position: 'Director',
       department: 'IT',
     };
@@ -252,7 +254,7 @@ describe('SystemUsersService', () => {
       txFindFirst.mockResolvedValue(null);
 
       await expect(
-        service.update(SUPER_ADMIN_ACTOR, 'gone', { name: 'X' }),
+        service.update(SUPER_ADMIN_ACTOR, 'gone', { firstName: 'X' }),
       ).rejects.toThrow(NotFoundException);
       expect(txFindFirst).toHaveBeenCalledWith({
         where: { id: 'gone', deletedAt: null },
@@ -265,19 +267,20 @@ describe('SystemUsersService', () => {
       txFindFirst.mockResolvedValue({ id: 'ad-2', role: SystemRole.ADMIN });
 
       await expect(
-        service.update(ADMIN_ACTOR, 'ad-2', { name: 'X' }),
+        service.update(ADMIN_ACTOR, 'ad-2', { firstName: 'X' }),
       ).rejects.toThrow(ForbiddenException);
       expect(txUpdate).not.toHaveBeenCalled();
     });
 
     it('builds `data` field by field — exactly the seven DTO fields, never a spread (DD-13, AC-60)', async () => {
-      await service.update(SUPER_ADMIN_ACTOR, 'staff-1', { name: 'Ada' });
+      await service.update(SUPER_ADMIN_ACTOR, 'staff-1', { firstName: 'Ada' });
 
       const { data, select } = writeArgsOf(txUpdate);
       expect(Object.keys(data).sort()).toEqual([
         'department',
+        'firstName',
         'isActive',
-        'name',
+        'lastName',
         'phoneNumber',
         'position',
         'profilePictureUrl',
@@ -305,12 +308,12 @@ describe('SystemUsersService', () => {
       expect(data.phoneNumber).toBeNull();
       expect(data.profilePictureUrl).toBeNull();
       // Absent keys stay `undefined`, which Prisma omits from the UPDATE.
-      expect(data.name).toBeUndefined();
+      expect(data.firstName).toBeUndefined();
     });
 
     // DD-9 — the isolation level is scoped to invariant-threatening writes.
     it('runs a profile-only patch at DEFAULT isolation and skips the invariant count', async () => {
-      await service.update(SUPER_ADMIN_ACTOR, 'staff-1', { name: 'Ada' });
+      await service.update(SUPER_ADMIN_ACTOR, 'staff-1', { firstName: 'Ada' });
 
       expect(txOptionsOf()).toBeUndefined();
       expect(txCount).not.toHaveBeenCalled();
@@ -404,7 +407,7 @@ describe('SystemUsersService', () => {
     it('lets a genuine unexpected error through unchanged (no blanket 409)', async () => {
       $transaction.mockRejectedValue(new Error('disk on fire'));
       await expect(
-        service.update(SUPER_ADMIN_ACTOR, 'staff-1', { name: 'X' }),
+        service.update(SUPER_ADMIN_ACTOR, 'staff-1', { firstName: 'X' }),
       ).rejects.toThrow('disk on fire');
     });
 
@@ -413,7 +416,7 @@ describe('SystemUsersService', () => {
         new NotFoundException(SYSTEM_USER_NOT_FOUND),
       );
       await expect(
-        service.update(SUPER_ADMIN_ACTOR, 'x', { name: 'X' }),
+        service.update(SUPER_ADMIN_ACTOR, 'x', { firstName: 'X' }),
       ).rejects.toThrow(NotFoundException);
     });
   });

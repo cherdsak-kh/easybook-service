@@ -37,12 +37,19 @@ export class CreateSystemUserDto {
   @MaxLength(128)
   password!: string;
 
-  @ApiProperty({ example: 'Ada Lovelace', maxLength: 120 })
+  @ApiProperty({ example: 'Ada', maxLength: 120 })
   @Transform(trim)
   @IsString()
   @MinLength(1)
   @MaxLength(120)
-  name!: string;
+  firstName!: string;
+
+  @ApiProperty({ example: 'Lovelace', maxLength: 120 })
+  @Transform(trim)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(120)
+  lastName!: string;
 
   @ApiPropertyOptional({ enum: SystemRole, default: SystemRole.STAFF })
   @IsOptional()

@@ -14,8 +14,11 @@ export class SystemUserResponseDto {
   @ApiProperty({ example: 'admin@easybook.local' })
   email!: string;
 
-  @ApiProperty({ example: 'Ada Lovelace' })
-  name!: string;
+  @ApiProperty({ example: 'Ada' })
+  firstName!: string;
+
+  @ApiProperty({ example: 'Lovelace' })
+  lastName!: string;
 
   @ApiProperty({ enum: SystemRole, example: SystemRole.STAFF })
   role!: SystemRole;

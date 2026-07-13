@@ -59,15 +59,15 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     const passwordHash = await new PasswordService().hash(PASSWORD);
     const base = { passwordHash, position: 'Director', department: 'IT' };
 
-    for (const [email, name, role] of [
-      [SUPER, 'E2E Super', SystemRole.SUPER_ADMIN],
-      [SUPER_2, 'E2E Super Two', SystemRole.SUPER_ADMIN],
-      [ADMIN, 'E2E Admin', SystemRole.ADMIN],
-      [ADMIN_2, 'E2E Admin Two', SystemRole.ADMIN],
-      [STAFF, 'E2E Staff', SystemRole.STAFF],
-    ] as Array<[string, string, SystemRole]>) {
+    for (const [email, firstName, lastName, role] of [
+      [SUPER, 'E2E', 'Super', SystemRole.SUPER_ADMIN],
+      [SUPER_2, 'E2E', 'Super Two', SystemRole.SUPER_ADMIN],
+      [ADMIN, 'E2E', 'Admin', SystemRole.ADMIN],
+      [ADMIN_2, 'E2E', 'Admin Two', SystemRole.ADMIN],
+      [STAFF, 'E2E', 'Staff', SystemRole.STAFF],
+    ] as Array<[string, string, string, SystemRole]>) {
       const created = await prisma.systemUser.create({
-        data: { email, name, role, ...base },
+        data: { email, firstName, lastName, role, ...base },
         select: { id: true },
       });
       ids[email] = created.id;
@@ -110,7 +110,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     await anon
       .patch(url(`/system-users/${id}`))
       .set('x-csrf-token', token)
-      .send({ name: 'X' })
+      .send({ firstName: 'X' })
       .expect(401);
     await anon
       .delete(url(`/system-users/${id}`))
@@ -131,7 +131,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     await agent
       .patch(url(`/system-users/${id}`))
       .set('x-csrf-token', token)
-      .send({ name: 'X' })
+      .send({ firstName: 'X' })
       .expect(403);
     await agent
       .delete(url(`/system-users/${id}`))
@@ -247,7 +247,8 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     const newUser = {
       email: `${PREFIX}created@easybook.local`,
       password: 'a-long-enough-password',
-      name: 'Created User',
+      firstName: 'Created',
+      lastName: 'User',
       position: 'Teacher',
       department: 'Computer Science',
     };
@@ -352,14 +353,14 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         await agent
           .patch(url(`/system-users/${ids[target]}`))
           .set('x-csrf-token', token)
-          .send({ name: 'Renamed' })
+          .send({ firstName: 'Renamed' })
           .expect(403);
 
         const row = await prisma.systemUser.findUnique({
           where: { id: ids[target] },
-          select: { name: true },
+          select: { firstName: true },
         });
-        expect(row?.name).not.toBe('Renamed');
+        expect(row?.firstName).not.toBe('Renamed');
       }
     });
 
@@ -368,7 +369,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       await agent
         .patch(url(`/system-users/${ids[ADMIN]}`))
         .set('x-csrf-token', token)
-        .send({ name: 'Self Rename' })
+        .send({ firstName: 'Self Rename' })
         .expect(403);
     });
 
@@ -404,11 +405,11 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       await agent
         .patch(url(`/system-users/${ids[STAFF]}`))
         .set('x-csrf-token', token)
-        .send({ name: 'Renamed Staff', isActive: false })
+        .send({ firstName: 'Renamed Staff', isActive: false })
         .expect(200)
         .expect((res) => {
           expect(res.body).toMatchObject({
-            name: 'Renamed Staff',
+            firstName: 'Renamed Staff',
             isActive: false,
           });
         });
@@ -447,7 +448,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         .patch(url(`/system-users/${ids[SUPER]}`))
         .set('x-csrf-token', token)
         .send({
-          name: 'Ada',
+          firstName: 'Ada',
           position: 'Director',
           department: 'IT',
           phoneNumber: '02-123-4567',
@@ -455,7 +456,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         .expect(200)
         .expect((res) =>
           expect(res.body).toMatchObject({
-            name: 'Ada',
+            firstName: 'Ada',
             phoneNumber: '02-123-4567',
           }),
         );
@@ -481,7 +482,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         'createdAt',
         'updatedAt',
       ]) {
-        await patch({ name: 'X', [key]: 'anything' }).expect(400);
+        await patch({ firstName: 'X', [key]: 'anything' }).expect(400);
       }
     });
 
@@ -533,7 +534,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       await agent
         .patch(target)
         .set('x-csrf-token', token)
-        .send({ name: null })
+        .send({ firstName: null })
         .expect(400);
     });
 
@@ -541,7 +542,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       const { agent } = await login(SUPER);
       await agent
         .patch(url(`/system-users/${ids[STAFF]}`))
-        .send({ name: 'X' })
+        .send({ firstName: 'X' })
         .expect(403);
     });
 
@@ -554,7 +555,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       await agent
         .patch(url(`/system-users/${ids[STAFF]}`))
         .set('x-csrf-token', token)
-        .send({ name: 'X' })
+        .send({ firstName: 'X' })
         .expect(404);
     });
   });
@@ -634,7 +635,8 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         .send({
           email: STAFF,
           password: 'a-long-enough-password',
-          name: 'Impostor',
+          firstName: 'Impostor',
+          lastName: 'User',
           position: 'p',
           department: 'd',
         })

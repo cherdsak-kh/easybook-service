@@ -60,21 +60,30 @@ describe('Auth — /auth/system (e2e)', () => {
       data: [
         {
           email: SUPER,
-          name: 'E2E Super',
+          firstName: 'E2E',
+          lastName: 'Super',
           role: SystemRole.SUPER_ADMIN,
           ...base,
         },
-        { email: STAFF, name: 'E2E Staff', role: SystemRole.STAFF, ...base },
+        {
+          email: STAFF,
+          firstName: 'E2E',
+          lastName: 'Staff',
+          role: SystemRole.STAFF,
+          ...base,
+        },
         {
           email: SUSPENDED,
-          name: 'E2E Suspended',
+          firstName: 'E2E',
+          lastName: 'Suspended',
           role: SystemRole.STAFF,
           isActive: false,
           ...base,
         },
         {
           email: DELETED,
-          name: 'E2E Deleted',
+          firstName: 'E2E',
+          lastName: 'Deleted',
           role: SystemRole.STAFF,
           deletedAt: new Date(),
           ...base,
@@ -204,7 +213,8 @@ describe('Auth — /auth/system (e2e)', () => {
       expect(cookie).toContain('Path=/');
       expect(res.body).toMatchObject({
         email: SUPER,
-        name: 'E2E Super',
+        firstName: 'E2E',
+        lastName: 'Super',
         role: SystemRole.SUPER_ADMIN,
       });
       expect((res.body as { id: string }).id).toBeTruthy();
@@ -355,11 +365,12 @@ describe('Auth — /auth/system (e2e)', () => {
           'createdAt',
           'department',
           'email',
+          'firstName',
           'id',
           'isActive',
           'lastLoginAt',
+          'lastName',
           'lineUserId',
-          'name',
           'phoneNumber',
           'position',
           'profilePictureUrl',
@@ -416,7 +427,8 @@ describe('Auth — /auth/system (e2e)', () => {
         .send({
           email: `${PREFIX}new@easybook.local`,
           password: 'a-long-enough-password',
-          name: 'Nope',
+          firstName: 'No',
+          lastName: 'Pe',
           position: 'p',
           department: 'd',
         })
@@ -430,7 +442,8 @@ describe('Auth — /auth/system (e2e)', () => {
         .send({
           email: `${PREFIX}new2@easybook.local`,
           password: 'a-long-enough-password',
-          name: 'Nope',
+          firstName: 'No',
+          lastName: 'Pe',
           position: 'p',
           department: 'd',
         })

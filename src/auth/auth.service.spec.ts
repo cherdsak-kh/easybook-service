@@ -26,7 +26,8 @@ const IP = '203.0.113.7';
 const activeUser = {
   id: 'user-1',
   email: 'ada@easybook.local',
-  name: 'Ada Lovelace',
+  firstName: 'Ada',
+  lastName: 'Lovelace',
   role: SystemRole.ADMIN,
   passwordHash: '$argon2id$real',
   isActive: true,
@@ -65,7 +66,8 @@ describe('AuthService', () => {
       ).resolves.toEqual({
         id: 'user-1',
         email: 'ada@easybook.local',
-        name: 'Ada Lovelace',
+        firstName: 'Ada',
+        lastName: 'Lovelace',
         role: SystemRole.ADMIN,
       });
       expect(verify).toHaveBeenCalledWith('$argon2id$real', 'correct');

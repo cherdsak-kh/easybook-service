@@ -41,7 +41,7 @@ describe('UpdateSystemUserDto (through the global ValidationPipe)', () => {
       ['createdAt', '2026-07-08T00:00:00.000Z'],
       ['updatedAt', '2026-07-08T00:00:00.000Z'],
     ])('rejects a body containing `%s`', async (key, value) => {
-      const messages = await messagesOf({ name: 'Ada', [key]: value });
+      const messages = await messagesOf({ firstName: 'Ada', [key]: value });
       expect(messages.join(' ')).toContain(`property ${key} should not exist`);
     });
   });
@@ -56,8 +56,8 @@ describe('UpdateSystemUserDto (through the global ValidationPipe)', () => {
     await expect(validate({ isActive: false })).resolves.toMatchObject({
       isActive: false,
     });
-    await expect(validate({ name: 'Ada' })).resolves.toMatchObject({
-      name: 'Ada',
+    await expect(validate({ firstName: 'Ada' })).resolves.toMatchObject({
+      firstName: 'Ada',
     });
   });
 
@@ -71,7 +71,14 @@ describe('UpdateSystemUserDto (through the global ValidationPipe)', () => {
       },
     );
 
-    it.each(['name', 'position', 'department', 'role', 'isActive'])(
+    it.each([
+      'firstName',
+      'lastName',
+      'position',
+      'department',
+      'role',
+      'isActive',
+    ])(
       'rejects an explicit null on the NOT NULL column `%s` with a 400, not a 403',
       async (key) => {
         await expect(messagesOf({ [key]: null })).resolves.toEqual(
@@ -86,7 +93,7 @@ describe('UpdateSystemUserDto (through the global ValidationPipe)', () => {
     });
 
     it('leaves absent keys `undefined` so Prisma omits them from the UPDATE', async () => {
-      const dto = await validate({ name: 'Ada' });
+      const dto = await validate({ firstName: 'Ada' });
       expect(dto.position).toBeUndefined();
       expect(dto.role).toBeUndefined();
       expect(dto.isActive).toBeUndefined();
@@ -96,11 +103,11 @@ describe('UpdateSystemUserDto (through the global ValidationPipe)', () => {
 
   describe('field validation', () => {
     it('trims strings before validating, so "   " cannot satisfy a NOT NULL column', async () => {
-      await expect(validate({ name: '  Ada  ' })).resolves.toMatchObject({
-        name: 'Ada',
+      await expect(validate({ firstName: '  Ada  ' })).resolves.toMatchObject({
+        firstName: 'Ada',
       });
-      await expect(messagesOf({ name: '   ' })).resolves.toEqual(
-        expect.arrayContaining([expect.stringContaining('name')]),
+      await expect(messagesOf({ firstName: '   ' })).resolves.toEqual(
+        expect.arrayContaining([expect.stringContaining('firstName')]),
       );
     });
 

@@ -11,7 +11,8 @@ import { SystemUserResponseDto } from './dto/system-user-response.dto';
 export const PUBLIC_FIELDS = {
   id: true,
   email: true,
-  name: true,
+  firstName: true,
+  lastName: true,
   role: true,
   position: true,
   department: true,
@@ -33,7 +34,8 @@ export function toSystemUserDto(row: PublicSystemUser): SystemUserResponseDto {
   return {
     id: row.id,
     email: row.email,
-    name: row.name,
+    firstName: row.firstName,
+    lastName: row.lastName,
     role: row.role,
     position: row.position,
     department: row.department,
