@@ -16,9 +16,15 @@ import { isCookieSecure, resolveSameSite } from '../config/env.validation';
  * cookie, so there is no ambient authority for CSRF to protect; its authenticity is proven by
  * `LineSignatureGuard`'s HMAC over the raw body. Requiring a CSRF token there would simply break
  * the integration (AC-18).
+ *
+ * `POST /line-users/register` is a stateless, bearer-authenticated (LINE ID token) LIFF-client call
+ * with no cookie and no ambient authority, so the double-submit CSRF that protects the cookie-session
+ * admin surface is irrelevant to it (same reasoning as the webhook). `GET /line-users/status` is a
+ * GET and already CSRF-safe via `ignoredMethods`.
  */
 export const CSRF_EXEMPT_PATHS: readonly string[] = [
   `${API_BASE_PATH}/line/webhook`,
+  `${API_BASE_PATH}/line-users/register`,
 ];
 
 export const CSRF_COOKIE_NAME = 'eb.csrf';

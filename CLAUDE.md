@@ -86,8 +86,12 @@ importing `PrismaModule`. Prisma 7 specifics:
   menus are created/uploaded by `scripts/setup-rich-menu.ts` (run manually via
   `npm run line:setup-richmenu`); the images live in `assets/richmenu/`. If you change a menu's
   name or dimensions in the setup script, update `RICH_MENU_SPECS` to match.
-- `LineUserController`'s rich-menu endpoint is explicitly unauthenticated for now (see the
-  code comment) — don't assume auth exists elsewhere in this module either.
+- Manual rich-menu switching (the former standalone `PATCH /line/users/:lineUserId/rich-menu`
+  route + its `LineUserController`) was **removed** — it was an unauthenticated access-control
+  bypass and a second uncontrolled writer to derived state. The rich menu is now driven from a
+  user's `access` via `LineUserService.updateAccess` (`ALLOWED → TYPE_2`, else `TYPE_1`), reusing
+  the still-present `setRichMenuType` / `applyRichMenu` internals. See
+  `claude_planning/20260714_1742_line_user_registration/`.
 
 **Auth** (`src/auth/`, `src/system-users/`, `src/session/`, `src/csrf/`, `src/redis/`) — the
 back-office (`SystemUser`) surface. LINE end-customers (`LineUser`) remain unauthenticated and the

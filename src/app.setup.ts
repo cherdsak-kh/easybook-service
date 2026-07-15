@@ -35,8 +35,13 @@ export function configureApp(app: INestApplication): void {
 
   // 1. CORS first: preflight must not be intercepted, and error responses must carry CORS headers.
   //    With cookie sessions + `credentials: true` the allowlist is a security control, never `*`.
+  //    `CORS_ORIGIN` may be a single origin or a comma-separated list (e.g. the Vite dev server
+  //    plus a tunnel used for on-device LIFF testing); a list becomes an array of trimmed origins.
+  const corsOrigin = config.get<string>('CORS_ORIGIN', 'http://localhost:2200');
   app.enableCors({
-    origin: config.get<string>('CORS_ORIGIN', 'http://localhost:2200'),
+    origin: corsOrigin.includes(',')
+      ? corsOrigin.split(',').map((origin) => origin.trim())
+      : corsOrigin,
     credentials: true,
   });
 

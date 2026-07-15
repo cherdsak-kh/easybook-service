@@ -1,5 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { AppAccess, RichMenuType } from '@prisma/client';
+import { LineUserRegistrationSummaryDto } from './line-user-registration-summary.dto';
 
 /** Public view of a LINE user (source schema for the OpenAPI spec). */
 export class LineUserResponseDto {
@@ -30,4 +31,12 @@ export class LineUserResponseDto {
 
   @ApiProperty({ example: '2026-07-07T10:00:00.000Z' })
   followedAt!: string;
+
+  @ApiProperty({
+    type: LineUserRegistrationSummaryDto,
+    nullable: true,
+    description:
+      "The user's registration summary, or null for a follower who never submitted the form.",
+  })
+  registration!: LineUserRegistrationSummaryDto | null;
 }

@@ -47,6 +47,18 @@ export function validateEnv(
     errors.push('REDIS_URL is required.');
   }
 
+  // 1b. LINE Login channel id — the `aud` an ID token is minted for (LineIdTokenGuard). DISTINCT
+  //     from the Messaging API channel (LINE_CHANNEL_ACCESS_TOKEN/_SECRET). When present in any
+  //     environment it must be the numeric Login channel id (digits only); it is required in
+  //     production (§2.4). In dev/test the guard throws a request-time 500 if unset, so a developer
+  //     not exercising LINE auth still boots — mirroring LineService's stance on the Messaging token.
+  const lineLoginChannelId = str(raw, 'LINE_LOGIN_CHANNEL_ID');
+  if (lineLoginChannelId !== undefined && !/^\d+$/.test(lineLoginChannelId)) {
+    errors.push(
+      'LINE_LOGIN_CHANNEL_ID must be a numeric channel id (digits only).',
+    );
+  }
+
   const sessionSecret = str(raw, 'SESSION_SECRET');
   const csrfSecret = str(raw, 'CSRF_SECRET');
   const cookieSecureRaw = str(raw, 'SESSION_COOKIE_SECURE');
@@ -86,6 +98,11 @@ export function validateEnv(
       errors.push(
         'CORS_ORIGIN must be an explicit origin in production (never "*").',
       );
+    }
+
+    // The LINE-consumer auth surface must not silently 500 in production.
+    if (!lineLoginChannelId) {
+      errors.push('LINE_LOGIN_CHANNEL_ID is required in production.');
     }
   }
 

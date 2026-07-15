@@ -20,7 +20,10 @@ enum RichMenuType {
 }
 
 /// Whether a user may use the EasyBook app.
+/// `UNREGISTERED` is the "zero" state a fresh follower lands on (before submitting the
+/// registration form); it is deliberately the first value and the default on LineUser.
 enum AppAccess {
+  UNREGISTERED
   PENDING
   ALLOWED
   BLOCKED
@@ -36,7 +39,7 @@ model LineUser {
   statusMessage String?
   language      String?
   richMenuType  RichMenuType @default(TYPE_1)
-  access        AppAccess    @default(PENDING)
+  access        AppAccess    @default(UNREGISTERED)
   followedAt    DateTime     @default(now())
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
@@ -46,8 +49,46 @@ model LineUser {
   /// Presence of a SystemUser here is a notification address, never an identity or a session.
   systemUser SystemUser? @relation("SystemUserLineAccount")
 
+  /// Back-relation for the 1:1 registration a LINE user submits to move UNREGISTERED -> PENDING.
+  /// VIRTUAL — adds no column to line_users. Nullable: a follower who never registered has none.
+  registration LineUserRegistration? @relation("LineUserToRegistration")
+
   @@index([deletedAt])
   @@map("line_users")
+}
+
+/// Personnel identity a LINE end-user submits to move from UNREGISTERED -> PENDING.
+/// 1:1 with LineUser. Holds PDPA-governed PII (real name, university ID, phone).
+model LineUserRegistration {
+  id String @id @default(cuid())
+
+  /// FK -> LineUser.id (a cuid), NOT LineUser.lineUserId (the "U…" string). Same-name footgun as
+  /// SystemUser.lineUserId — this is the cuid PK, the notification/identity target row. @unique
+  /// makes the relation 1:1: one registration per LineUser.
+  lineUserId String   @unique
+  lineUser   LineUser @relation("LineUserToRegistration", fields: [lineUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  firstName String
+  lastName  String
+
+  /// University student/staff ID. Globally @unique (A-4): a university ID identifies one person, so
+  /// two registrations sharing an ID is a data error the DB rejects (P2002 -> 409 in the endpoint).
+  studentStaffId String @unique
+
+  /// Loosely validated in the DTO (Thai formats), mirroring SystemUser.phoneNumber. Stored as given.
+  phone      String
+  department String // free text (A-5 / DD-7)
+  role       String // free text (A-5 / DD-7), e.g. "Student" / "Staff" / "Teacher"
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Soft-delete parity column, reserved for a future right-to-erasure path. THIS feature never
+  /// sets it and never cascades it from LineUser unfollow (registration persists across re-follow).
+  deletedAt DateTime?
+
+  @@index([deletedAt])
+  @@map("line_user_registrations")
 }
 
 /// Back-office operator role. Distinct from AppAccess (LINE consumer domain) by design.

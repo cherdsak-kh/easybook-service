@@ -32,10 +32,10 @@ import { LineUserService } from './line-user.service';
 /**
  * Back-office management of LINE end-users. Route prefix: `/api/v1/line-users`.
  *
- * NOTE — this is DISTINCT from `LineUserController` (`/line/users/:lineUserId/rich-menu`): that one
- * is unauthenticated by design and keyed on the LINE-side `lineUserId`, whereas this resource is
- * session-guarded (`SUPER_ADMIN`/`ADMIN` only) and keyed on the cuid `LineUser.id`. The two
- * "line users" paths are intentionally separate — see 02_design_log.md §0 (Q-1).
+ * Session-guarded (`SUPER_ADMIN`/`ADMIN` only) and keyed on the cuid `LineUser.id`. The former
+ * standalone `PATCH /line/users/:lineUserId/rich-menu` route was removed — rich-menu switching is
+ * now derived from `access` via `LineUserService.updateAccess` (see
+ * claude_planning/20260714_1742_line_user_registration/).
  *
  * `@Roles(...)` is the sole authorization gate here: unlike `/system-users`, this resource has no
  * target-dependent policy (approve/block is a straight write of one field), so no policy file exists.

@@ -138,6 +138,12 @@ async function bootstrap() {
         // The security-scheme name referenced by @ApiCookieAuth('session').
         'session',
       )
+      // The LINE ID token (Bearer) that authenticates the LIFF-client endpoints
+      // (`/line-users/register`, `/line-users/status`); referenced by @ApiBearerAuth().
+      .addBearerAuth(
+        { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
+        'bearer',
+      )
       .build();
     const document = SwaggerModule.createDocument(app, swaggerConfig);
     SwaggerModule.setup('docs', app, document);
