@@ -5,6 +5,7 @@ import request from 'supertest';
 import type { App } from 'supertest/types';
 import { PasswordService } from '../src/auth/password.service';
 import { API_BASE_PATH } from '../src/common/api.constants';
+import { LineService } from '../src/line/line.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import {
   clearThrottleCounters,
@@ -27,9 +28,24 @@ const STAFF = `${SU_PREFIX}staff@easybook.local`;
 
 const url = (path: string) => `${API_BASE_PATH}${path}`;
 
+// The exact status-change push copy (must match ACCESS_NOTIFICATION_MESSAGES in the service).
+const ALLOWED_MSG =
+  'ยินดีด้วย! บัญชีของคุณได้รับการอนุมัติการใช้งานเรียบร้อยแล้ว คุณสามารถกดปุ่มจองคิวที่เมนูด้านล่างเพื่อทำรายการได้ทันทีครับ 🎉';
+const BLOCKED_MSG =
+  'ขออภัย บัญชีการใช้งานของคุณถูกระงับสิทธิ์ชั่วคราวโดยผู้ดูแลระบบ หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่สถาบัน';
+
 interface Session {
   agent: request.Agent;
   token: string;
+}
+
+interface RegistrationSummary {
+  firstName: string;
+  lastName: string;
+  studentStaffId: string;
+  phone: string;
+  department: string;
+  role: string;
 }
 
 interface LineUserBody {
@@ -38,6 +54,7 @@ interface LineUserBody {
   displayName: string | null;
   access: AppAccess;
   followedAt: string;
+  registration: RegistrationSummary | null;
 }
 
 interface ListBody {
@@ -84,6 +101,7 @@ describe('LINE Users management (e2e)', () => {
   let app: INestApplication<App>;
   let prisma: PrismaService;
   let redis: Redis;
+  let pushSpy: jest.SpyInstance;
 
   const luIds: Record<string, string> = {};
   const server = () => app.getHttpServer();
@@ -135,6 +153,20 @@ describe('LINE Users management (e2e)', () => {
       });
       luIds[f.lineUserId] = created.id;
     }
+
+    // The ALLOWED fixture carries a registration so the list-embed can be asserted; the others
+    // deliberately have none (registration: null in the row).
+    await prisma.lineUserRegistration.create({
+      data: {
+        lineUserId: luIds[`${LU_PREFIX}allowed`],
+        firstName: 'Bob',
+        lastName: 'Allowed',
+        studentStaffId: `${LU_PREFIX}stid-allowed`,
+        phone: '081-000-0000',
+        department: 'Engineering',
+        role: 'Staff',
+      },
+    });
   };
 
   beforeAll(async () => {
@@ -142,6 +174,14 @@ describe('LINE Users management (e2e)', () => {
     prisma = prismaOf(app);
     redis = redisOf(app);
     await waitForRedis(redis);
+
+    // updateAccess now applies the rich menu on LINE. Stub the LINE calls so the PATCH tests never
+    // hit the real Messaging API — the switch behaviour is unit-tested; here we only need 200s.
+    const line = app.get(LineService);
+    jest.spyOn(line, 'findRichMenuId').mockResolvedValue('rm-e2e');
+    jest.spyOn(line, 'linkRichMenuToUser').mockResolvedValue(undefined);
+    // Best-effort push on access change — stub it so the PATCH tests never hit the real Messaging API.
+    pushSpy = jest.spyOn(line, 'push').mockResolvedValue(undefined);
   }, 60_000);
 
   beforeEach(async () => {
@@ -256,6 +296,32 @@ describe('LINE Users management (e2e)', () => {
       await agent.get(url('/line-users?access=NOPE')).expect(400);
     });
 
+    it('AC-B11 — each row embeds the registration summary (or null), including the phone', async () => {
+      const { agent } = await login(ADMIN);
+      const res = await agent
+        .get(url('/line-users?search=Qwx&limit=100'))
+        .expect(200);
+      const rows = (res.body as ListBody).data;
+
+      const allowed = rows.find((u) => u.lineUserId === `${LU_PREFIX}allowed`);
+      expect(allowed?.registration).toEqual({
+        firstName: 'Bob',
+        lastName: 'Allowed',
+        studentStaffId: `${LU_PREFIX}stid-allowed`,
+        phone: '081-000-0000',
+        department: 'Engineering',
+        role: 'Staff',
+      });
+
+      // A follower with no registration renders gracefully as null (AC-F7 backend half).
+      const pending = rows.find((u) => u.lineUserId === `${LU_PREFIX}pending`);
+      expect(pending?.registration).toBeNull();
+
+      // PO decision reversal: admins now see the phone to vet registrations.
+      expect(allowed?.registration?.phone).toBe('081-000-0000');
+      expect(JSON.stringify(res.body)).toContain('081-000-0000');
+    });
+
     it('AC-B6 — a soft-deleted LINE user never appears in data', async () => {
       const { agent } = await login(ADMIN);
       const res = await agent
@@ -352,6 +418,44 @@ describe('LINE Users management (e2e)', () => {
       await patch({ access: 'MAYBE' }).expect(400);
       await patch({ access: AppAccess.ALLOWED, note: 'x' }).expect(400);
       await patch({}).expect(400);
+    });
+
+    it('pushes the exact status copy to the LINE U… id, and a push failure does not 500 the PATCH', async () => {
+      const { agent, token } = await login(ADMIN);
+      const lineUserId = `${LU_PREFIX}pending`;
+
+      pushSpy.mockClear();
+      pushSpy.mockResolvedValue(undefined);
+      await agent
+        .patch(target())
+        .set('x-csrf-token', token)
+        .send({ access: AppAccess.ALLOWED })
+        .expect(200);
+
+      // Pushed to the LINE-side U… id (the fixture's lineUserId), NOT the cuid.
+      expect(pushSpy).toHaveBeenCalledWith(lineUserId, [
+        { type: 'text', text: ALLOWED_MSG },
+      ]);
+
+      // Best-effort: even when the push rejects, the PATCH still succeeds (no 500/502) and the
+      // access change persists.
+      pushSpy.mockClear();
+      pushSpy.mockRejectedValueOnce(new Error('user blocked the bot'));
+      const blocked = await agent
+        .patch(target())
+        .set('x-csrf-token', token)
+        .send({ access: AppAccess.BLOCKED })
+        .expect(200);
+      expect((blocked.body as LineUserBody).access).toBe(AppAccess.BLOCKED);
+      expect(pushSpy).toHaveBeenCalledWith(lineUserId, [
+        { type: 'text', text: BLOCKED_MSG },
+      ]);
+
+      const row = await prisma.lineUser.findUnique({
+        where: { id: luIds[lineUserId] },
+        select: { access: true },
+      });
+      expect(row?.access).toBe(AppAccess.BLOCKED);
     });
 
     it('AC-B8 — a SUPER_ADMIN may also patch', async () => {

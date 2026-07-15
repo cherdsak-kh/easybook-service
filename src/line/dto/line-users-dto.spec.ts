@@ -1,6 +1,7 @@
 import { ValidationPipe } from '@nestjs/common';
 import type { ArgumentMetadata } from '@nestjs/common';
 import { AppAccess } from '@prisma/client';
+import { CreateLineUserRegistrationDto } from './create-line-user-registration.dto';
 import { ListLineUsersQueryDto } from './list-line-users-query.dto';
 import { UpdateLineUserAccessDto } from './update-line-user-access.dto';
 
@@ -11,8 +12,8 @@ const pipe = new ValidationPipe({
   transform: true,
 });
 
-const runner = <T>(metatype: unknown) => {
-  const META = { type: 'query', metatype } as ArgumentMetadata;
+const runner = <T>(metatype: unknown, type: 'query' | 'body' = 'query') => {
+  const META = { type, metatype } as ArgumentMetadata;
   const validate = (body: unknown): Promise<T> =>
     pipe.transform(body, META) as Promise<T>;
   const messagesOf = async (body: unknown): Promise<string[]> => {
@@ -93,5 +94,49 @@ describe('UpdateLineUserAccessDto (through the global ValidationPipe)', () => {
   it('rejects an extra key via forbidNonWhitelisted (AC-B11)', async () => {
     const messages = await messagesOf({ access: AppAccess.ALLOWED, note: 'x' });
     expect(messages.join(' ')).toContain('property note should not exist');
+  });
+});
+
+describe('CreateLineUserRegistrationDto (through the global ValidationPipe)', () => {
+  const { validate, messagesOf } = runner<CreateLineUserRegistrationDto>(
+    CreateLineUserRegistrationDto,
+    'body',
+  );
+
+  const VALID = {
+    firstName: 'Somchai',
+    lastName: 'Jaidee',
+    studentStaffId: '6412345678',
+    phone: '081-234-5678',
+    department: 'Computer Science',
+    role: 'Student',
+  };
+
+  it('accepts a valid payload and trims string fields (AC-B6)', async () => {
+    await expect(
+      validate({ ...VALID, firstName: '  Somchai  ' }),
+    ).resolves.toMatchObject({ ...VALID, firstName: 'Somchai' });
+  });
+
+  it('rejects a client-supplied lineUserId via forbidNonWhitelisted (impersonation guard)', async () => {
+    const messages = await messagesOf({ ...VALID, lineUserId: 'U-evil' });
+    expect(messages.join(' ')).toContain(
+      'property lineUserId should not exist',
+    );
+  });
+
+  it.each(['firstName', 'lastName', 'studentStaffId', 'department', 'role'])(
+    'rejects a blank %s (AC-B6)',
+    async (field) => {
+      const messages = await messagesOf({ ...VALID, [field]: '   ' });
+      expect(messages.join(' ')).toMatch(new RegExp(field));
+    },
+  );
+
+  it.each([
+    ['a missing required field', { ...VALID, phone: undefined }],
+    ['a bad phone', { ...VALID, phone: 'not a phone!!' }],
+  ])('rejects %s (AC-B6)', async (_label, body) => {
+    await expect(messagesOf(body)).resolves.toBeInstanceOf(Array);
   });
 });
