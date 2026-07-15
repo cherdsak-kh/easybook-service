@@ -19,26 +19,47 @@ const CHANNEL_ID = process.env.LINE_LOGIN_CHANNEL_ID;
 const LU_PREFIX = 'e2ereg-';
 const url = (path: string) => `${API_BASE_PATH}${path}`;
 
+const DEPT_NAME = `${LU_PREFIX}Computer Science`;
+const ROLE_NAME = `${LU_PREFIX}Teacher`;
+const DEPT2_NAME = `${LU_PREFIX}Mathematics`;
+const DELETED_DEPT_NAME = `${LU_PREFIX}Retired Dept`;
+
 // The exact "registration received" push copy (must match ACCESS_NOTIFICATION_MESSAGES / PENDING).
 const PENDING_MSG =
   'ระบบได้รับข้อมูลการลงทะเบียนของคุณแล้ว เจ้าหน้าที่กำลังดำเนินการตรวจสอบข้อมูลกรุณารอสักครู่ครับ ⏳';
 
-const VALID_BODY = {
+const optionIds = {
+  departmentId: '',
+  personnelRoleId: '',
+  department2Id: '',
+  deletedDepartmentId: '',
+};
+
+const validBody = (staffId: string) => ({
   firstName: 'Somchai',
   lastName: 'Jaidee',
-  studentStaffId: `${LU_PREFIX}stid-1`,
+  staffId,
   phone: '081-234-5678',
-  department: 'Computer Science',
-  role: 'Student',
-};
+  departmentId: optionIds.departmentId,
+  personnelRoleId: optionIds.personnelRoleId,
+});
 
 interface StatusBody {
   access: AppAccess;
   registration: {
     id: string;
-    studentStaffId: string;
+    staffId: string;
     phone: string;
+    departmentId: string;
+    department: string;
+    personnelRoleId: string;
+    personnelRole: string;
   } | null;
+}
+
+interface OptionsBody {
+  departments: Array<{ id: string; name: string }>;
+  personnelRoles: Array<{ id: string; name: string }>;
 }
 
 /**
@@ -55,10 +76,42 @@ describe('LINE registration + status (e2e)', () => {
   let pushSpy: jest.SpyInstance;
   const server = () => app.getHttpServer();
 
-  const purge = () =>
+  const purgeLineUsers = () =>
     prisma.$executeRawUnsafe(
       `DELETE FROM line_users WHERE "lineUserId" LIKE '${LU_PREFIX}%'`,
     );
+
+  const purgeOptions = async () => {
+    await prisma.$executeRawUnsafe(
+      `DELETE FROM departments WHERE "name" LIKE '${LU_PREFIX}%'`,
+    );
+    await prisma.$executeRawUnsafe(
+      `DELETE FROM personnel_roles WHERE "name" LIKE '${LU_PREFIX}%'`,
+    );
+  };
+
+  const seedOptions = async () => {
+    const dept = await prisma.department.create({
+      data: { name: DEPT_NAME },
+      select: { id: true },
+    });
+    const dept2 = await prisma.department.create({
+      data: { name: DEPT2_NAME },
+      select: { id: true },
+    });
+    const deletedDept = await prisma.department.create({
+      data: { name: DELETED_DEPT_NAME, deletedAt: new Date() },
+      select: { id: true },
+    });
+    const role = await prisma.personnelRole.create({
+      data: { name: ROLE_NAME },
+      select: { id: true },
+    });
+    optionIds.departmentId = dept.id;
+    optionIds.department2Id = dept2.id;
+    optionIds.deletedDepartmentId = deletedDept.id;
+    optionIds.personnelRoleId = role.id;
+  };
 
   beforeAll(async () => {
     jest.spyOn(global, 'fetch').mockImplementation((_input, init) => {
@@ -93,19 +146,33 @@ describe('LINE registration + status (e2e)', () => {
     pushSpy = jest
       .spyOn(app.get(LineService), 'push')
       .mockResolvedValue(undefined);
+
+    await purgeLineUsers();
+    await purgeOptions();
+    await seedOptions();
   }, 60_000);
 
   beforeEach(async () => {
-    await purge();
+    await purgeLineUsers();
   });
 
   afterAll(async () => {
-    await purge();
+    await purgeLineUsers();
+    await purgeOptions();
     jest.restoreAllMocks();
     await app.close();
   });
 
   const bearer = (token = 'good-token') => `Bearer ${token}`;
+
+  const registerPending = async (sub: string, staffId: string) => {
+    currentSub = sub;
+    await request(server())
+      .post(url('/line-users/register'))
+      .set('Authorization', bearer())
+      .send(validBody(staffId))
+      .expect(201);
+  };
 
   // ─────────────────────────── auth (guard) ───────────────────────────
 
@@ -124,12 +191,39 @@ describe('LINE registration + status (e2e)', () => {
   it('AC-B4 — POST /register with no token is 401 and writes nothing', async () => {
     await request(server())
       .post(url('/line-users/register'))
-      .send(VALID_BODY)
+      .send(validBody(`${LU_PREFIX}stid-noauth`))
       .expect(401);
     const count = await prisma.lineUserRegistration.count({
-      where: { studentStaffId: VALID_BODY.studentStaffId },
+      where: { staffId: `${LU_PREFIX}stid-noauth` },
     });
     expect(count).toBe(0);
+  });
+
+  // ─────────────────────────── options ───────────────────────────
+
+  it('SC-B7 — GET /registration/options returns non-deleted options, name ASC, bearer-guarded', async () => {
+    await request(server())
+      .get(url('/line-users/registration/options'))
+      .expect(401);
+
+    currentSub = `${LU_PREFIX}U-opts`;
+    const res = await request(server())
+      .get(url('/line-users/registration/options'))
+      .set('Authorization', bearer())
+      .expect(200);
+    const body = res.body as OptionsBody;
+
+    const deptNames = body.departments.map((d) => d.name);
+    expect(deptNames).toContain(DEPT_NAME);
+    expect(deptNames).toContain(DEPT2_NAME);
+    // The soft-deleted option is hidden.
+    expect(deptNames).not.toContain(DELETED_DEPT_NAME);
+    expect(body.personnelRoles.map((r) => r.name)).toContain(ROLE_NAME);
+
+    // name ASC (stable) — DEPT2 (Mathematics) sorts after DEPT (Computer Science).
+    const idxCs = deptNames.indexOf(DEPT_NAME);
+    const idxMath = deptNames.indexOf(DEPT2_NAME);
+    expect(idxCs).toBeLessThan(idxMath);
   });
 
   // ─────────────────────────── status ───────────────────────────
@@ -144,7 +238,6 @@ describe('LINE registration + status (e2e)', () => {
     expect(body.access).toBe(AppAccess.UNREGISTERED);
     expect(body.registration).toBeNull();
 
-    // The get-or-create really created the row with the UNREGISTERED default (AC-B1).
     const row = await prisma.lineUser.findFirst({
       where: { lineUserId: currentSub },
       select: { access: true, richMenuType: true },
@@ -155,70 +248,81 @@ describe('LINE registration + status (e2e)', () => {
 
   // ─────────────────────────── register ───────────────────────────
 
-  it('AC-B3 — POST /register creates the registration, flips access to PENDING, and needs no CSRF token', async () => {
+  it('AC-B3 — POST /register creates the registration, flips to PENDING (resolved names), no CSRF', async () => {
     currentSub = `${LU_PREFIX}U-reg`;
     pushSpy.mockClear();
     // No x-csrf-token header sent → proves the CSRF exemption for this bearer endpoint.
     const res = await request(server())
       .post(url('/line-users/register'))
       .set('Authorization', bearer())
-      .send(VALID_BODY)
+      .send(validBody(`${LU_PREFIX}stid-1`))
       .expect(201);
     const body = res.body as StatusBody;
     expect(body.access).toBe(AppAccess.PENDING);
-    expect(body.registration?.studentStaffId).toBe(VALID_BODY.studentStaffId);
-    expect(body.registration?.phone).toBe(VALID_BODY.phone);
+    expect(body.registration?.staffId).toBe(`${LU_PREFIX}stid-1`);
+    expect(body.registration?.departmentId).toBe(optionIds.departmentId);
+    expect(body.registration?.department).toBe(DEPT_NAME);
+    expect(body.registration?.personnelRole).toBe(ROLE_NAME);
 
     // Best-effort PENDING push fired, to the caller's LINE U… id (the verified sub), not the cuid.
     expect(pushSpy).toHaveBeenCalledWith(currentSub, [
       { type: 'text', text: PENDING_MSG },
     ]);
 
-    // Rich menu stays TYPE_1 through registration.
     const row = await prisma.lineUser.findFirst({
       where: { lineUserId: currentSub },
       select: { access: true, richMenuType: true },
     });
     expect(row?.access).toBe(AppAccess.PENDING);
     expect(row?.richMenuType).toBe('TYPE_1');
+  });
 
-    // A follow-up /status echoes the PENDING state + registration.
-    const status = await request(server())
-      .get(url('/line-users/status'))
+  it('SC-B6 — register with a deleted/unknown option id is 400 and writes nothing', async () => {
+    currentSub = `${LU_PREFIX}U-badopt`;
+    // A soft-deleted department id → 400.
+    await request(server())
+      .post(url('/line-users/register'))
       .set('Authorization', bearer())
-      .expect(200);
-    expect((status.body as StatusBody).access).toBe(AppAccess.PENDING);
+      .send({
+        ...validBody(`${LU_PREFIX}stid-badopt`),
+        departmentId: optionIds.deletedDepartmentId,
+      })
+      .expect(400);
+    // An unknown personnel-role id → 400.
+    await request(server())
+      .post(url('/line-users/register'))
+      .set('Authorization', bearer())
+      .send({
+        ...validBody(`${LU_PREFIX}stid-badopt`),
+        personnelRoleId: 'no-such-role',
+      })
+      .expect(400);
+
+    const count = await prisma.lineUserRegistration.count({
+      where: { staffId: `${LU_PREFIX}stid-badopt` },
+    });
+    expect(count).toBe(0);
   });
 
   it('AC-B5 — registering twice for the same LINE user is a 409', async () => {
+    await registerPending(`${LU_PREFIX}U-dup`, `${LU_PREFIX}stid-dup1`);
     currentSub = `${LU_PREFIX}U-dup`;
     await request(server())
       .post(url('/line-users/register'))
       .set('Authorization', bearer())
-      .send({ ...VALID_BODY, studentStaffId: `${LU_PREFIX}stid-dup1` })
-      .expect(201);
-    await request(server())
-      .post(url('/line-users/register'))
-      .set('Authorization', bearer())
-      .send({ ...VALID_BODY, studentStaffId: `${LU_PREFIX}stid-dup2` })
+      .send(validBody(`${LU_PREFIX}stid-dup2`))
       .expect(409);
   });
 
-  it('AC-B2 — a studentStaffId already used by someone else is a 409', async () => {
+  it('SC-B1 — a staffId already used by someone else is a 409', async () => {
     const sharedId = `${LU_PREFIX}stid-shared`;
-
-    currentSub = `${LU_PREFIX}U-a`;
-    await request(server())
-      .post(url('/line-users/register'))
-      .set('Authorization', bearer())
-      .send({ ...VALID_BODY, studentStaffId: sharedId })
-      .expect(201);
+    await registerPending(`${LU_PREFIX}U-a`, sharedId);
 
     currentSub = `${LU_PREFIX}U-b`;
     await request(server())
       .post(url('/line-users/register'))
       .set('Authorization', bearer())
-      .send({ ...VALID_BODY, studentStaffId: sharedId })
+      .send(validBody(sharedId))
       .expect(409);
   });
 
@@ -230,9 +334,128 @@ describe('LINE registration + status (e2e)', () => {
         .set('Authorization', bearer())
         .send(body);
 
-    await post({ ...VALID_BODY, firstName: '   ' }).expect(400);
-    await post({ ...VALID_BODY, phone: 'nope!!' }).expect(400);
+    await post({ ...validBody(`${LU_PREFIX}stid-v`), firstName: '   ' }).expect(
+      400,
+    );
+    await post({ ...validBody(`${LU_PREFIX}stid-v`), phone: 'nope!!' }).expect(
+      400,
+    );
     // A client-supplied lineUserId is rejected (impersonation guard + forbidNonWhitelisted).
-    await post({ ...VALID_BODY, lineUserId: 'U-evil' }).expect(400);
+    await post({
+      ...validBody(`${LU_PREFIX}stid-v`),
+      lineUserId: 'U-evil',
+    }).expect(400);
+  });
+
+  // ─────────────────────── PENDING self-edit (PATCH /registration) ───────────────────────
+
+  it('SC-B8 — a PENDING caller edits all fields, stays PENDING, sends no push', async () => {
+    await registerPending(`${LU_PREFIX}U-edit`, `${LU_PREFIX}stid-edit`);
+    currentSub = `${LU_PREFIX}U-edit`;
+    pushSpy.mockClear();
+
+    const res = await request(server())
+      .patch(url('/line-users/registration'))
+      .set('Authorization', bearer())
+      .send({
+        ...validBody(`${LU_PREFIX}stid-edit`), // re-submitting own staffId is fine
+        firstName: 'Somchai-Edited',
+        departmentId: optionIds.department2Id,
+      })
+      .expect(200);
+    const body = res.body as StatusBody;
+    expect(body.access).toBe(AppAccess.PENDING);
+    expect(body.registration?.department).toBe(DEPT2_NAME);
+
+    // No push on a field-edit.
+    expect(pushSpy).not.toHaveBeenCalled();
+
+    // access + richMenuType untouched.
+    const row = await prisma.lineUser.findFirst({
+      where: { lineUserId: currentSub },
+      select: { access: true, richMenuType: true },
+    });
+    expect(row?.access).toBe(AppAccess.PENDING);
+    expect(row?.richMenuType).toBe('TYPE_1');
+  });
+
+  it('SC-B9 — the PATCH by a non-PENDING caller (ALLOWED/BLOCKED/UNREGISTERED) is 403 with no write', async () => {
+    // UNREGISTERED: a LIFF-first caller who never registered.
+    currentSub = `${LU_PREFIX}U-unreg`;
+    await request(server())
+      .get(url('/line-users/status'))
+      .set('Authorization', bearer())
+      .expect(200); // creates the UNREGISTERED row
+    await request(server())
+      .patch(url('/line-users/registration'))
+      .set('Authorization', bearer())
+      .send(validBody(`${LU_PREFIX}stid-unreg`))
+      .expect(403);
+
+    // ALLOWED / BLOCKED: register then flip access directly, expect 403 and unchanged first name.
+    for (const access of [AppAccess.ALLOWED, AppAccess.BLOCKED]) {
+      const sub = `${LU_PREFIX}U-${access}`;
+      await registerPending(sub, `${LU_PREFIX}stid-${access}`);
+      await prisma.lineUser.updateMany({
+        where: { lineUserId: sub },
+        data: { access },
+      });
+      currentSub = sub;
+      await request(server())
+        .patch(url('/line-users/registration'))
+        .set('Authorization', bearer())
+        .send({ ...validBody(`${LU_PREFIX}stid-${access}`), firstName: 'Nope' })
+        .expect(403);
+
+      const reg = await prisma.lineUserRegistration.findFirst({
+        where: { staffId: `${LU_PREFIX}stid-${access}` },
+        select: { firstName: true },
+      });
+      expect(reg?.firstName).toBe('Somchai'); // no partial write
+    }
+  });
+
+  it('SC-B10 — the PATCH enforces validation: body lineUserId → 400, deleted option → 400, foreign staffId → 409', async () => {
+    await registerPending(`${LU_PREFIX}U-ev`, `${LU_PREFIX}stid-ev`);
+    // A different PENDING user owns another staffId.
+    await registerPending(`${LU_PREFIX}U-other`, `${LU_PREFIX}stid-other`);
+
+    currentSub = `${LU_PREFIX}U-ev`;
+    const patch = (body: Record<string, unknown>) =>
+      request(server())
+        .patch(url('/line-users/registration'))
+        .set('Authorization', bearer())
+        .send(body);
+
+    await patch({
+      ...validBody(`${LU_PREFIX}stid-ev`),
+      lineUserId: 'U-evil',
+    }).expect(400);
+    await patch({
+      ...validBody(`${LU_PREFIX}stid-ev`),
+      departmentId: optionIds.deletedDepartmentId,
+    }).expect(400);
+    // Colliding with ANOTHER registration's staffId → 409.
+    await patch(validBody(`${LU_PREFIX}stid-other`)).expect(409);
+  });
+
+  it('SC-6 — PATCH /line-users/registration reaches the CLIENT controller (200 with a PENDING bearer), not admin PATCH :id', async () => {
+    await registerPending(`${LU_PREFIX}U-collide`, `${LU_PREFIX}stid-collide`);
+    currentSub = `${LU_PREFIX}U-collide`;
+
+    // With a valid LINE bearer (NOT a session cookie), the literal `registration` route wins and
+    // returns 200. If it were shadowed by the admin `PATCH /line-users/:id` (SessionGuard), a bearer
+    // token would yield 401, never 200 — so this 200 proves the collision fix.
+    await request(server())
+      .patch(url('/line-users/registration'))
+      .set('Authorization', bearer())
+      .send(validBody(`${LU_PREFIX}stid-collide`))
+      .expect(200);
+
+    // With no bearer at all, the client guard rejects (401) — the client controller is in the path.
+    await request(server())
+      .patch(url('/line-users/registration'))
+      .send(validBody(`${LU_PREFIX}stid-collide`))
+      .expect(401);
   });
 });

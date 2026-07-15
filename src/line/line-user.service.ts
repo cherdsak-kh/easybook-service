@@ -1,17 +1,14 @@
 import {
   BadGatewayException,
+  BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
-import type {
-  AppAccess,
-  LineUser,
-  LineUserRegistration,
-  RichMenuType,
-} from '@prisma/client';
+import type { AppAccess, LineUser, RichMenuType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { LineUserRegistrationResponseDto } from './dto/line-user-registration-response.dto';
@@ -19,12 +16,17 @@ import { LineUserResponseDto } from './dto/line-user-response.dto';
 import { LineUserStatusResponseDto } from './dto/line-user-status-response.dto';
 import { ListLineUsersQueryDto } from './dto/list-line-users-query.dto';
 import { PaginatedLineUsersResponseDto } from './dto/paginated-line-users-response.dto';
+import { RegistrationOptionsResponseDto } from './dto/registration-options-response.dto';
+import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
 import { LineService } from './line.service';
 import {
   ALREADY_REGISTERED,
+  INVALID_DEPARTMENT,
+  INVALID_PERSONNEL_ROLE,
   LINE_RICH_MENU_APPLY_FAILED,
   LINE_USER_NOT_FOUND,
-  STUDENT_STAFF_ID_TAKEN,
+  REGISTRATION_NOT_EDITABLE,
+  STAFF_ID_TAKEN,
 } from './line-users.errors';
 import { RICH_MENU_SPECS } from './rich-menu.constants';
 
@@ -64,8 +66,8 @@ export const ACCESS_NOTIFICATION_MESSAGES: Record<AppAccess, string | null> = {
  * THE one definition of "a publicly visible LineUser" — exactly the `LineUserResponseDto` fields.
  * Kept explicit so the DTO stays the response boundary (never `deletedAt`/`language`/audit columns),
  * mirroring `system-users.fields.ts`'s `PUBLIC_FIELDS`. The nested `registration` select is the
- * compact admin summary — it now includes `phone` so admins can vet an applicant (a deliberate
- * reversal of the earlier PII-minimisation decision, at the product owner's request).
+ * compact admin summary: `staffId` + `phone` + the RESOLVED option names (via the FK relations, with
+ * NO `deletedAt` filter — a soft-deleted option must still resolve its name for display, SC-2.4).
  */
 export const LINE_USER_PUBLIC_FIELDS = {
   id: true,
@@ -80,10 +82,10 @@ export const LINE_USER_PUBLIC_FIELDS = {
     select: {
       firstName: true,
       lastName: true,
-      studentStaffId: true,
+      staffId: true,
       phone: true,
-      department: true,
-      role: true,
+      department: { select: { name: true } },
+      personnelRole: { select: { name: true } },
     },
   },
 } as const;
@@ -91,6 +93,30 @@ export const LINE_USER_PUBLIC_FIELDS = {
 /** A `LineUser` row narrowed to `LINE_USER_PUBLIC_FIELDS`. `followedAt` is still a `Date`. */
 export type PublicLineUser = Prisma.LineUserGetPayload<{
   select: typeof LINE_USER_PUBLIC_FIELDS;
+}>;
+
+/**
+ * The owner-facing registration select: identity/contact fields plus BOTH option ids (so the Pending
+ * edit form can pre-select) and the resolved option names (for display). No `deletedAt` filter on the
+ * relation selects — the name resolves even when the referenced option was later soft-deleted.
+ */
+const REGISTRATION_OWNER_SELECT = {
+  id: true,
+  firstName: true,
+  lastName: true,
+  staffId: true,
+  phone: true,
+  departmentId: true,
+  personnelRoleId: true,
+  department: { select: { name: true } },
+  personnelRole: { select: { name: true } },
+  createdAt: true,
+  updatedAt: true,
+} as const;
+
+/** A `LineUserRegistration` narrowed to `REGISTRATION_OWNER_SELECT`. */
+type OwnerRegistration = Prisma.LineUserRegistrationGetPayload<{
+  select: typeof REGISTRATION_OWNER_SELECT;
 }>;
 
 @Injectable()
@@ -207,12 +233,58 @@ export class LineUserService {
   }
 
   /**
+   * The combined, non-deleted option lists for the registration form (SC-3.1). One read per table,
+   * each `name ASC`. Ids + names only — no PII, no timestamps.
+   */
+  async getRegistrationOptions(): Promise<RegistrationOptionsResponseDto> {
+    const [departments, personnelRoles] = await Promise.all([
+      this.prisma.department.findMany({
+        where: { deletedAt: null },
+        select: { id: true, name: true },
+        orderBy: { name: 'asc' },
+      }),
+      this.prisma.personnelRole.findMany({
+        where: { deletedAt: null },
+        select: { id: true, name: true },
+        orderBy: { name: 'asc' },
+      }),
+    ]);
+    return { departments, personnelRoles };
+  }
+
+  /**
+   * Assert both chosen option ids resolve to a NON-DELETED option (SC-3.2/SC-B6). A soft-deleted or
+   * unknown id is a client-side validation failure → `400` (distinct message per field), never a
+   * `409`. The FK's `onDelete: Restrict` does not help here — a soft-deleted option row still exists,
+   * so the DB would accept the FK; this app-level `deletedAt: null` check is what rejects it.
+   */
+  private async assertActiveOptions(
+    client: Pick<Prisma.TransactionClient, 'department' | 'personnelRole'>,
+    departmentId: string,
+    personnelRoleId: string,
+  ): Promise<void> {
+    const [department, personnelRole] = await Promise.all([
+      client.department.findFirst({
+        where: { id: departmentId, deletedAt: null },
+        select: { id: true },
+      }),
+      client.personnelRole.findFirst({
+        where: { id: personnelRoleId, deletedAt: null },
+        select: { id: true },
+      }),
+    ]);
+    if (!department) throw new BadRequestException(INVALID_DEPARTMENT);
+    if (!personnelRole) throw new BadRequestException(INVALID_PERSONNEL_ROLE);
+  }
+
+  /**
    * Register the caller (identified by their verified LINE `sub`) and transition
    * `UNREGISTERED → PENDING`. The rich menu stays `TYPE_1` (untouched).
    *
-   * One `$transaction`: get-or-create the active LineUser, gate on `UNREGISTERED`, create the 1:1
-   * registration, then flip `access` to `PENDING`. A `P2002` on the LineUser 1:1 (a race) or on
-   * `studentStaffId` (used by someone else) becomes a `409` with distinct messages (design §3.1).
+   * One `$transaction`: get-or-create the active LineUser, gate on `UNREGISTERED`, assert both option
+   * ids are non-deleted (`400`), create the 1:1 registration, then flip `access` to `PENDING`. A
+   * `P2002` on the LineUser 1:1 (a race) or on `staffId` (used by someone else) becomes a `409` with
+   * distinct messages (design §3.1 / SC-3.2).
    */
   async register(
     lineUserId: string,
@@ -238,16 +310,23 @@ export class LineUserService {
             throw new ConflictException(ALREADY_REGISTERED);
           }
 
+          await this.assertActiveOptions(
+            tx,
+            dto.departmentId,
+            dto.personnelRoleId,
+          );
+
           const created = await tx.lineUserRegistration.create({
             data: {
               lineUserId: user.id,
               firstName: dto.firstName,
               lastName: dto.lastName,
-              studentStaffId: dto.studentStaffId,
+              staffId: dto.staffId,
               phone: dto.phone,
-              department: dto.department,
-              role: dto.role,
+              departmentId: dto.departmentId,
+              personnelRoleId: dto.personnelRoleId,
             },
+            select: REGISTRATION_OWNER_SELECT,
           });
 
           const updated = await tx.lineUser.update({
@@ -273,23 +352,61 @@ export class LineUserService {
 
       return this.toStatusDto(access, registration);
     } catch (error) {
-      if (
-        error instanceof Prisma.PrismaClientKnownRequestError &&
-        error.code === 'P2002'
-      ) {
-        const rawTarget = error.meta?.target;
-        const target = Array.isArray(rawTarget)
-          ? rawTarget.join(',')
-          : typeof rawTarget === 'string'
-            ? rawTarget
-            : '';
-        throw new ConflictException(
-          target.includes('studentStaffId')
-            ? STUDENT_STAFF_ID_TAKEN
-            : ALREADY_REGISTERED,
-        );
-      }
-      throw error;
+      throw this.mapRegistrationWriteError(error);
+    }
+  }
+
+  /**
+   * A PENDING user's self-edit of their own registration (SC-3.3). Identity is the verified `sub`;
+   * there is no cross-user write.
+   *
+   * State gate (SC-B9): permitted ONLY while `access === 'PENDING'`. `ALLOWED`/`BLOCKED`/
+   * `UNREGISTERED` → `403` (authorization-by-state), deterministic with no partial write — distinct
+   * from register's duplicate-resource `409`. Options are re-validated non-deleted (`400`); a
+   * `staffId` collision with ANOTHER registration → `409` (re-submitting the caller's own value is a
+   * no-op). `access` stays `PENDING`, `richMenuType` stays `TYPE_1`, and there is NO LINE push (Q6).
+   */
+  async updateRegistration(
+    lineUserId: string,
+    dto: UpdateLineUserRegistrationDto,
+  ): Promise<LineUserStatusResponseDto> {
+    const user = await this.prisma.lineUser.findFirst({
+      where: { lineUserId, deletedAt: null },
+      select: { id: true, access: true },
+    });
+
+    // No row, or any non-PENDING state, is a 403 (authorization-by-state). A LIFF-first caller who
+    // never registered is UNREGISTERED → also 403 (nothing to edit), never a partial write.
+    if (!user || user.access !== 'PENDING') {
+      throw new ForbiddenException(REGISTRATION_NOT_EDITABLE);
+    }
+
+    await this.assertActiveOptions(
+      this.prisma,
+      dto.departmentId,
+      dto.personnelRoleId,
+    );
+
+    try {
+      const updated = await this.prisma.lineUserRegistration.update({
+        where: { lineUserId: user.id },
+        data: {
+          firstName: dto.firstName,
+          lastName: dto.lastName,
+          staffId: dto.staffId,
+          phone: dto.phone,
+          departmentId: dto.departmentId,
+          personnelRoleId: dto.personnelRoleId,
+        },
+        select: REGISTRATION_OWNER_SELECT,
+      });
+
+      this.logger.log(`LineUser registration edited. id=${user.id}`);
+
+      // access stays PENDING, richMenuType untouched, no push (Q6).
+      return this.toStatusDto('PENDING', updated);
+    } catch (error) {
+      throw this.mapRegistrationWriteError(error);
     }
   }
 
@@ -302,6 +419,7 @@ export class LineUserService {
     const user = await this.getOrCreateByLineUserId(lineUserId);
     const registration = await this.prisma.lineUserRegistration.findFirst({
       where: { lineUserId: user.id, deletedAt: null },
+      select: REGISTRATION_OWNER_SELECT,
     });
     return this.toStatusDto(user.access, registration);
   }
@@ -419,18 +537,42 @@ export class LineUserService {
         ? {
             firstName: user.registration.firstName,
             lastName: user.registration.lastName,
-            studentStaffId: user.registration.studentStaffId,
+            staffId: user.registration.staffId,
             phone: user.registration.phone,
-            department: user.registration.department,
-            role: user.registration.role,
+            department: user.registration.department.name,
+            personnelRole: user.registration.personnelRole.name,
           }
         : null,
     };
   }
 
+  /**
+   * A duplicate-key from a registration write. On `staffId` → `409 STAFF_ID_TAKEN`; on the LineUser
+   * 1:1 (`lineUserId`, a register race) → `409 ALREADY_REGISTERED`. Deliberately-thrown
+   * `HttpException`s (the 400/403/409 raised inside the flow) pass straight through; anything else is
+   * rethrown unchanged.
+   */
+  private mapRegistrationWriteError(error: unknown): Error {
+    if (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === 'P2002'
+    ) {
+      const rawTarget = error.meta?.target;
+      const target = Array.isArray(rawTarget)
+        ? rawTarget.join(',')
+        : typeof rawTarget === 'string'
+          ? rawTarget
+          : '';
+      return new ConflictException(
+        target.includes('staffId') ? STAFF_ID_TAKEN : ALREADY_REGISTERED,
+      );
+    }
+    return error instanceof Error ? error : new Error(String(error));
+  }
+
   private toStatusDto(
     access: AppAccess,
-    registration: LineUserRegistration | null,
+    registration: OwnerRegistration | null,
   ): LineUserStatusResponseDto {
     return {
       access,
@@ -441,16 +583,18 @@ export class LineUserService {
   }
 
   private toRegistrationResponseDto(
-    registration: LineUserRegistration,
+    registration: OwnerRegistration,
   ): LineUserRegistrationResponseDto {
     return {
       id: registration.id,
       firstName: registration.firstName,
       lastName: registration.lastName,
-      studentStaffId: registration.studentStaffId,
+      staffId: registration.staffId,
       phone: registration.phone,
-      department: registration.department,
-      role: registration.role,
+      departmentId: registration.departmentId,
+      department: registration.department.name,
+      personnelRoleId: registration.personnelRoleId,
+      personnelRole: registration.personnelRole.name,
       createdAt: registration.createdAt.toISOString(),
       updatedAt: registration.updatedAt.toISOString(),
     };

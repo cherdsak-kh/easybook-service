@@ -1,6 +1,8 @@
 import {
   BadGatewayException,
+  BadRequestException,
   ConflictException,
+  ForbiddenException,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
@@ -8,6 +10,7 @@ import { AppAccess, Prisma } from '@prisma/client';
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
+import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
 import { LineService } from './line.service';
 import {
   accessToRichMenuType,
@@ -16,8 +19,11 @@ import {
 } from './line-user.service';
 import {
   ALREADY_REGISTERED,
+  INVALID_DEPARTMENT,
+  INVALID_PERSONNEL_ROLE,
   LINE_USER_NOT_FOUND,
-  STUDENT_STAFF_ID_TAKEN,
+  REGISTRATION_NOT_EDITABLE,
+  STAFF_ID_TAKEN,
 } from './line-users.errors';
 
 interface TxOptions {
@@ -34,29 +40,32 @@ const makeTx = () => ({
   lineUserRegistration: {
     create: jest.fn(),
   },
+  department: { findFirst: jest.fn() },
+  personnelRole: { findFirst: jest.fn() },
 });
 
 const VALID_DTO: CreateLineUserRegistrationDto = {
   firstName: 'Somchai',
   lastName: 'Jaidee',
-  studentStaffId: '6412345678',
+  staffId: '6412345678',
   phone: '081-234-5678',
-  department: 'Computer Science',
-  role: 'Student',
+  departmentId: 'dep-1',
+  personnelRoleId: 'role-1',
 };
 
-const REGISTRATION_ROW = {
+/** Owner-facing registration row (matches REGISTRATION_OWNER_SELECT: ids + resolved option names). */
+const OWNER_REGISTRATION_ROW = {
   id: 'reg-1',
-  lineUserId: 'lu-1',
   firstName: 'Somchai',
   lastName: 'Jaidee',
-  studentStaffId: '6412345678',
+  staffId: '6412345678',
   phone: '081-234-5678',
-  department: 'Computer Science',
-  role: 'Student',
+  departmentId: 'dep-1',
+  personnelRoleId: 'role-1',
+  department: { name: 'Computer Science' },
+  personnelRole: { name: 'Teacher' },
   createdAt: new Date('2026-07-14T10:00:00.000Z'),
   updatedAt: new Date('2026-07-14T10:00:00.000Z'),
-  deletedAt: null,
 };
 
 describe('LineUserService', () => {
@@ -72,7 +81,10 @@ describe('LineUserService', () => {
   };
   const lineUserRegistration = {
     findFirst: jest.fn(),
+    update: jest.fn(),
   };
+  const department = { findFirst: jest.fn(), findMany: jest.fn() };
+  const personnelRole = { findFirst: jest.fn(), findMany: jest.fn() };
   const $transaction = jest.fn();
   const line = {
     findRichMenuId: jest.fn(),
@@ -107,7 +119,13 @@ describe('LineUserService', () => {
         LineUserService,
         {
           provide: PrismaService,
-          useValue: { lineUser, lineUserRegistration, $transaction },
+          useValue: {
+            lineUser,
+            lineUserRegistration,
+            department,
+            personnelRole,
+            $transaction,
+          },
         },
         { provide: LineService, useValue: line },
       ],
@@ -232,26 +250,63 @@ describe('LineUserService', () => {
     expect(accessToRichMenuType(AppAccess.BLOCKED)).toBe('TYPE_1');
   });
 
+  // ───────────────────────── getRegistrationOptions ─────────────────────────
+
+  describe('getRegistrationOptions', () => {
+    it('returns non-deleted departments + personnel roles, id+name, ordered name ASC (SC-B7)', async () => {
+      department.findMany.mockResolvedValue([{ id: 'dep-1', name: 'Biology' }]);
+      personnelRole.findMany.mockResolvedValue([
+        { id: 'role-1', name: 'Teacher' },
+      ]);
+
+      const result = await service.getRegistrationOptions();
+
+      expect(department.findMany).toHaveBeenCalledWith({
+        where: { deletedAt: null },
+        select: { id: true, name: true },
+        orderBy: { name: 'asc' },
+      });
+      expect(personnelRole.findMany).toHaveBeenCalledWith({
+        where: { deletedAt: null },
+        select: { id: true, name: true },
+        orderBy: { name: 'asc' },
+      });
+      expect(result).toEqual({
+        departments: [{ id: 'dep-1', name: 'Biology' }],
+        personnelRoles: [{ id: 'role-1', name: 'Teacher' }],
+      });
+    });
+  });
+
   // ───────────────────────── register ─────────────────────────
 
   describe('register', () => {
-    it('creates the registration and flips UNREGISTERED->PENDING, returning the status view (AC-B3)', async () => {
+    const primeTx = () => {
       const tx = makeTx();
+      tx.department.findFirst.mockResolvedValue({ id: 'dep-1' });
+      tx.personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+      return tx;
+    };
+
+    it('creates the registration and flips UNREGISTERED->PENDING, returning the status view (AC-B3)', async () => {
+      const tx = primeTx();
       tx.lineUser.findFirst.mockResolvedValue({
         id: 'lu-1',
         access: AppAccess.UNREGISTERED,
       });
-      tx.lineUserRegistration.create.mockResolvedValue(REGISTRATION_ROW);
+      tx.lineUserRegistration.create.mockResolvedValue(OWNER_REGISTRATION_ROW);
       tx.lineUser.update.mockResolvedValue({ access: AppAccess.PENDING });
-      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
-        cb(tx),
-      );
 
       const result = await service.register('U123', VALID_DTO);
 
-      expect(tx.lineUserRegistration.create).toHaveBeenCalledWith({
-        data: { lineUserId: 'lu-1', ...VALID_DTO },
-      });
+      expect(tx.lineUserRegistration.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { lineUserId: 'lu-1', ...VALID_DTO },
+        }),
+      );
       expect(tx.lineUser.update).toHaveBeenCalledWith({
         where: { id: 'lu-1' },
         data: { access: AppAccess.PENDING },
@@ -260,8 +315,12 @@ describe('LineUserService', () => {
       expect(result.access).toBe(AppAccess.PENDING);
       expect(result.registration).toMatchObject({
         id: 'reg-1',
-        studentStaffId: '6412345678',
+        staffId: '6412345678',
         phone: '081-234-5678',
+        departmentId: 'dep-1',
+        department: 'Computer Science',
+        personnelRoleId: 'role-1',
+        personnelRole: 'Teacher',
         createdAt: '2026-07-14T10:00:00.000Z',
       });
       // Best-effort "registration received" push (PENDING copy) to the caller's U… id (the arg),
@@ -271,17 +330,50 @@ describe('LineUserService', () => {
       ]);
     });
 
-    it('best-effort: register still resolves + persists when the push rejects (logged, not thrown)', async () => {
+    it('rejects a deleted/unknown departmentId with 400 (SC-B6), writing nothing', async () => {
       const tx = makeTx();
       tx.lineUser.findFirst.mockResolvedValue({
         id: 'lu-1',
         access: AppAccess.UNREGISTERED,
       });
-      tx.lineUserRegistration.create.mockResolvedValue(REGISTRATION_ROW);
-      tx.lineUser.update.mockResolvedValue({ access: AppAccess.PENDING });
+      tx.department.findFirst.mockResolvedValue(null);
+      tx.personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
       $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
         cb(tx),
       );
+
+      await expect(service.register('U123', VALID_DTO)).rejects.toThrow(
+        new BadRequestException(INVALID_DEPARTMENT),
+      );
+      expect(tx.lineUserRegistration.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects a deleted/unknown personnelRoleId with 400 (SC-B6)', async () => {
+      const tx = makeTx();
+      tx.lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.UNREGISTERED,
+      });
+      tx.department.findFirst.mockResolvedValue({ id: 'dep-1' });
+      tx.personnelRole.findFirst.mockResolvedValue(null);
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+
+      await expect(service.register('U123', VALID_DTO)).rejects.toThrow(
+        new BadRequestException(INVALID_PERSONNEL_ROLE),
+      );
+      expect(tx.lineUserRegistration.create).not.toHaveBeenCalled();
+    });
+
+    it('best-effort: register still resolves + persists when the push rejects (logged, not thrown)', async () => {
+      const tx = primeTx();
+      tx.lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.UNREGISTERED,
+      });
+      tx.lineUserRegistration.create.mockResolvedValue(OWNER_REGISTRATION_ROW);
+      tx.lineUser.update.mockResolvedValue({ access: AppAccess.PENDING });
       line.push.mockRejectedValue(new Error('user blocked the bot'));
       const warn = jest
         .spyOn(Logger.prototype, 'warn')
@@ -296,20 +388,16 @@ describe('LineUserService', () => {
     });
 
     it('creates the LineUser row when the caller opened the LIFF first (no prior follow)', async () => {
-      const tx = makeTx();
+      const tx = primeTx();
       tx.lineUser.findFirst.mockResolvedValue(null);
       tx.lineUser.create.mockResolvedValue({
         id: 'lu-new',
         access: AppAccess.UNREGISTERED,
       });
       tx.lineUserRegistration.create.mockResolvedValue({
-        ...REGISTRATION_ROW,
-        lineUserId: 'lu-new',
+        ...OWNER_REGISTRATION_ROW,
       });
       tx.lineUser.update.mockResolvedValue({ access: AppAccess.PENDING });
-      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
-        cb(tx),
-      );
 
       await service.register('U-new', VALID_DTO);
 
@@ -335,8 +423,8 @@ describe('LineUserService', () => {
       expect(tx.lineUserRegistration.create).not.toHaveBeenCalled();
     });
 
-    it('maps a P2002 on studentStaffId to a 409 STUDENT_STAFF_ID_TAKEN (AC-B2)', async () => {
-      const tx = makeTx();
+    it('maps a P2002 on staffId to a 409 STAFF_ID_TAKEN (SC-B1)', async () => {
+      const tx = primeTx();
       tx.lineUser.findFirst.mockResolvedValue({
         id: 'lu-1',
         access: AppAccess.UNREGISTERED,
@@ -345,20 +433,17 @@ describe('LineUserService', () => {
         new Prisma.PrismaClientKnownRequestError('unique', {
           code: 'P2002',
           clientVersion: 'x',
-          meta: { target: ['studentStaffId'] },
+          meta: { target: ['staffId'] },
         }),
-      );
-      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
-        cb(tx),
       );
 
       await expect(service.register('U123', VALID_DTO)).rejects.toThrow(
-        new ConflictException(STUDENT_STAFF_ID_TAKEN),
+        new ConflictException(STAFF_ID_TAKEN),
       );
     });
 
     it('maps a P2002 on lineUserId (a race) to a 409 ALREADY_REGISTERED (AC-B2)', async () => {
-      const tx = makeTx();
+      const tx = primeTx();
       tx.lineUser.findFirst.mockResolvedValue({
         id: 'lu-1',
         access: AppAccess.UNREGISTERED,
@@ -370,9 +455,6 @@ describe('LineUserService', () => {
           meta: { target: ['lineUserId'] },
         }),
       );
-      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
-        cb(tx),
-      );
 
       await expect(service.register('U123', VALID_DTO)).rejects.toThrow(
         new ConflictException(ALREADY_REGISTERED),
@@ -380,23 +462,122 @@ describe('LineUserService', () => {
     });
   });
 
-  // ───────────────────────── getStatus ─────────────────────────
+  // ───────────────────────── updateRegistration (PENDING self-edit) ─────────────────────────
 
-  describe('getStatus', () => {
-    it('returns access + registration for an existing user', async () => {
+  describe('updateRegistration', () => {
+    const EDIT_DTO: UpdateLineUserRegistrationDto = { ...VALID_DTO };
+
+    it('updates all fields for a PENDING caller, keeps PENDING, and sends NO push (SC-B8)', async () => {
       lineUser.findFirst.mockResolvedValue({
         id: 'lu-1',
         access: AppAccess.PENDING,
       });
-      lineUserRegistration.findFirst.mockResolvedValue(REGISTRATION_ROW);
+      department.findFirst.mockResolvedValue({ id: 'dep-1' });
+      personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      lineUserRegistration.update.mockResolvedValue(OWNER_REGISTRATION_ROW);
+
+      const result = await service.updateRegistration('U123', EDIT_DTO);
+
+      expect(lineUserRegistration.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { lineUserId: 'lu-1' },
+          data: {
+            firstName: 'Somchai',
+            lastName: 'Jaidee',
+            staffId: '6412345678',
+            phone: '081-234-5678',
+            departmentId: 'dep-1',
+            personnelRoleId: 'role-1',
+          },
+        }),
+      );
+      expect(result.access).toBe(AppAccess.PENDING);
+      expect(result.registration).toMatchObject({
+        staffId: '6412345678',
+        department: 'Computer Science',
+        personnelRole: 'Teacher',
+      });
+      // No LINE push on a field-edit (Q6).
+      expect(line.push).not.toHaveBeenCalled();
+    });
+
+    it.each([AppAccess.ALLOWED, AppAccess.BLOCKED, AppAccess.UNREGISTERED])(
+      '403s a non-PENDING caller (%s) with no write (SC-B9)',
+      async (access) => {
+        lineUser.findFirst.mockResolvedValue({ id: 'lu-1', access });
+
+        await expect(
+          service.updateRegistration('U123', EDIT_DTO),
+        ).rejects.toThrow(new ForbiddenException(REGISTRATION_NOT_EDITABLE));
+        expect(lineUserRegistration.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it('403s when the caller has no active LineUser row (SC-B9)', async () => {
+      lineUser.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.updateRegistration('U123', EDIT_DTO),
+      ).rejects.toThrow(new ForbiddenException(REGISTRATION_NOT_EDITABLE));
+      expect(lineUserRegistration.update).not.toHaveBeenCalled();
+    });
+
+    it('rejects a deleted/unknown option id with 400 and no write (SC-B10)', async () => {
+      lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+      });
+      department.findFirst.mockResolvedValue(null);
+      personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+
+      await expect(
+        service.updateRegistration('U123', EDIT_DTO),
+      ).rejects.toThrow(new BadRequestException(INVALID_DEPARTMENT));
+      expect(lineUserRegistration.update).not.toHaveBeenCalled();
+    });
+
+    it('maps a P2002 on staffId (another registration) to 409 STAFF_ID_TAKEN (SC-B10)', async () => {
+      lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+      });
+      department.findFirst.mockResolvedValue({ id: 'dep-1' });
+      personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      lineUserRegistration.update.mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError('unique', {
+          code: 'P2002',
+          clientVersion: 'x',
+          meta: { target: ['staffId'] },
+        }),
+      );
+
+      await expect(
+        service.updateRegistration('U123', EDIT_DTO),
+      ).rejects.toThrow(new ConflictException(STAFF_ID_TAKEN));
+    });
+  });
+
+  // ───────────────────────── getStatus ─────────────────────────
+
+  describe('getStatus', () => {
+    it('returns access + registration (with resolved option names) for an existing user', async () => {
+      lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+      });
+      lineUserRegistration.findFirst.mockResolvedValue(OWNER_REGISTRATION_ROW);
 
       const result = await service.getStatus('U123');
 
-      expect(lineUserRegistration.findFirst).toHaveBeenCalledWith({
-        where: { lineUserId: 'lu-1', deletedAt: null },
-      });
+      expect(lineUserRegistration.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { lineUserId: 'lu-1', deletedAt: null },
+        }),
+      );
       expect(result.access).toBe(AppAccess.PENDING);
-      expect(result.registration?.studentStaffId).toBe('6412345678');
+      expect(result.registration?.staffId).toBe('6412345678');
+      expect(result.registration?.department).toBe('Computer Science');
+      expect(result.registration?.personnelRole).toBe('Teacher');
     });
 
     it('gives a LIFF-first caller a fresh UNREGISTERED state + null registration', async () => {
@@ -464,7 +645,7 @@ describe('LineUserService', () => {
       });
     });
 
-    it('maps a nested registration relation into the compact summary (AC-B11)', async () => {
+    it('maps a nested registration relation into the compact summary with resolved option names (AC-B11/SC-B5)', async () => {
       $transaction.mockResolvedValue([
         [
           {
@@ -473,10 +654,10 @@ describe('LineUserService', () => {
             registration: {
               firstName: 'Somchai',
               lastName: 'Jaidee',
-              studentStaffId: '6412345678',
+              staffId: '6412345678',
               phone: '081-234-5678',
-              department: 'Computer Science',
-              role: 'Student',
+              department: { name: 'Computer Science' },
+              personnelRole: { name: 'Teacher' },
             },
           },
         ],
@@ -488,10 +669,10 @@ describe('LineUserService', () => {
       expect(result.data[0].registration).toEqual({
         firstName: 'Somchai',
         lastName: 'Jaidee',
-        studentStaffId: '6412345678',
+        staffId: '6412345678',
         phone: '081-234-5678',
         department: 'Computer Science',
-        role: 'Student',
+        personnelRole: 'Teacher',
       });
     });
 
