@@ -71,14 +71,24 @@ model LineUserRegistration {
   firstName String
   lastName  String
 
-  /// University student/staff ID. Globally @unique (A-4): a university ID identifies one person, so
-  /// two registrations sharing an ID is a data error the DB rejects (P2002 -> 409 in the endpoint).
-  studentStaffId String @unique
+  /// University staff/personnel ID. Globally @unique — one ID identifies one person, so two
+  /// registrations sharing an ID is a data error the DB rejects (P2002 -> 409 in the endpoint).
+  /// Renamed from `studentStaffId` (SC-B1): the domain targets educational personnel/staff.
+  staffId String @unique
 
   /// Loosely validated in the DTO (Thai formats), mirroring SystemUser.phoneNumber. Stored as given.
-  phone      String
-  department String // free text (A-5 / DD-7)
-  role       String // free text (A-5 / DD-7), e.g. "Student" / "Staff" / "Teacher"
+  phone String
+
+  /// FK -> Department.id. Required: every registration picks a department option (SC-2.4/Q4).
+  /// `onDelete: Restrict` refuses a stray hard delete of a referenced option — normal deletes are
+  /// soft (deletedAt), so a referenced row is never hard-deleted. Resolves for display even when the
+  /// option is soft-deleted (the FK row persists; only deletedAt is set).
+  departmentId String
+  department   Department @relation("RegistrationDepartment", fields: [departmentId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// FK -> PersonnelRole.id (the LINE end-user's self-declared role — NOT SystemRole). Required.
+  personnelRoleId String
+  personnelRole   PersonnelRole @relation("RegistrationPersonnelRole", fields: [personnelRoleId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -88,7 +98,46 @@ model LineUserRegistration {
   deletedAt DateTime?
 
   @@index([deletedAt])
+  @@index([departmentId])
+  @@index([personnelRoleId])
   @@map("line_user_registrations")
+}
+
+/// Admin-curated department/faculty options for the LINE registration form. Soft-deleted, never
+/// hard-deleted. The active-name uniqueness is a PARTIAL unique index (`WHERE deletedAt IS NULL`,
+/// authored in raw SQL in the migration — the PSL cannot express it), so `name` is deliberately NOT
+/// `@unique` here: a soft-deleted name is REUSABLE (SC-2.3/Q2). Holds no PII.
+model Department {
+  id        String    @id @default(cuid())
+  name      String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  registrations LineUserRegistration[] @relation("RegistrationDepartment")
+
+  @@index([deletedAt])
+  @@map("departments")
+}
+
+/// Admin-curated PERSONNEL role options (Teacher, Support Staff, …) for the LINE registration form —
+/// the LINE end-user's self-declared role, a client-portal/registration concern.
+///
+/// CRITICAL: `PersonnelRole` is NOT `SystemRole`. `SystemRole` (SUPER_ADMIN | ADMIN | STAFF, on
+/// SystemUser) is the back-office RBAC enum. They share NO table, enum, type, endpoint, or seed, and
+/// never cross a code path. Soft-deleted, name reusable (partial unique index — same as Department).
+/// Holds no PII.
+model PersonnelRole {
+  id        String    @id @default(cuid())
+  name      String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  registrations LineUserRegistration[] @relation("RegistrationPersonnelRole")
+
+  @@index([deletedAt])
+  @@map("personnel_roles")
 }
 
 /// Back-office operator role. Distinct from AppAccess (LINE consumer domain) by design.

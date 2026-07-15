@@ -106,13 +106,13 @@ describe('CreateLineUserRegistrationDto (through the global ValidationPipe)', ()
   const VALID = {
     firstName: 'Somchai',
     lastName: 'Jaidee',
-    studentStaffId: '6412345678',
+    staffId: '6412345678',
     phone: '081-234-5678',
-    department: 'Computer Science',
-    role: 'Student',
+    departmentId: 'clx1a2b3c4d5e6f7g8h9i0j1',
+    personnelRoleId: 'clx9z8y7x6w5v4u3t2s1r0q9',
   };
 
-  it('accepts a valid payload and trims string fields (AC-B6)', async () => {
+  it('accepts a valid payload and trims string fields (SC-B1)', async () => {
     await expect(
       validate({ ...VALID, firstName: '  Somchai  ' }),
     ).resolves.toMatchObject({ ...VALID, firstName: 'Somchai' });
@@ -125,13 +125,27 @@ describe('CreateLineUserRegistrationDto (through the global ValidationPipe)', ()
     );
   });
 
-  it.each(['firstName', 'lastName', 'studentStaffId', 'department', 'role'])(
-    'rejects a blank %s (AC-B6)',
-    async (field) => {
-      const messages = await messagesOf({ ...VALID, [field]: '   ' });
-      expect(messages.join(' ')).toMatch(new RegExp(field));
-    },
-  );
+  it('rejects the removed free-text `department`/`role`/`studentStaffId` keys (SC-B1)', async () => {
+    const messages = await messagesOf({
+      ...VALID,
+      department: 'Computer Science',
+      role: 'Student',
+    });
+    const joined = messages.join(' ');
+    expect(joined).toContain('property department should not exist');
+    expect(joined).toContain('property role should not exist');
+  });
+
+  it.each([
+    'firstName',
+    'lastName',
+    'staffId',
+    'departmentId',
+    'personnelRoleId',
+  ])('rejects a blank %s (SC-B1/SC-B6)', async (field) => {
+    const messages = await messagesOf({ ...VALID, [field]: '   ' });
+    expect(messages.join(' ')).toMatch(new RegExp(field));
+  });
 
   it.each([
     ['a missing required field', { ...VALID, phone: undefined }],

@@ -17,14 +17,16 @@ import { isCookieSecure, resolveSameSite } from '../config/env.validation';
  * `LineSignatureGuard`'s HMAC over the raw body. Requiring a CSRF token there would simply break
  * the integration (AC-18).
  *
- * `POST /line-users/register` is a stateless, bearer-authenticated (LINE ID token) LIFF-client call
- * with no cookie and no ambient authority, so the double-submit CSRF that protects the cookie-session
- * admin surface is irrelevant to it (same reasoning as the webhook). `GET /line-users/status` is a
- * GET and already CSRF-safe via `ignoredMethods`.
+ * `POST /line-users/register` and `PATCH /line-users/registration` are stateless, bearer-
+ * authenticated (LINE ID token) LIFF-client calls with no cookie and no ambient authority, so the
+ * double-submit CSRF that protects the cookie-session admin surface is irrelevant to them (same
+ * reasoning as the webhook). The two option GETs and `GET /line-users/status` are GETs and already
+ * CSRF-safe via `ignoredMethods`. The admin option CRUD is cookie-session and is NOT exempt.
  */
 export const CSRF_EXEMPT_PATHS: readonly string[] = [
   `${API_BASE_PATH}/line/webhook`,
   `${API_BASE_PATH}/line-users/register`,
+  `${API_BASE_PATH}/line-users/registration`,
 ];
 
 export const CSRF_COOKIE_NAME = 'eb.csrf';

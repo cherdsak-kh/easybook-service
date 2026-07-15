@@ -9,10 +9,14 @@ import { LineWebhookService } from './line-webhook.service';
 import { LineIdTokenGuard } from './guards/line-id-token.guard';
 
 @Module({
+  // Route-order is LOAD-BEARING (SC-6): the client `LineRegistrationController` MUST precede the
+  // admin `LineUsersController` so its literal `PATCH /line-users/registration` route is registered
+  // before — and therefore wins over — the admin `PATCH /line-users/:id`. A real cuid still falls
+  // through to `:id`. Reordering these two breaks the client self-edit endpoint.
   controllers: [
     LineController,
-    LineUsersController,
     LineRegistrationController,
+    LineUsersController,
   ],
   providers: [
     LineService,

@@ -42,10 +42,10 @@ interface Session {
 interface RegistrationSummary {
   firstName: string;
   lastName: string;
-  studentStaffId: string;
+  staffId: string;
   phone: string;
   department: string;
-  role: string;
+  personnelRole: string;
 }
 
 interface LineUserBody {
@@ -118,15 +118,46 @@ describe('LINE Users management (e2e)', () => {
     return { agent, token };
   };
 
+  // Ids of the fixture option rows (the registration FK targets), refreshed each seed.
+  const optionIds: { departmentId: string; personnelRoleId: string } = {
+    departmentId: '',
+    personnelRoleId: '',
+  };
+  const DEPT_NAME = `${LU_PREFIX}Engineering`;
+  const ROLE_NAME = `${LU_PREFIX}Staff`;
+
   const purgeLineUsers = () =>
+    // Cascade-deletes the registrations (FK onDelete: Cascade), so the option rows can then go.
     prisma.$executeRawUnsafe(
       `DELETE FROM line_users WHERE "lineUserId" LIKE '${LU_PREFIX}%'`,
     );
+
+  const purgeOptions = async () => {
+    // Safe only AFTER the registrations are gone (FK onDelete: Restrict).
+    await prisma.$executeRawUnsafe(
+      `DELETE FROM departments WHERE "name" LIKE '${LU_PREFIX}%'`,
+    );
+    await prisma.$executeRawUnsafe(
+      `DELETE FROM personnel_roles WHERE "name" LIKE '${LU_PREFIX}%'`,
+    );
+  };
 
   /** Re-creates the fixture rows so each test starts from a known world. */
   const seed = async () => {
     await purgeE2eUsers(prisma, SU_PREFIX);
     await purgeLineUsers();
+    await purgeOptions();
+
+    const dept = await prisma.department.create({
+      data: { name: DEPT_NAME },
+      select: { id: true },
+    });
+    const prole = await prisma.personnelRole.create({
+      data: { name: ROLE_NAME },
+      select: { id: true },
+    });
+    optionIds.departmentId = dept.id;
+    optionIds.personnelRoleId = prole.id;
 
     const passwordHash = await new PasswordService().hash(PASSWORD);
     const base = { passwordHash, position: 'Director', department: 'IT' };
@@ -161,10 +192,10 @@ describe('LINE Users management (e2e)', () => {
         lineUserId: luIds[`${LU_PREFIX}allowed`],
         firstName: 'Bob',
         lastName: 'Allowed',
-        studentStaffId: `${LU_PREFIX}stid-allowed`,
+        staffId: `${LU_PREFIX}stid-allowed`,
         phone: '081-000-0000',
-        department: 'Engineering',
-        role: 'Staff',
+        departmentId: optionIds.departmentId,
+        personnelRoleId: optionIds.personnelRoleId,
       },
     });
   };
@@ -192,6 +223,7 @@ describe('LINE Users management (e2e)', () => {
   afterAll(async () => {
     await purgeE2eUsers(prisma, SU_PREFIX);
     await purgeLineUsers();
+    await purgeOptions();
     await clearThrottleCounters(redis);
     await app.close();
   });
@@ -307,10 +339,11 @@ describe('LINE Users management (e2e)', () => {
       expect(allowed?.registration).toEqual({
         firstName: 'Bob',
         lastName: 'Allowed',
-        studentStaffId: `${LU_PREFIX}stid-allowed`,
+        staffId: `${LU_PREFIX}stid-allowed`,
         phone: '081-000-0000',
-        department: 'Engineering',
-        role: 'Staff',
+        // department + personnelRole are the RESOLVED option names, not ids.
+        department: DEPT_NAME,
+        personnelRole: ROLE_NAME,
       });
 
       // A follower with no registration renders gracefully as null (AC-F7 backend half).
@@ -320,6 +353,25 @@ describe('LINE Users management (e2e)', () => {
       // PO decision reversal: admins now see the phone to vet registrations.
       expect(allowed?.registration?.phone).toBe('081-000-0000');
       expect(JSON.stringify(res.body)).toContain('081-000-0000');
+    });
+
+    it('SC-B5 — a registration whose option was later soft-deleted still resolves the name', async () => {
+      const { agent } = await login(ADMIN);
+
+      // Soft-delete the referenced option (app-level soft delete = set deletedAt).
+      await prisma.department.update({
+        where: { id: optionIds.departmentId },
+        data: { deletedAt: new Date() },
+      });
+
+      const res = await agent
+        .get(url('/line-users?search=Qwx&limit=100'))
+        .expect(200);
+      const allowed = (res.body as ListBody).data.find(
+        (u) => u.lineUserId === `${LU_PREFIX}allowed`,
+      );
+      // The FK row persists (only deletedAt set), so the name still resolves for display.
+      expect(allowed?.registration?.department).toBe(DEPT_NAME);
     });
 
     it('AC-B6 — a soft-deleted LINE user never appears in data', async () => {

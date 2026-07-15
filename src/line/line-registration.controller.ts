@@ -3,6 +3,7 @@ import {
   Controller,
   Get,
   HttpCode,
+  Patch,
   Post,
   Req,
   UseGuards,
@@ -13,6 +14,7 @@ import {
   ApiBearerAuth,
   ApiConflictResponse,
   ApiCreatedResponse,
+  ApiForbiddenResponse,
   ApiOkResponse,
   ApiOperation,
   ApiTags,
@@ -21,6 +23,8 @@ import {
 import { ErrorResponseDto } from '../common/dto/error-response.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { LineUserStatusResponseDto } from './dto/line-user-status-response.dto';
+import { RegistrationOptionsResponseDto } from './dto/registration-options-response.dto';
+import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
 import { LineIdTokenGuard } from './guards/line-id-token.guard';
 import { LineUserService } from './line-user.service';
 import type { RequestWithLineUserId } from './line.types';
@@ -31,12 +35,14 @@ import type { RequestWithLineUserId } from './line.types';
  * token), NOT the cookie session that guards the admin `LineUsersController`. The caller's identity
  * is the verified `sub` on `req.lineUserId` — never a body/param value (LINK-LINE-1).
  *
- * It shares the `line-users` base with the admin `LineUsersController` without collision: the admin
- * controller owns `GET /` and `PATCH /:id`, this one owns the literal `GET /status` and
- * `POST /register` — different methods and no `GET /:id` to shadow `GET /status`.
+ * It shares the `line-users` base with the admin `LineUsersController`. This controller MUST be
+ * registered BEFORE the admin one in `LineModule.controllers` (SC-6) so its literal
+ * `PATCH /line-users/registration` route wins over the admin `PATCH /line-users/:id`; a real cuid
+ * still falls through to `:id`. The admin controller has no `GET /line-users/:id`, so `GET /status`
+ * and `GET /registration/options` collide with nothing.
  *
- * `POST /register` is exempt from CSRF (bearer, cookieless — see `CSRF_EXEMPT_PATHS`); `GET /status`
- * is a GET and already CSRF-safe.
+ * `POST /register` and `PATCH /registration` are exempt from CSRF (bearer, cookieless — see
+ * `CSRF_EXEMPT_PATHS`); the two GETs are GETs and already CSRF-safe.
  */
 @ApiTags('LINE Registration')
 @ApiBearerAuth()
@@ -69,20 +75,44 @@ export class LineRegistrationController {
     return this.users.getStatus(req.lineUserId as string);
   }
 
+  @Get('registration/options')
+  @UseGuards(LineIdTokenGuard)
+  @ApiOperation({
+    summary: 'List the selectable department + personnel-role options.',
+    description:
+      'Combined payload so the registration/edit form makes ONE call. Returns only NON-deleted options, each list ordered `name ASC`. Ids feed `departmentId`/`personnelRoleId` on register/edit.',
+  })
+  @ApiOkResponse({
+    description: 'The available options.',
+    type: RegistrationOptionsResponseDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'Missing/invalid/expired/wrong-aud LINE ID token.',
+    type: ErrorResponseDto,
+  })
+  @ApiBadGatewayResponse({
+    description: 'LINE verification endpoint unreachable (retryable).',
+    type: ErrorResponseDto,
+  })
+  getOptions(): Promise<RegistrationOptionsResponseDto> {
+    return this.users.getRegistrationOptions();
+  }
+
   @Post('register')
   @UseGuards(LineIdTokenGuard)
   @HttpCode(201)
   @ApiOperation({
     summary: 'Submit the registration form (UNREGISTERED → PENDING).',
     description:
-      'Creates the 1:1 registration for the authenticated LINE user and moves them to `PENDING` (rich menu stays `TYPE_1`). Returns the caller’s status view so the frontend can route to the Pending screen without a second call. There is no `lineUserId` body field — the identity is the verified `sub`.',
+      'Creates the 1:1 registration for the authenticated LINE user and moves them to `PENDING` (rich menu stays `TYPE_1`). `departmentId`/`personnelRoleId` must reference non-deleted options. Returns the caller’s status view so the frontend can route to the Pending screen without a second call. There is no `lineUserId` body field — the identity is the verified `sub`.',
   })
   @ApiCreatedResponse({
     description: 'Registered; access is now PENDING.',
     type: LineUserStatusResponseDto,
   })
   @ApiBadRequestResponse({
-    description: 'Missing/blank field, bad phone, or an unknown extra key.',
+    description:
+      'Missing/blank field, bad phone, a deleted/unknown option id, or an unknown extra key.',
     type: ErrorResponseDto,
   })
   @ApiUnauthorizedResponse({
@@ -90,7 +120,7 @@ export class LineRegistrationController {
     type: ErrorResponseDto,
   })
   @ApiConflictResponse({
-    description: 'Already registered, or the student/staff ID is taken.',
+    description: 'Already registered, or the staff ID is taken.',
     type: ErrorResponseDto,
   })
   @ApiBadGatewayResponse({
@@ -102,5 +132,45 @@ export class LineRegistrationController {
     @Body() dto: CreateLineUserRegistrationDto,
   ): Promise<LineUserStatusResponseDto> {
     return this.users.register(req.lineUserId as string, dto);
+  }
+
+  @Patch('registration')
+  @UseGuards(LineIdTokenGuard)
+  @ApiOperation({
+    summary: 'Edit your registration while PENDING (full re-submit).',
+    description:
+      'A caller whose `access` is strictly `PENDING` may update all their registration fields. `ALLOWED`/`BLOCKED`/`UNREGISTERED` → `403` (no partial write). `access` stays `PENDING` and the rich menu stays `TYPE_1`; no LINE push fires. Same validation as register (options must be non-deleted; a `staffId` taken by another registration → `409`; re-submitting your own is fine). No `lineUserId` body field.',
+  })
+  @ApiOkResponse({
+    description: 'Updated; still PENDING.',
+    type: LineUserStatusResponseDto,
+  })
+  @ApiBadRequestResponse({
+    description:
+      'Missing/blank field, bad phone, a deleted/unknown option id, or an unknown extra key.',
+    type: ErrorResponseDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'Missing/invalid/expired/wrong-aud LINE ID token.',
+    type: ErrorResponseDto,
+  })
+  @ApiForbiddenResponse({
+    description:
+      'The caller is not PENDING (ALLOWED / BLOCKED / UNREGISTERED).',
+    type: ErrorResponseDto,
+  })
+  @ApiConflictResponse({
+    description: 'The staff ID is taken by another registration.',
+    type: ErrorResponseDto,
+  })
+  @ApiBadGatewayResponse({
+    description: 'LINE verification endpoint unreachable (retryable).',
+    type: ErrorResponseDto,
+  })
+  updateRegistration(
+    @Req() req: RequestWithLineUserId,
+    @Body() dto: UpdateLineUserRegistrationDto,
+  ): Promise<LineUserStatusResponseDto> {
+    return this.users.updateRegistration(req.lineUserId as string, dto);
   }
 }

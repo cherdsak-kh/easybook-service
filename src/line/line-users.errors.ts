@@ -20,5 +20,21 @@ export const LINE_RICH_MENU_APPLY_FAILED =
  * the caller already has a registration vs. the submitted ID belongs to someone else.
  */
 export const ALREADY_REGISTERED = 'This LINE user is already registered.';
-export const STUDENT_STAFF_ID_TAKEN =
-  'This student/staff ID is already registered.';
+export const STAFF_ID_TAKEN = 'This staff ID is already registered.';
+
+/**
+ * A chosen `departmentId`/`personnelRoleId` did not resolve to a NON-DELETED option (SC-3.2/SC-B6).
+ * A soft-deleted or unknown option is a client-side validation failure → `400`, not a `409`
+ * (the app has no `422` convention). Distinct messages so the frontend can flag the right field.
+ */
+export const INVALID_DEPARTMENT = 'The selected department is not available.';
+export const INVALID_PERSONNEL_ROLE =
+  'The selected personnel role is not available.';
+
+/**
+ * The PENDING-only self-edit gate (SC-3.3/SC-B9). An authorization-by-state rejection (403),
+ * distinct from register's duplicate-resource `409`: only a caller whose `access` is strictly
+ * `PENDING` may edit their registration. Deterministic, with no partial write.
+ */
+export const REGISTRATION_NOT_EDITABLE =
+  'Your registration can only be edited while it is pending review.';
