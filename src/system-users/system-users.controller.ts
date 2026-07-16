@@ -12,6 +12,7 @@ import {
 } from '@nestjs/common';
 import { SystemRole } from '@prisma/client';
 import {
+  ApiBadRequestResponse,
   ApiConflictResponse,
   ApiCookieAuth,
   ApiCreatedResponse,
@@ -35,6 +36,7 @@ import { CreateSystemUserDto } from './dto/create-system-user.dto';
 import { ListSystemUsersQueryDto } from './dto/list-system-users-query.dto';
 import { PaginatedSystemUsersResponseDto } from './dto/paginated-system-users-response.dto';
 import { SystemUserResponseDto } from './dto/system-user-response.dto';
+import { SystemUserWithTemporaryPasswordDto } from './dto/system-user-with-temporary-password.dto';
 import { UpdateSystemUserDto } from './dto/update-system-user.dto';
 import { SystemUsersService } from './system-users.service';
 import type { Actor } from './system-users.policy';
@@ -68,16 +70,25 @@ export class SystemUsersController {
   @ApiOperation({
     summary: 'Create a back-office user.',
     description:
-      'The only creation path besides the offline seed script. There is no public registration. `lineUserId` is not accepted — any extra key is a 400.',
+      'The only creation path besides the offline seed script. There is no public registration. The SERVER issues a temporary password and returns it EXACTLY ONCE as `temporaryPassword` — it is argon2id-hashed at rest, never logged, and never retrievable again; deliver it out-of-band. `password` and `lineUserId` are not accepted — any extra key is a 400. `departmentId`/`personnelRoleId` must reference ACTIVE options.',
   })
   @ApiHeader({ name: 'x-csrf-token', required: true })
-  @ApiCreatedResponse({ description: 'Created.', type: SystemUserResponseDto })
+  @ApiCreatedResponse({
+    description: 'Created. Carries the one-time `temporaryPassword`.',
+    type: SystemUserWithTemporaryPasswordDto,
+  })
+  @ApiBadRequestResponse({
+    description:
+      'Validation failed, or departmentId/personnelRoleId is unknown or soft-deleted.',
+    type: ErrorResponseDto,
+  })
   @ApiUnauthorizedResponse({
     description: 'No session.',
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'Not a SUPER_ADMIN, or CSRF failure.',
+    description:
+      'Not a SUPER_ADMIN, CSRF failure, or a password change is required.',
     type: ErrorResponseDto,
   })
   @ApiConflictResponse({
@@ -92,7 +103,7 @@ export class SystemUsersController {
   create(
     @CurrentUser() actor: AuthenticatedSystemUser,
     @Body() dto: CreateSystemUserDto,
-  ): Promise<SystemUserResponseDto> {
+  ): Promise<SystemUserWithTemporaryPasswordDto> {
     return this.systemUsers.create(actor.id, dto);
   }
 
@@ -263,5 +274,45 @@ export class SystemUsersController {
   })
   restore(@Param('id') id: string): Promise<SystemUserResponseDto> {
     return this.systemUsers.restore(id);
+  }
+
+  // Declared adjacent to `:id/restore` — the only other 3-segment POST, and a different literal in
+  // the same position, so the two cannot collide. @HttpCode(200) is MANDATORY: Nest defaults POST to
+  // 201 and this creates nothing.
+  @Post(':id/reset-password')
+  @HttpCode(200)
+  @Roles(SystemRole.SUPER_ADMIN)
+  @ApiOperation({
+    summary: 'Issue a new temporary password for a user.',
+    description:
+      'Generates a new temporary password, stores only its argon2id digest, and sets `mustChangePassword` — confining the target to the password-change screen until they set their own. The plaintext is returned EXACTLY ONCE as `temporaryPassword`; deliver it out-of-band. You cannot reset your OWN password (use POST /auth/system/password). A SUSPENDED user is a valid target — the flags are orthogonal — though they still cannot log in.',
+  })
+  @ApiHeader({ name: 'x-csrf-token', required: true })
+  @ApiOkResponse({
+    description: 'Reset. Carries the one-time `temporaryPassword`.',
+    type: SystemUserWithTemporaryPasswordDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'No session.',
+    type: ErrorResponseDto,
+  })
+  @ApiForbiddenResponse({
+    description:
+      'Not a SUPER_ADMIN; CSRF failure; resetting your own password; or a password change is required.',
+    type: ErrorResponseDto,
+  })
+  @ApiNotFoundResponse({
+    description: 'Unknown or soft-deleted id.',
+    type: ErrorResponseDto,
+  })
+  @ApiServiceUnavailableResponse({
+    description: 'Session store unavailable.',
+    type: ErrorResponseDto,
+  })
+  resetPassword(
+    @CurrentUser() actor: AuthenticatedSystemUser,
+    @Param('id') id: string,
+  ): Promise<SystemUserWithTemporaryPasswordDto> {
+    return this.systemUsers.resetPassword(actorOf(actor), id);
   }
 }

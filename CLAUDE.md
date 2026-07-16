@@ -51,6 +51,12 @@ the DOCKER-1 backlog item.
 (registered `global: true` so `LoginThrottleGuard` can resolve it) → `HealthModule` → `LineModule`
 → `AuthModule` → `SystemUsersModule`. Domain modules (Resource, Booking, etc.) don't exist yet —
 they are added as their own future tasks; don't assume they're stubbed out anywhere.
+`AuthModule` ↔ `SystemUsersModule` is a genuine circular reference resolved with `forwardRef` on both
+sides: `SystemUsersModule` needs the guards, and `AuthSystemController` needs `SystemUsersService`
+(which owns every `SystemUser` write — `PATCH /auth/system/me` and the avatar's `profilePictureUrl`
+included). Re-providing `SystemUsersService` in `AuthModule` instead would mint a **second instance**
+and is exactly the drift `PUBLIC_FIELDS` exists to prevent. `StorageModule` is imported by `AuthModule`
+only.
 
 **API surface**: the global prefix is `API_BASE_PATH` (`src/common/api.constants.ts` = `/api/v1`).
 Controllers are mounted under that automatically via `main.ts`; don't hardcode `/api/v1` in
@@ -113,6 +119,32 @@ two domains share **no session and no authentication surface**.
 - **The CSRF token is the `x-csrf-token` header, never a body field.** `forbidNonWhitelisted: true`
   would reject a `_csrf` body key with `400` before the CSRF middleware ever saw it. `GET`/`HEAD`/
   `OPTIONS` are exempt. Mint one at `GET /auth/system/csrf`; it is stateless and survives login.
+- **`SystemUser.departmentId` / `personnelRoleId` are required FKs** into the admin-curated
+  `Department` / `PersonnelRole` option tables — the same tables LINE registrations use. They replaced
+  the former free-text `position` / `department` columns on 2026-07-16 (**DD-7 superseded by the PO**;
+  its real intent — "these are not a Prisma `enum`" — is preserved, since an admin-managed table is
+  not an enum). `personnelRole` is the model; **"Position" is only the UI label**.
+  **Read/write asymmetry, and it is deliberate:** reads (`PUBLIC_FIELDS`' nested selects) carry **no
+  `deletedAt` filter**, so a soft-deleted option keeps resolving its name for an existing assignment
+  forever; writes must reference an **active** option, validated by `findFirst({ id, deletedAt: null })`
+  **inside the write transaction** → `400`. The FK does **not** do that job — `onDelete: Restrict`
+  guards *hard* deletes, and a soft-deleted row still exists, so Postgres accepts it happily. Adding a
+  `deletedAt` filter to the read would return `null` against a non-nullable DTO field and 500 the list.
+- **`mustChangePassword` is the forced-reset gate** (camelCase, `@default(true)`). A temp password is
+  issued by `POST /system-users` and `POST /system-users/:id/reset-password`, returned **exactly once**
+  as `temporaryPassword`, argon2id-hashed at rest, and **never logged** — keep log lines `id=`-only and
+  never add a request/response body logger. `CreateSystemUserDto` has **no `password` field**: an
+  admin-chosen password would be a second credential path bypassing the gate.
+  **Enforced server-side inside `SessionGuard`**, reusing the row it already re-reads (zero extra
+  queries), via `Reflector` + the **deny-by-default** `@AllowPasswordChangeGate()` decorator. A
+  *global* guard cannot work — globals run before controller guards, so `req.systemUser` would be
+  undefined. The exempt set is **exactly**: `GET /auth/system/csrf`, `POST /auth/system/login` (both
+  unguarded anyway), `POST /auth/system/logout`, `GET /auth/system/me`, `POST /auth/system/password`,
+  `GET /health`. **Everything else is 403**, explicitly including `PATCH /auth/system/me` and
+  `POST /auth/system/me/avatar`. Widening this list is a hole; narrowing it is a permanent lockout —
+  the e2e lockout matrix in `test/staff-management.e2e-spec.ts` exists to keep both true. **A frontend
+  redirect is UX, never the control.** A wrong `currentPassword` on the change endpoint is a **400,
+  never a 401** (401 is the SPA's session-dead signal and would log the user out for a typo).
 - **`isActive` vs `deletedAt` are orthogonal and must both be checked.** `isActive = false` is a
   reversible suspension — the user exists, appears in listings, resolves as a `createdBy`.
   `deletedAt != null` is soft deletion — invisible to every route; the row survives *only* to keep
@@ -128,7 +160,41 @@ two domains share **no session and no authentication surface**.
 - **Authorization lives in exactly one file**, `src/system-users/system-users.policy.ts`, called
   inside the service's write transaction. `RolesGuard` stays coarse (role only) — it runs before
   `ValidationPipe` and outside the transaction, so it cannot see the DTO or the target row. Do not
-  duplicate the matrix into a guard.
+  duplicate the matrix into a guard. (Option-id *existence* checks are **validation**, not authz, and
+  stay in the service: the policy has no Prisma and no I/O by design.)
+- **`PersonnelRole` is NOT `SystemRole`, and this is now sharper than it used to be.** A `SystemUser`
+  carries **BOTH**: `role: SystemRole` (the `SUPER_ADMIN | ADMIN | STAFF` RBAC **enum** — the *only*
+  thing that grants privilege, read only by `RolesGuard` and `system-users.policy.ts`) **and**
+  `personnelRole: PersonnelRole` (an admin-curated **job title row** that grants **nothing**, read only
+  by a `select` that reaches a DTO). They are adjacent fields on one model, so the mistake is now
+  *typeable*: **`PersonnelRole.name` must never appear in an authorization expression.** A
+  `PersonnelRole` named `"ADMIN"` is a string on a STAFF user who still gets 403 everywhere. Any future
+  `if (user.personnelRole.name === 'ADMIN')` is a privilege-escalation bug — the AC-X3 cross-check in
+  `test/options.e2e-spec.ts` fails the build if one appears, and asserts `role: "STAFF"` and
+  `personnelRole.name: "ADMIN"` coexisting in one `/auth/system/me` body with RBAC winning.
+- **Staff avatars live in Cloudflare R2** (`src/storage/`), the **only** place `@aws-sdk/client-s3` is
+  imported — mock `R2StorageService` in tests, never the SDK, and never hit real R2. Upload is a
+  **backend multipart proxy** (`POST /auth/system/me/avatar`), not a presign: a presigned PUT/POST can
+  only constrain the Content-Type the client *declares*, so it cannot satisfy the server-side
+  enforcement AC-B13 requires. The declared MIME is a first filter only; the **control is a magic-byte
+  sniff**, and the stored `ContentType` + the key's extension come from the **sniffed** type — never
+  from `originalname` (attacker-controlled; the path-traversal / double-extension vector). Key:
+  `avatars/<userId>/<32 hex>.<ext>` — **unguessable**, because the bucket is public-read and avatars
+  are PII. Order: Put → DB write (delete the new object if it fails) → best-effort delete of the old
+  object, guarded by "the old URL must start with `${R2_PUBLIC_BASE_URL}/avatars/`" (an admin may have
+  set an arbitrary external URL; never derive a delete target from a foreign URL). Two traps:
+  multer's size limit surfaces as **413**, but AC-B13 demands **400** — `MulterErrorTo400Filter` is
+  what makes that true; and busboy's `limits.fileSize` is **exclusive**, so the interceptor is handed
+  `AVATAR_MAX_BYTES + 1`. Avatars are a **second data store of PII** and are in `AUTH-ERASURE`'s scope.
+- **R2 environment (exactly five vars):** `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
+  `R2_BUCKET`, `R2_PUBLIC_BASE_URL`. There is deliberately **no `R2_REGION`** (R2 accepts only `auto`
+  — a code constant) and **no `R2_ENDPOINT`** (derived: `https://<account id>.r2.cloudflarestorage.com`).
+  Production-required; format-checked whenever present; `R2_PUBLIC_BASE_URL` must parse and be
+  **https:** (that is what makes `profilePictureUrl`'s https-only contract a *boot-time* guarantee);
+  plus an **all-or-nothing** rule in every environment — a half-configured box fails boot loudly rather
+  than dying at upload time with an opaque SDK error. All five optional when **none** is set, so dev
+  and the test suites need no bucket (the endpoint then throws a request-time 500, mirroring
+  `LINE_LOGIN_CHANNEL_ID`).
 - **`SystemUser.lineUserId` footgun:** it is a **cuid** (`LineUser.id`), *not* the LINE-side `U…`
   identifier — which is what `LineUser.lineUserId` holds. Same field name, two models, different
   values. `prisma.systemUser.findUnique({ where: { lineUserId: event.source.userId } })` type-checks
@@ -151,8 +217,10 @@ webhook) should use `@ApiExcludeController()`.
 **Environment** (see `.env.example`): `PORT` (3300), `CORS_ORIGIN` (defaults to the Vite dev
 server), `SWAGGER_ENABLED`, `DATABASE_URL`, `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET`,
 `REDIS_URL`, `SESSION_SECRET`, `CSRF_SECRET` (must differ from `SESSION_SECRET`),
-`SESSION_COOKIE_NAME` / `_SECURE` / `_SAMESITE`, `SESSION_TTL_SECONDS`, and the `SEED_SUPER_ADMIN_*`
-vars used only by the seed script. `src/config/env.validation.ts` fails the boot on a misconfigured
+`SESSION_COOKIE_NAME` / `_SECURE` / `_SAMESITE`, `SESSION_TTL_SECONDS`, the five `R2_*` vars (see the
+Auth section), and the `SEED_SUPER_ADMIN_*` vars used only by the seed script — note
+`SEED_SUPER_ADMIN_POSITION` / `_DEPARTMENT` keep their names but are now the **name of the option to
+resolve-or-create**, not free text. `src/config/env.validation.ts` fails the boot on a misconfigured
 secret — that is a deploy defect, unlike an unreachable Redis, which is a runtime condition that
 degrades to `503`. Backend and frontend are separate origins by design; with cookie sessions and
 `credentials: true`, the `CORS_ORIGIN` allowlist is a security control and must never become `*`.

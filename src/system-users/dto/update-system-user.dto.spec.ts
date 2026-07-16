@@ -94,7 +94,8 @@ describe('UpdateSystemUserDto (through the global ValidationPipe)', () => {
 
     it('leaves absent keys `undefined` so Prisma omits them from the UPDATE', async () => {
       const dto = await validate({ firstName: 'Ada' });
-      expect(dto.position).toBeUndefined();
+      expect(dto.personnelRoleId).toBeUndefined();
+      expect(dto.departmentId).toBeUndefined();
       expect(dto.role).toBeUndefined();
       expect(dto.isActive).toBeUndefined();
       expect(dto.phoneNumber).toBeUndefined();

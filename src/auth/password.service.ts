@@ -1,6 +1,16 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomInt } from 'node:crypto';
 import { Injectable } from '@nestjs/common';
 import * as argon2 from 'argon2';
+
+/**
+ * Unambiguous alphabet: no `0`/`O`, no `1`/`l`/`I`. A temporary password is read off one screen and
+ * typed into another by a human, so a glyph collision is a support ticket.
+ */
+const TEMP_PASSWORD_ALPHABET =
+  'ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+
+/** 16 chars over a 54-char alphabet ≈ 92 bits. Comfortably clears the ≥12 rule in §5.3. */
+const TEMP_PASSWORD_LENGTH = 16;
 
 /**
  * argon2id password hashing with OWASP-recommended parameters.
@@ -49,5 +59,25 @@ export class PasswordService {
 
   dummyHash(): Promise<string> {
     return this.dummyHashPromise;
+  }
+
+  /**
+   * A single-use temporary password, issued by `POST /system-users` and
+   * `POST /system-users/:id/reset-password`.
+   *
+   * `crypto.randomInt` per character — rejection-sampled by Node, so the draw is unbiased. NEVER
+   * `Math.random`: it is a non-cryptographic PRNG whose internal state is recoverable from a handful
+   * of outputs, which would make every subsequently issued temp password predictable.
+   *
+   * The caller hashes this immediately and returns the plaintext exactly once (AC-B7). It satisfies
+   * the §5.3 new-password rules, so the recipient could technically keep it — they cannot, because
+   * `mustChangePassword` forces the change regardless.
+   */
+  generateTemporaryPassword(): string {
+    let out = '';
+    for (let i = 0; i < TEMP_PASSWORD_LENGTH; i += 1) {
+      out += TEMP_PASSWORD_ALPHABET[randomInt(TEMP_PASSWORD_ALPHABET.length)];
+    }
+    return out;
   }
 }

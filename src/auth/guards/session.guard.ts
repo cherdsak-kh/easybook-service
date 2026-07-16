@@ -1,17 +1,21 @@
 import {
   CanActivate,
   ExecutionContext,
+  ForbiddenException,
   Injectable,
   UnauthorizedException,
 } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
 import { PrismaService } from '../../prisma/prisma.service';
 import { destroySessionQuietly } from '../../session/session.util';
 import { PUBLIC_FIELDS } from '../../system-users/system-users.fields';
 import {
   AUTHENTICATION_REQUIRED,
+  MUST_CHANGE_PASSWORD,
   SESSION_ABSOLUTE_MAX_AGE_MS,
 } from '../auth.constants';
 import type { RequestWithSystemUser } from '../auth.types';
+import { ALLOW_PASSWORD_CHANGE_GATE } from '../decorators/allow-password-change-gate.decorator';
 
 /**
  * Cookie-session authentication.
@@ -26,10 +30,26 @@ import type { RequestWithSystemUser } from '../auth.types';
  * normally still `isActive: true`, so checking `isActive` alone would authenticate a deleted
  * account holding a live cookie; and leaving `deletedAt` on `req.systemUser` would leak it
  * straight into `GET /auth/system/me`'s response body.
+ *
+ * **The forced-reset gate lives here too (AC-B8)**, deliberately:
+ *   - It reuses the row this guard ALREADY read (`mustChangePassword` rides along in
+ *     `PUBLIC_FIELDS`) — zero extra queries, and no second place that can drift from this guard's
+ *     view of the user.
+ *   - A *global* guard cannot work: globals run BEFORE controller-level guards, so it would find
+ *     `req.systemUser` undefined and would have to issue its own DB read. A *non-global* second
+ *     guard would have to be remembered on every future controller — the exact omission that
+ *     becomes a hole.
+ *
+ * Order is load-bearing: `deletedAt`/`isActive` are 401s that DESTROY the session and fire FIRST, so
+ * a suspended or soft-deleted user never reaches the reset screen. `mustChangePassword` is a
+ * CREDENTIAL state, not a fourth lifecycle state: the session is KEPT and the answer is 403.
  */
 @Injectable()
 export class SessionGuard implements CanActivate {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly reflector: Reflector,
+  ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const req = context.switchToHttp().getRequest<RequestWithSystemUser>();
@@ -68,6 +88,19 @@ export class SessionGuard implements CanActivate {
     if (deletedAt !== null || !publicUser.isActive) {
       await destroySessionQuietly(req);
       throw new UnauthorizedException(AUTHENTICATION_REQUIRED);
+    }
+
+    // The forced-reset gate. Deny by default; opt out with @AllowPasswordChangeGate(). The session
+    // survives — this is a credential state, not a lifecycle failure — so the caller can still reach
+    // the three exempt doors (logout / GET me / POST password) and change their password.
+    if (
+      publicUser.mustChangePassword &&
+      !this.reflector.getAllAndOverride<boolean>(ALLOW_PASSWORD_CHANGE_GATE, [
+        context.getHandler(),
+        context.getClass(),
+      ])
+    ) {
+      throw new ForbiddenException(MUST_CHANGE_PASSWORD);
     }
 
     req.systemUser = publicUser;

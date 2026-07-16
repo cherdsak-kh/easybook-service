@@ -11,11 +11,14 @@ import { SystemUsersService } from './system-users.service';
 import {
   CONCURRENT_MODIFICATION,
   EMAIL_TAKEN,
+  INVALID_DEPARTMENT,
+  INVALID_PERSONNEL_ROLE,
   LAST_SUPER_ADMIN,
   SYSTEM_USER_NOT_FOUND,
   USER_NOT_DELETED,
 } from './system-users.errors';
 import { PUBLIC_FIELDS } from './system-users.fields';
+import { CANNOT_RESET_OWN_PASSWORD } from './system-users.policy';
 import type { Actor } from './system-users.policy';
 
 const SUPER_ADMIN_ACTOR: Actor = { id: 'sa-1', role: SystemRole.SUPER_ADMIN };
@@ -27,8 +30,9 @@ const row = {
   firstName: 'Other',
   lastName: 'Super Admin',
   role: SystemRole.SUPER_ADMIN,
-  position: 'Director',
-  department: 'IT',
+  department: { id: 7, name: 'IT' },
+  personnelRole: { id: 9, name: 'Director' },
+  mustChangePassword: false,
   phoneNumber: null,
   profilePictureUrl: null,
   isActive: true,
@@ -78,10 +82,14 @@ describe('SystemUsersService', () => {
   const txFindUnique = jest.fn();
   const txUpdate = jest.fn();
   const txCount = jest.fn();
+  const txCreate = jest.fn();
+  const txDepartmentFindFirst = jest.fn();
+  const txPersonnelRoleFindFirst = jest.fn();
   const create = jest.fn();
   const findFirst = jest.fn();
   const findMany = jest.fn();
   const count = jest.fn();
+  const update = jest.fn();
   const $transaction = jest.fn();
 
   const tx = {
@@ -90,16 +98,27 @@ describe('SystemUsersService', () => {
       findUnique: txFindUnique,
       update: txUpdate,
       count: txCount,
+      create: txCreate,
     },
+    department: { findFirst: txDepartmentFindFirst },
+    personnelRole: { findFirst: txPersonnelRoleFindFirst },
   } as unknown as Prisma.TransactionClient;
 
   const prisma = {
-    systemUser: { create, findFirst, findMany, count },
+    systemUser: { create, findFirst, findMany, count, update },
     $transaction,
   } as unknown as PrismaService;
 
+  // Standalone jest.fn()s (the spec's existing style for `create`, `findFirst`, …) so assertions
+  // reference the mock directly rather than an unbound method off the service object.
+  const hash = jest.fn().mockResolvedValue('$argon2id$x');
+  const generateTemporaryPassword = jest
+    .fn()
+    .mockReturnValue('TempPassword123x');
+
   const password = {
-    hash: jest.fn().mockResolvedValue('$argon2id$x'),
+    hash,
+    generateTemporaryPassword,
   } as unknown as PasswordService;
 
   /** Runs the interactive-transaction callback, capturing its isolation options. */
@@ -125,32 +144,94 @@ describe('SystemUsersService', () => {
   describe('create', () => {
     const dto = {
       email: 'Other@EasyBook.Local',
-      password: 'a-long-enough-password',
       firstName: 'Other',
       lastName: 'Super Admin',
-      position: 'Director',
-      department: 'IT',
+      departmentId: 7,
+      personnelRoleId: 9,
     };
 
-    it('hashes the password, stamps createdById, and selects only public fields', async () => {
-      create.mockResolvedValue(row);
+    /** Both option lookups resolve; the insert returns `row`. */
+    const happyPath = () => {
+      runInteractiveTx();
+      txDepartmentFindFirst.mockResolvedValue({ id: 7 });
+      txPersonnelRoleFindFirst.mockResolvedValue({ id: 9 });
+      txCreate.mockResolvedValue(row);
+    };
+
+    it('hashes the SERVER-issued temp password, stamps createdById, and selects only public fields', async () => {
+      happyPath();
 
       await service.create('sa-1', dto);
 
-      const args = create.mock.calls[0] as [
+      const args = txCreate.mock.calls[0] as [
         { data: Record<string, unknown>; select: unknown },
       ];
       expect(args[0].data).toMatchObject({
         email: 'other@easybook.local',
         createdById: 'sa-1',
+        departmentId: 7,
+        personnelRoleId: 9,
+        mustChangePassword: true, // explicit, not left to the DB default
         phoneNumber: null,
         profilePictureUrl: null,
       });
       expect(args[0].select).toBe(PUBLIC_FIELDS);
     });
 
+    it('AC-B7 — returns the temp password once and stores ONLY its digest, never the plaintext', async () => {
+      happyPath();
+
+      const result = await service.create('sa-1', dto);
+
+      expect(result.temporaryPassword).toBe('TempPassword123x');
+      expect(hash).toHaveBeenCalledWith('TempPassword123x');
+
+      // The plaintext must never reach a column: the digest is what is written.
+      const { data } = writeArgsOf(txCreate);
+      expect(data.passwordHash).toBe('$argon2id$x');
+      expect(JSON.stringify(data)).not.toContain('TempPassword123x');
+    });
+
+    it('AC-B3 — a soft-deleted or unknown departmentId is a 400, and nothing is written', async () => {
+      runInteractiveTx();
+      txDepartmentFindFirst.mockResolvedValue(null); // soft-deleted == absent to this check
+
+      await expect(
+        captureHttpError(service.create('sa-1', dto)),
+      ).resolves.toEqual({ status: 400, message: INVALID_DEPARTMENT });
+      expect(txCreate).not.toHaveBeenCalled();
+    });
+
+    it('AC-B3 — a soft-deleted or unknown personnelRoleId is a 400, and nothing is written', async () => {
+      runInteractiveTx();
+      txDepartmentFindFirst.mockResolvedValue({ id: 7 });
+      txPersonnelRoleFindFirst.mockResolvedValue(null);
+
+      await expect(
+        captureHttpError(service.create('sa-1', dto)),
+      ).resolves.toEqual({ status: 400, message: INVALID_PERSONNEL_ROLE });
+      expect(txCreate).not.toHaveBeenCalled();
+    });
+
+    it('validates the options with an ACTIVE-only filter, inside the transaction', async () => {
+      happyPath();
+      await service.create('sa-1', dto);
+
+      expect(txDepartmentFindFirst).toHaveBeenCalledWith({
+        where: { id: 7, deletedAt: null },
+        select: { id: true },
+      });
+      expect(txPersonnelRoleFindFirst).toHaveBeenCalledWith({
+        where: { id: 9, deletedAt: null },
+        select: { id: true },
+      });
+    });
+
     it('maps a unique-constraint violation to 409 with the generic message (AC-26, AC-33, AC-54)', async () => {
-      create.mockRejectedValue(
+      runInteractiveTx();
+      txDepartmentFindFirst.mockResolvedValue({ id: 7 });
+      txPersonnelRoleFindFirst.mockResolvedValue({ id: 9 });
+      txCreate.mockRejectedValue(
         new Prisma.PrismaClientKnownRequestError('unique', {
           code: 'P2002',
           clientVersion: '7.8.0',
@@ -165,9 +246,73 @@ describe('SystemUsersService', () => {
     });
 
     it('never adds a deletedAt filter or a read-then-write pre-check for duplicates', async () => {
-      create.mockResolvedValue(row);
+      happyPath();
       await service.create('sa-1', dto);
-      expect(findFirst).not.toHaveBeenCalled();
+      expect(txFindFirst).not.toHaveBeenCalled();
+    });
+  });
+
+  // ───────────────────────── reset-password ─────────────────────────
+
+  describe('resetPassword', () => {
+    const target = { id: 'sa-2', role: SystemRole.STAFF };
+
+    it('AC-B7 — issues a new temp password, sets mustChangePassword, returns the plaintext once', async () => {
+      runInteractiveTx();
+      txFindFirst.mockResolvedValue(target);
+      txUpdate.mockResolvedValue(row);
+
+      const result = await service.resetPassword(SUPER_ADMIN_ACTOR, 'sa-2');
+
+      expect(result.temporaryPassword).toBe('TempPassword123x');
+      const { data } = writeArgsOf(txUpdate);
+      expect(data).toEqual({
+        passwordHash: '$argon2id$x',
+        mustChangePassword: true,
+      });
+      // Only the digest is written — never the plaintext.
+      expect(JSON.stringify(data)).not.toContain('TempPassword123x');
+    });
+
+    it('resolves the target with a deletedAt filter — a soft-deleted id is a 404', async () => {
+      runInteractiveTx();
+      txFindFirst.mockResolvedValue(null);
+
+      await expect(
+        captureHttpError(service.resetPassword(SUPER_ADMIN_ACTOR, 'gone')),
+      ).resolves.toEqual({ status: 404, message: SYSTEM_USER_NOT_FOUND });
+      expect(txFindFirst).toHaveBeenCalledWith({
+        where: { id: 'gone', deletedAt: null },
+        select: { id: true, role: true },
+      });
+    });
+
+    it('refuses a self-reset via the policy (403), and writes nothing', async () => {
+      runInteractiveTx();
+      txFindFirst.mockResolvedValue({
+        id: 'sa-1',
+        role: SystemRole.SUPER_ADMIN,
+      });
+
+      await expect(
+        captureHttpError(service.resetPassword(SUPER_ADMIN_ACTOR, 'sa-1')),
+      ).resolves.toEqual({ status: 403, message: CANNOT_RESET_OWN_PASSWORD });
+      expect(txUpdate).not.toHaveBeenCalled();
+    });
+
+    it('never touches role, isActive or deletedAt, so the last-SUPER_ADMIN invariant is unreachable', async () => {
+      runInteractiveTx();
+      txFindFirst.mockResolvedValue(target);
+      txUpdate.mockResolvedValue(row);
+
+      await service.resetPassword(SUPER_ADMIN_ACTOR, 'sa-2');
+
+      const { data } = writeArgsOf(txUpdate);
+      expect(data).not.toHaveProperty('role');
+      expect(data).not.toHaveProperty('isActive');
+      expect(data).not.toHaveProperty('deletedAt');
+      expect(txCount).not.toHaveBeenCalled(); // no invariant check
+      expect(txOptionsOf()).toBeUndefined(); // and therefore no Serializable
     });
   });
 
@@ -272,17 +417,17 @@ describe('SystemUsersService', () => {
       expect(txUpdate).not.toHaveBeenCalled();
     });
 
-    it('builds `data` field by field — exactly the seven DTO fields, never a spread (DD-13, AC-60)', async () => {
+    it('builds `data` field by field — exactly the eight DTO fields, never a spread (DD-13, AC-60)', async () => {
       await service.update(SUPER_ADMIN_ACTOR, 'staff-1', { firstName: 'Ada' });
 
       const { data, select } = writeArgsOf(txUpdate);
       expect(Object.keys(data).sort()).toEqual([
-        'department',
+        'departmentId',
         'firstName',
         'isActive',
         'lastName',
+        'personnelRoleId',
         'phoneNumber',
-        'position',
         'profilePictureUrl',
         'role',
       ]);

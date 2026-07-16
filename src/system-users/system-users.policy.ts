@@ -43,6 +43,8 @@ export const ADMIN_MAY_ONLY_MODIFY_STAFF =
 export const ONLY_SUPER_ADMIN_MAY_DELETE =
   'Only a SUPER_ADMIN may delete a user.';
 export const INSUFFICIENT_ROLE = 'Insufficient role.';
+export const CANNOT_RESET_OWN_PASSWORD =
+  'You cannot reset your own password. Use the change-password endpoint instead.';
 
 export function canPatch(
   actor: Actor,
@@ -86,5 +88,21 @@ export function canDelete(actor: Actor, target: Target): PolicyResult {
   // Unreachable: @Roles(SUPER_ADMIN) fires before the target is even loaded.
   if (actor.role !== SystemRole.SUPER_ADMIN)
     return deny(ONLY_SUPER_ADMIN_MAY_DELETE);
+  return allow();
+}
+
+/**
+ * `POST /system-users/:id/reset-password`. SUPER_ADMIN-only (enforced coarsely by `@Roles`); the one
+ * target-dependent rule is "not yourself".
+ *
+ * A SUPER_ADMIN resetting themselves would burn their own working password and put themselves behind
+ * the forced-reset gate for no reason — the same class of foot-gun as `canDelete`'s self-rule, and
+ * consistent with it. It is not a lockout (they hold the temp password), but `POST /auth/system/password`
+ * is the correct door.
+ */
+export function canResetPassword(actor: Actor, target: Target): PolicyResult {
+  if (actor.id === target.id) return deny(CANNOT_RESET_OWN_PASSWORD);
+  // Unreachable: @Roles(SUPER_ADMIN) fires before the target is even loaded. Defence in depth.
+  if (actor.role !== SystemRole.SUPER_ADMIN) return deny(INSUFFICIENT_ROLE);
   return allow();
 }

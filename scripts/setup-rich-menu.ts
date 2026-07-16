@@ -33,7 +33,7 @@ const menuType1: MenuDef = {
     size: { width: 2500, height: 843 },
     selected: true,
     name: 'easy-book-liff',
-    chatBarText: 'Welcome to EasyBook',
+    chatBarText: 'EasyBook App',
     areas: [
       {
         bounds: { x: 0, y: 0, width: 2500, height: 843 },
@@ -109,7 +109,11 @@ async function main(): Promise<void> {
       const richMenuId = await line.createRichMenu(menu);
       console.log(`Created rich menu '${key}':`, richMenuId);
 
-      await line.setRichMenuImage(richMenuId, readFileSync(image), 'image/jpeg');
+      await line.setRichMenuImage(
+        richMenuId,
+        readFileSync(image),
+        'image/jpeg',
+      );
       console.log(`  uploaded ${image}`);
 
       if (key === defaultKey) {

@@ -11,6 +11,7 @@ import {
   clearThrottleCounters,
   createE2eApp,
   prismaOf,
+  ensureE2eOptions,
   purgeE2eUsers,
   redisOf,
   waitForRedis,
@@ -160,7 +161,13 @@ describe('LINE Users management (e2e)', () => {
     optionIds.personnelRoleId = prole.id;
 
     const passwordHash = await new PasswordService().hash(PASSWORD);
-    const base = { passwordHash, position: 'Director', department: 'IT' };
+    // mustChangePassword: false — these fixtures are already-onboarded users. The model default
+    // is TRUE (deny by default), so omitting it would gate every fixture into a 403.
+    const base = {
+      passwordHash,
+      mustChangePassword: false,
+      ...(await ensureE2eOptions(prisma)),
+    };
     for (const [email, role] of [
       [SUPER, SystemRole.SUPER_ADMIN],
       [ADMIN, SystemRole.ADMIN],

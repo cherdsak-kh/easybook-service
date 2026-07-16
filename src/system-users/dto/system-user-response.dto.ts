@@ -1,5 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { SystemRole } from '@prisma/client';
+import { SystemUserOptionDto } from './system-user-option.dto';
 
 /**
  * The one canonical public view of a `SystemUser`. Exactly the `PUBLIC_FIELDS` select.
@@ -20,14 +21,29 @@ export class SystemUserResponseDto {
   @ApiProperty({ example: 'Lovelace' })
   lastName!: string;
 
-  @ApiProperty({ enum: SystemRole, example: SystemRole.STAFF })
+  @ApiProperty({
+    enum: SystemRole,
+    example: SystemRole.STAFF,
+    description:
+      'Back-office RBAC. The ONLY field that grants privilege — never `personnelRole`.',
+  })
   role!: SystemRole;
 
-  @ApiProperty({ example: 'Teacher', maxLength: 100 })
-  position!: string;
+  @ApiProperty({ type: SystemUserOptionDto })
+  department!: SystemUserOptionDto;
 
-  @ApiProperty({ example: 'Computer Science', maxLength: 120 })
-  department!: string;
+  @ApiProperty({
+    type: SystemUserOptionDto,
+    description: 'Job title. NOT `role` — grants zero privilege.',
+  })
+  personnelRole!: SystemUserOptionDto;
+
+  @ApiProperty({
+    example: false,
+    description:
+      'True while a temp password is outstanding; every route except logout / GET me / POST password answers 403.',
+  })
+  mustChangePassword!: boolean;
 
   @ApiProperty({
     type: String,

@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -10,19 +11,60 @@ import { PasswordService } from '../auth/password.service';
 import { normaliseEmail } from '../auth/login-throttle.key';
 import { mapTransactionError } from '../common/prisma-tx.util';
 import { PrismaService } from '../prisma/prisma.service';
+import type { UpdateOwnProfileDto } from '../auth/dto/update-own-profile.dto';
 import { CreateSystemUserDto } from './dto/create-system-user.dto';
 import { ListSystemUsersQueryDto } from './dto/list-system-users-query.dto';
 import { PaginatedSystemUsersResponseDto } from './dto/paginated-system-users-response.dto';
 import { SystemUserResponseDto } from './dto/system-user-response.dto';
+import { SystemUserWithTemporaryPasswordDto } from './dto/system-user-with-temporary-password.dto';
 import { UpdateSystemUserDto } from './dto/update-system-user.dto';
 import {
   EMAIL_TAKEN,
+  INVALID_DEPARTMENT,
+  INVALID_PERSONNEL_ROLE,
   LAST_SUPER_ADMIN,
   SYSTEM_USER_NOT_FOUND,
   USER_NOT_DELETED,
 } from './system-users.errors';
 import { PUBLIC_FIELDS, toSystemUserDto } from './system-users.fields';
-import { Actor, canDelete, canPatch } from './system-users.policy';
+import {
+  Actor,
+  canDelete,
+  canPatch,
+  canResetPassword,
+} from './system-users.policy';
+
+/**
+ * The write half of the read/write asymmetry (AC-B3/AC-B4). Runs INSIDE the caller's transaction, so
+ * an option cannot be soft-deleted between the check and the write.
+ *
+ * **The FK does NOT do this job.** `onDelete: Restrict` guards HARD deletes; a soft-deleted option
+ * row still exists, so Postgres accepts the reference happily. Only this check rejects it. Do not
+ * remove it on the theory that "the FK covers it".
+ *
+ * This is VALIDATION, not authorization — it stays in the service and does NOT go into
+ * `system-users.policy.ts` (AC-B12 is about the authz matrix; the policy has no Prisma and no I/O
+ * by design, so an existence check could not live there anyway).
+ */
+async function assertOptionsAreActive(
+  tx: Prisma.TransactionClient,
+  ids: { departmentId?: number; personnelRoleId?: number },
+): Promise<void> {
+  if (ids.departmentId !== undefined) {
+    const ok = await tx.department.findFirst({
+      where: { id: ids.departmentId, deletedAt: null },
+      select: { id: true },
+    });
+    if (!ok) throw new BadRequestException(INVALID_DEPARTMENT);
+  }
+  if (ids.personnelRoleId !== undefined) {
+    const ok = await tx.personnelRole.findFirst({
+      where: { id: ids.personnelRoleId, deletedAt: null },
+      select: { id: true },
+    });
+    if (!ok) throw new BadRequestException(INVALID_PERSONNEL_ROLE);
+  }
+}
 
 /** `role = SUPER_ADMIN AND isActive = true AND deletedAt IS NULL`. */
 const ACTIVE_SUPER_ADMIN: Prisma.SystemUserWhereInput = {
@@ -67,35 +109,53 @@ export class SystemUsersService {
   /**
    * The only creation path besides the offline seed script.
    *
+   * The SERVER issues the password (AC-B7): a temp password is generated, argon2id-hashed, and the
+   * plaintext returned exactly ONCE in this response. `CreateSystemUserDto` has no `password` field,
+   * so there is no second credential path that could bypass the forced-reset gate.
+   *
    * Duplicate handling is write-then-catch, never read-then-write: two concurrent inserts of the
    * same email must yield one `201` and one `409`, which only the unique constraint can guarantee.
    * The `@unique` index spans soft-deleted rows, so a deleted user's email collides for free — and
    * the message stays generic so it never reveals that the colliding row is deleted.
+   *
+   * The transaction exists because the option validation must see the same snapshot as the write.
    */
   async create(
     actorId: string,
     dto: CreateSystemUserDto,
-  ): Promise<SystemUserResponseDto> {
-    const digest = await this.password.hash(dto.password);
+  ): Promise<SystemUserWithTemporaryPasswordDto> {
+    const temporaryPassword = this.password.generateTemporaryPassword();
+    const digest = await this.password.hash(temporaryPassword);
 
     try {
-      const created = await this.prisma.systemUser.create({
-        data: {
-          email: normaliseEmail(dto.email), // defence in depth; the DTO already normalised it
-          passwordHash: digest,
-          firstName: dto.firstName,
-          lastName: dto.lastName,
-          role: dto.role,
-          position: dto.position,
-          department: dto.department,
-          phoneNumber: dto.phoneNumber ?? null,
-          profilePictureUrl: dto.profilePictureUrl ?? null,
-          createdById: actorId,
-        },
-        select: PUBLIC_FIELDS,
+      const created = await this.prisma.$transaction(async (tx) => {
+        await assertOptionsAreActive(tx, {
+          departmentId: dto.departmentId,
+          personnelRoleId: dto.personnelRoleId,
+        });
+
+        return tx.systemUser.create({
+          data: {
+            email: normaliseEmail(dto.email), // defence in depth; the DTO already normalised it
+            passwordHash: digest,
+            firstName: dto.firstName,
+            lastName: dto.lastName,
+            role: dto.role,
+            departmentId: dto.departmentId,
+            personnelRoleId: dto.personnelRoleId,
+            // Explicit, not relying on the DB default: this is the flag's whole point.
+            mustChangePassword: true,
+            phoneNumber: dto.phoneNumber ?? null,
+            profilePictureUrl: dto.profilePictureUrl ?? null,
+            createdById: actorId,
+          },
+          select: PUBLIC_FIELDS,
+        });
       });
+
+      // `id=`-only, exactly as before. NEVER log the DTO or the temp password (AC-B7).
       this.logger.log(`SystemUser created. id=${created.id} by=${actorId}`);
-      return toSystemUserDto(created);
+      return { ...toSystemUserDto(created), temporaryPassword };
     } catch (error) {
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -105,6 +165,50 @@ export class SystemUsersService {
       }
       throw error;
     }
+  }
+
+  /**
+   * `POST /system-users/:id/reset-password` — issue a NEW temp password, returned once (AC-B7).
+   *
+   * Needs none of the heavier machinery, provably: the write cannot change `role`, `isActive` or
+   * `deletedAt`, so it cannot decrease the active-SUPER_ADMIN count ⇒ no invariant check ⇒ no
+   * `Serializable` ⇒ no `mapTransactionError`. Same shape of argument as `restore`.
+   *
+   * A SUSPENDED (`isActive: false`) target is a VALID target — the flags are orthogonal. Resetting
+   * their password is allowed; they still cannot log in. Do not add an `isActive` filter.
+   *
+   * Accepted race (documented, not engineered around): two SUPER_ADMINs resetting the same target
+   * concurrently both receive a syntactically valid temp password; only the last committed one works.
+   * Both actors are SUPER_ADMINs, so this is a UX wrinkle, not a security defect.
+   */
+  async resetPassword(
+    actor: Actor,
+    id: string,
+  ): Promise<SystemUserWithTemporaryPasswordDto> {
+    const temporaryPassword = this.password.generateTemporaryPassword();
+    const digest = await this.password.hash(temporaryPassword);
+
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const target = await tx.systemUser.findFirst({
+        where: { id, deletedAt: null }, // a soft-deleted id is byte-identical to an unknown one
+        select: { id: true, role: true },
+      });
+      if (!target) throw new NotFoundException(SYSTEM_USER_NOT_FOUND);
+
+      const verdict = canResetPassword(actor, target);
+      if (!verdict.allowed) throw new ForbiddenException(verdict.reason);
+
+      return tx.systemUser.update({
+        where: { id: target.id },
+        data: { passwordHash: digest, mustChangePassword: true },
+        select: PUBLIC_FIELDS,
+      });
+    });
+
+    this.logger.log(
+      `SystemUser password reset. id=${updated.id} by=${actor.id}`,
+    );
+    return { ...toSystemUserDto(updated), temporaryPassword };
   }
 
   /**
@@ -179,6 +283,12 @@ export class SystemUsersService {
       const verdict = canPatch(actor, target, patch); // steps 5 + 6
       if (!verdict.allowed) throw new ForbiddenException(verdict.reason);
 
+      // Inside the transaction, so an option cannot be soft-deleted between check and write.
+      await assertOptionsAreActive(tx, {
+        departmentId: patch.departmentId,
+        personnelRoleId: patch.personnelRoleId,
+      });
+
       const updated = await tx.systemUser.update({
         where: { id: target.id },
         // EXPLICIT, field by field. Never `data: { ...patch }` — a spread would silently make any
@@ -188,8 +298,8 @@ export class SystemUsersService {
         data: {
           firstName: patch.firstName,
           lastName: patch.lastName,
-          position: patch.position,
-          department: patch.department,
+          departmentId: patch.departmentId,
+          personnelRoleId: patch.personnelRoleId,
           phoneNumber: patch.phoneNumber,
           profilePictureUrl: patch.profilePictureUrl,
           role: patch.role,
@@ -295,5 +405,41 @@ export class SystemUsersService {
       this.logger.log(`SystemUser restored. id=${restored.id}`);
       return toSystemUserDto(restored);
     });
+  }
+
+  /**
+   * `PATCH /auth/system/me` — the caller edits their OWN profile (`SELF-PROFILE-1`).
+   *
+   * No policy call and no transaction, deliberately: the allowlist is `UpdateOwnProfileDto`'s field
+   * set (enforced by `forbidNonWhitelisted` at the pipe), there is no target but self, and no field
+   * here bears an invariant. A single-row update with no cross-row read needs no ceremony.
+   *
+   * Field by field, never `{...dto}` — same discipline as `update()`.
+   */
+  async updateOwnProfile(
+    id: string,
+    patch: UpdateOwnProfileDto,
+  ): Promise<SystemUserResponseDto> {
+    const updated = await this.prisma.systemUser.update({
+      where: { id },
+      data: {
+        firstName: patch.firstName,
+        lastName: patch.lastName,
+        phoneNumber: patch.phoneNumber,
+        profilePictureUrl: patch.profilePictureUrl,
+      },
+      select: PUBLIC_FIELDS,
+    });
+    return toSystemUserDto(updated);
+  }
+
+  /** The `profilePictureUrl` write behind `POST /auth/system/me/avatar`. */
+  async setOwnAvatar(id: string, url: string): Promise<SystemUserResponseDto> {
+    const updated = await this.prisma.systemUser.update({
+      where: { id },
+      data: { profilePictureUrl: url },
+      select: PUBLIC_FIELDS,
+    });
+    return toSystemUserDto(updated);
   }
 }

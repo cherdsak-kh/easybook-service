@@ -13,6 +13,7 @@ import {
   cookieValue,
   createE2eApp,
   prismaOf,
+  ensureE2eOptions,
   purgeE2eUsers,
   readCookie,
   redisOf,
@@ -54,7 +55,13 @@ describe('Auth — /auth/system (e2e)', () => {
   const seed = async () => {
     const password = new PasswordService();
     const passwordHash = await password.hash(PASSWORD);
-    const base = { passwordHash, position: 'Director', department: 'IT' };
+    // mustChangePassword: false — these fixtures are already-onboarded users. The model default
+    // is TRUE (deny by default), so omitting it would gate every fixture into a 403.
+    const base = {
+      passwordHash,
+      mustChangePassword: false,
+      ...(await ensureE2eOptions(prisma)),
+    };
 
     await prisma.systemUser.createMany({
       data: [
@@ -363,7 +370,7 @@ describe('Auth — /auth/system (e2e)', () => {
       expect(Object.keys(res.body as object).sort()).toEqual(
         [
           'createdAt',
-          'department',
+          'department', // now an embedded { id, name }, not free text
           'email',
           'firstName',
           'id',
@@ -371,12 +378,34 @@ describe('Auth — /auth/system (e2e)', () => {
           'lastLoginAt',
           'lastName',
           'lineUserId',
+          'mustChangePassword', // AC-B10 — the SPA routes off this
+          'personnelRole', // the former `position`, now an embedded { id, name }
           'phoneNumber',
-          'position',
           'profilePictureUrl',
           'role',
         ].sort(),
       );
+    });
+
+    it('AC-B10 — /me exposes mustChangePassword, and embeds both options as { id, name }', async () => {
+      const { agent } = await loggedInAgent();
+      const res = await agent.get(url('/auth/system/me')).expect(200);
+
+      const body = res.body as {
+        mustChangePassword: boolean;
+        department: { id: number; name: string };
+        personnelRole: { id: number; name: string };
+      };
+      expect(body.mustChangePassword).toBe(false);
+      // Both embeds resolve to exactly { id, name } — no extra keys leak from the option row.
+      expect(Object.keys(body.department).sort()).toEqual(['id', 'name']);
+      expect(typeof body.department.id).toBe('number');
+      expect(typeof body.department.name).toBe('string');
+      expect(Object.keys(body.personnelRole).sort()).toEqual(['id', 'name']);
+      expect(typeof body.personnelRole.id).toBe('number');
+      expect(typeof body.personnelRole.name).toBe('string');
+      // `position` is gone from the wire — it is `personnelRole` now (the UI label stays "Position").
+      expect(res.body).not.toHaveProperty('position');
     });
 
     it('GET /auth/system/me with no session → 401', async () => {
