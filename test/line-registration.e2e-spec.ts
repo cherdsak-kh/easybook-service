@@ -29,10 +29,10 @@ const PENDING_MSG =
   'ระบบได้รับข้อมูลการลงทะเบียนของคุณแล้ว เจ้าหน้าที่กำลังดำเนินการตรวจสอบข้อมูลกรุณารอสักครู่ครับ ⏳';
 
 const optionIds = {
-  departmentId: '',
-  personnelRoleId: '',
-  department2Id: '',
-  deletedDepartmentId: '',
+  departmentId: 0,
+  personnelRoleId: 0,
+  department2Id: 0,
+  deletedDepartmentId: 0,
 };
 
 const validBody = (staffId: string) => ({
@@ -50,16 +50,16 @@ interface StatusBody {
     id: string;
     staffId: string;
     phone: string;
-    departmentId: string;
+    departmentId: number;
     department: string;
-    personnelRoleId: string;
+    personnelRoleId: number;
     personnelRole: string;
   } | null;
 }
 
 interface OptionsBody {
-  departments: Array<{ id: string; name: string }>;
-  personnelRoles: Array<{ id: string; name: string }>;
+  departments: Array<{ id: number; name: string }>;
+  personnelRoles: Array<{ id: number; name: string }>;
 }
 
 /**
@@ -288,13 +288,13 @@ describe('LINE registration + status (e2e)', () => {
         departmentId: optionIds.deletedDepartmentId,
       })
       .expect(400);
-    // An unknown personnel-role id → 400.
+    // An unknown (but valid integer) personnel-role id → 400 (assertActiveOptions).
     await request(server())
       .post(url('/line-users/register'))
       .set('Authorization', bearer())
       .send({
         ...validBody(`${LU_PREFIX}stid-badopt`),
-        personnelRoleId: 'no-such-role',
+        personnelRoleId: 2147483000,
       })
       .expect(400);
 

@@ -5,6 +5,7 @@ import {
   Get,
   HttpCode,
   Param,
+  ParseIntPipe,
   Patch,
   Post,
   UseGuards,
@@ -42,8 +43,9 @@ import { OptionsService } from './options.service';
  * curated DATA. It is NOT `SystemRole` (SUPER_ADMIN/ADMIN/STAFF), the back-office RBAC enum: they
  * share no table, enum, or endpoint. Creating a PersonnelRole named e.g. "ADMIN" grants no privilege.
  *
- * Session-guarded (`SUPER_ADMIN`/`ADMIN`; `STAFF` denied), keyed on the cuid `PersonnelRole.id`.
- * Mutations require `x-csrf-token`. `DELETE` is a soft delete.
+ * Session-guarded (`SUPER_ADMIN`/`ADMIN`; `STAFF` denied), keyed on the auto-increment integer
+ * `PersonnelRole.id`. Mutations require `x-csrf-token`. `DELETE` is a soft delete. `:id` is parsed
+ * with `ParseIntPipe`, so a non-numeric id is a `400` before the service is reached.
  */
 @ApiTags('Personnel Roles')
 @ApiCookieAuth('session')
@@ -142,7 +144,7 @@ export class PersonnelRolesController {
     type: ErrorResponseDto,
   })
   update(
-    @Param('id') id: string,
+    @Param('id', ParseIntPipe) id: number,
     @Body() dto: UpdatePersonnelRoleDto,
   ): Promise<PersonnelRoleResponseDto> {
     return this.options.update('personnelRole', id, dto.name);
@@ -174,7 +176,7 @@ export class PersonnelRolesController {
     description: 'Session store unavailable.',
     type: ErrorResponseDto,
   })
-  remove(@Param('id') id: string): Promise<void> {
+  remove(@Param('id', ParseIntPipe) id: number): Promise<void> {
     return this.options.softDelete('personnelRole', id);
   }
 }

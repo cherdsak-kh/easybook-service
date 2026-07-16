@@ -119,9 +119,9 @@ describe('LINE Users management (e2e)', () => {
   };
 
   // Ids of the fixture option rows (the registration FK targets), refreshed each seed.
-  const optionIds: { departmentId: string; personnelRoleId: string } = {
-    departmentId: '',
-    personnelRoleId: '',
+  const optionIds: { departmentId: number; personnelRoleId: number } = {
+    departmentId: 0,
+    personnelRoleId: 0,
   };
   const DEPT_NAME = `${LU_PREFIX}Engineering`;
   const ROLE_NAME = `${LU_PREFIX}Staff`;

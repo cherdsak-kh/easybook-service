@@ -6,7 +6,7 @@ import { OPTION_NAME_TAKEN, OPTION_NOT_FOUND } from './options.errors';
 import { OptionsService } from './options.service';
 
 const ROW = {
-  id: 'dep-1',
+  id: 1,
   name: 'Computer Science',
   createdAt: new Date('2026-07-14T10:00:00.000Z'),
   updatedAt: new Date('2026-07-14T10:00:00.000Z'),
@@ -61,7 +61,7 @@ describe('OptionsService', () => {
       });
       expect(result).toEqual([
         {
-          id: 'dep-1',
+          id: 1,
           name: 'Computer Science',
           createdAt: '2026-07-14T10:00:00.000Z',
           updatedAt: '2026-07-14T10:00:00.000Z',
@@ -99,18 +99,18 @@ describe('OptionsService', () => {
   describe('update', () => {
     it('404s an unknown/soft-deleted id and never writes', async () => {
       department.findFirst.mockResolvedValue(null);
-      await expect(service.update('department', 'gone', 'X')).rejects.toThrow(
+      await expect(service.update('department', 999, 'X')).rejects.toThrow(
         new NotFoundException(OPTION_NOT_FOUND),
       );
       expect(department.update).not.toHaveBeenCalled();
     });
 
     it('renames an existing option', async () => {
-      department.findFirst.mockResolvedValue({ id: 'dep-1' });
+      department.findFirst.mockResolvedValue({ id: 1 });
       department.update.mockResolvedValue({ ...ROW, name: 'Renamed' });
-      const result = await service.update('department', 'dep-1', 'Renamed');
+      const result = await service.update('department', 1, 'Renamed');
       expect(department.update).toHaveBeenCalledWith({
-        where: { id: 'dep-1' },
+        where: { id: 1 },
         data: { name: 'Renamed' },
         select: { id: true, name: true, createdAt: true, updatedAt: true },
       });
@@ -118,31 +118,31 @@ describe('OptionsService', () => {
     });
 
     it('maps a rename P2002 to 409 NAME_TAKEN', async () => {
-      department.findFirst.mockResolvedValue({ id: 'dep-1' });
+      department.findFirst.mockResolvedValue({ id: 1 });
       department.update.mockRejectedValue(p2002());
-      await expect(
-        service.update('department', 'dep-1', 'Dup'),
-      ).rejects.toThrow(new ConflictException(OPTION_NAME_TAKEN));
+      await expect(service.update('department', 1, 'Dup')).rejects.toThrow(
+        new ConflictException(OPTION_NAME_TAKEN),
+      );
     });
   });
 
   describe('softDelete', () => {
     it('404s an unknown/already-deleted id and never writes', async () => {
       personnelRole.findFirst.mockResolvedValue(null);
-      await expect(service.softDelete('personnelRole', 'gone')).rejects.toThrow(
+      await expect(service.softDelete('personnelRole', 999)).rejects.toThrow(
         new NotFoundException(OPTION_NOT_FOUND),
       );
       expect(personnelRole.update).not.toHaveBeenCalled();
     });
 
     it('sets deletedAt (soft delete), never a hard delete', async () => {
-      personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      personnelRole.findFirst.mockResolvedValue({ id: 1 });
       personnelRole.update.mockResolvedValue({ ...ROW });
-      await service.softDelete('personnelRole', 'role-1');
+      await service.softDelete('personnelRole', 1);
       const [arg] = personnelRole.update.mock.calls[0] as [
         { where: Record<string, unknown>; data: { deletedAt: unknown } },
       ];
-      expect(arg.where).toEqual({ id: 'role-1' });
+      expect(arg.where).toEqual({ id: 1 });
       expect(arg.data.deletedAt).toBeInstanceOf(Date);
     });
   });

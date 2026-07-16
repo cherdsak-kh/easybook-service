@@ -31,8 +31,8 @@ export class UpdatePersonnelRoleDto {
 
 /** Public view of a `PersonnelRole` option. `deletedAt` is NEVER exposed. */
 export class PersonnelRoleResponseDto {
-  @ApiProperty({ example: 'clx9z8y7x6w5v4u3t2s1r0q9' })
-  id!: string;
+  @ApiProperty({ example: 1, description: 'Auto-increment integer id.' })
+  id!: number;
 
   @ApiProperty({ example: 'Teacher' })
   name!: string;

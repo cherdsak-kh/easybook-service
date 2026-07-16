@@ -13,7 +13,7 @@ export type OptionModel = 'department' | 'personnelRole';
 
 /** The wire shape both `DepartmentResponseDto` and `PersonnelRoleResponseDto` satisfy structurally. */
 export interface OptionResponse {
-  id: string;
+  id: number;
   name: string;
   createdAt: string;
   updatedAt: string;
@@ -21,7 +21,7 @@ export interface OptionResponse {
 
 /** A `Department`/`PersonnelRole` row narrowed to the public select. Dates are still `Date`s. */
 interface OptionRow {
-  id: string;
+  id: number;
   name: string;
   createdAt: Date;
   updatedAt: Date;
@@ -40,15 +40,15 @@ interface OptionDelegate {
     orderBy: { name: 'asc' };
   }): Promise<OptionRow[]>;
   findFirst(args: {
-    where: { id: string; deletedAt: null };
+    where: { id: number; deletedAt: null };
     select: { id: true };
-  }): Promise<{ id: string } | null>;
+  }): Promise<{ id: number } | null>;
   create(args: {
     data: { name: string };
     select: { id: true; name: true; createdAt: true; updatedAt: true };
   }): Promise<OptionRow>;
   update(args: {
-    where: { id: string };
+    where: { id: number };
     data: { name?: string; deletedAt?: Date };
     select: { id: true; name: true; createdAt: true; updatedAt: true };
   }): Promise<OptionRow>;
@@ -118,7 +118,7 @@ export class OptionsService {
   /** Rename an option. `404` on unknown/soft-deleted id; `409` on an active-name collision. */
   async update(
     model: OptionModel,
-    id: string,
+    id: number,
     name: string,
   ): Promise<OptionResponse> {
     const existing = await this.delegate(model).findFirst({
@@ -144,7 +144,7 @@ export class OptionsService {
    * Soft-delete an option (`update` setting `deletedAt`, NEVER a hard delete). A second delete on
    * the same id is a `404`, byte-identical to an unknown id (the read filters `deletedAt: null`).
    */
-  async softDelete(model: OptionModel, id: string): Promise<void> {
+  async softDelete(model: OptionModel, id: number): Promise<void> {
     const existing = await this.delegate(model).findFirst({
       where: { id, deletedAt: null },
       select: { id: true },

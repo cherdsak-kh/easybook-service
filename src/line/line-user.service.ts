@@ -260,8 +260,8 @@ export class LineUserService {
    */
   private async assertActiveOptions(
     client: Pick<Prisma.TransactionClient, 'department' | 'personnelRole'>,
-    departmentId: string,
-    personnelRoleId: string,
+    departmentId: number,
+    personnelRoleId: number,
   ): Promise<void> {
     const [department, personnelRole] = await Promise.all([
       client.department.findFirst({

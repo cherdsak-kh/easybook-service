@@ -79,15 +79,16 @@ model LineUserRegistration {
   /// Loosely validated in the DTO (Thai formats), mirroring SystemUser.phoneNumber. Stored as given.
   phone String
 
-  /// FK -> Department.id. Required: every registration picks a department option (SC-2.4/Q4).
-  /// `onDelete: Restrict` refuses a stray hard delete of a referenced option — normal deletes are
-  /// soft (deletedAt), so a referenced row is never hard-deleted. Resolves for display even when the
-  /// option is soft-deleted (the FK row persists; only deletedAt is set).
-  departmentId String
+  /// FK -> Department.id (an auto-increment Int). Required: every registration picks a department
+  /// option (SC-2.4/Q4). `onDelete: Restrict` refuses a stray hard delete of a referenced option —
+  /// normal deletes are soft (deletedAt), so a referenced row is never hard-deleted. Resolves for
+  /// display even when the option is soft-deleted (the FK row persists; only deletedAt is set).
+  departmentId Int
   department   Department @relation("RegistrationDepartment", fields: [departmentId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
-  /// FK -> PersonnelRole.id (the LINE end-user's self-declared role — NOT SystemRole). Required.
-  personnelRoleId String
+  /// FK -> PersonnelRole.id (an auto-increment Int; the LINE end-user's self-declared role — NOT
+  /// SystemRole). Required.
+  personnelRoleId Int
   personnelRole   PersonnelRole @relation("RegistrationPersonnelRole", fields: [personnelRoleId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   createdAt DateTime @default(now())
@@ -108,7 +109,7 @@ model LineUserRegistration {
 /// authored in raw SQL in the migration — the PSL cannot express it), so `name` is deliberately NOT
 /// `@unique` here: a soft-deleted name is REUSABLE (SC-2.3/Q2). Holds no PII.
 model Department {
-  id        String    @id @default(cuid())
+  id        Int       @id @default(autoincrement())
   name      String
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
@@ -128,7 +129,7 @@ model Department {
 /// never cross a code path. Soft-deleted, name reusable (partial unique index — same as Department).
 /// Holds no PII.
 model PersonnelRole {
-  id        String    @id @default(cuid())
+  id        Int       @id @default(autoincrement())
   name      String
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt

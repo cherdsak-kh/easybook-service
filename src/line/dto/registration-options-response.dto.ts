@@ -2,8 +2,8 @@ import { ApiProperty } from '@nestjs/swagger';
 
 /** A single selectable option (id + display name) for the registration form. */
 export class OptionDto {
-  @ApiProperty({ example: 'clx1a2b3c4d5e6f7g8h9i0j1' })
-  id!: string;
+  @ApiProperty({ example: 1, description: 'Auto-increment integer id.' })
+  id!: number;
 
   @ApiProperty({ example: 'Computer Science' })
   name!: string;

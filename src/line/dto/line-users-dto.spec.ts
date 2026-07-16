@@ -108,14 +108,20 @@ describe('CreateLineUserRegistrationDto (through the global ValidationPipe)', ()
     lastName: 'Jaidee',
     staffId: '6412345678',
     phone: '081-234-5678',
-    departmentId: 'clx1a2b3c4d5e6f7g8h9i0j1',
-    personnelRoleId: 'clx9z8y7x6w5v4u3t2s1r0q9',
+    departmentId: 1,
+    personnelRoleId: 2,
   };
 
   it('accepts a valid payload and trims string fields (SC-B1)', async () => {
     await expect(
       validate({ ...VALID, firstName: '  Somchai  ' }),
     ).resolves.toMatchObject({ ...VALID, firstName: 'Somchai' });
+  });
+
+  it('coerces stringified integer option ids to numbers (@Type(() => Number))', async () => {
+    await expect(
+      validate({ ...VALID, departmentId: '3', personnelRoleId: '4' }),
+    ).resolves.toMatchObject({ departmentId: 3, personnelRoleId: 4 });
   });
 
   it('rejects a client-supplied lineUserId via forbidNonWhitelisted (impersonation guard)', async () => {
@@ -136,16 +142,21 @@ describe('CreateLineUserRegistrationDto (through the global ValidationPipe)', ()
     expect(joined).toContain('property role should not exist');
   });
 
-  it.each([
-    'firstName',
-    'lastName',
-    'staffId',
-    'departmentId',
-    'personnelRoleId',
-  ])('rejects a blank %s (SC-B1/SC-B6)', async (field) => {
-    const messages = await messagesOf({ ...VALID, [field]: '   ' });
-    expect(messages.join(' ')).toMatch(new RegExp(field));
-  });
+  it.each(['firstName', 'lastName', 'staffId'])(
+    'rejects a blank %s (SC-B1/SC-B6)',
+    async (field) => {
+      const messages = await messagesOf({ ...VALID, [field]: '   ' });
+      expect(messages.join(' ')).toMatch(new RegExp(field));
+    },
+  );
+
+  it.each(['departmentId', 'personnelRoleId'])(
+    'rejects a non-integer %s (SC-B6)',
+    async (field) => {
+      const messages = await messagesOf({ ...VALID, [field]: 'not-a-number' });
+      expect(messages.join(' ')).toMatch(new RegExp(field));
+    },
+  );
 
   it.each([
     ['a missing required field', { ...VALID, phone: undefined }],

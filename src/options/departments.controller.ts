@@ -5,6 +5,7 @@ import {
   Get,
   HttpCode,
   Param,
+  ParseIntPipe,
   Patch,
   Post,
   UseGuards,
@@ -38,10 +39,11 @@ import { OptionsService } from './options.service';
 /**
  * Admin CRUD for the `Department` registration options. Route prefix: `/api/v1/departments`.
  *
- * Session-guarded (`SUPER_ADMIN`/`ADMIN`; `STAFF` denied), keyed on the cuid `Department.id`. Same
- * guard stack as `/system-users` — NOT the LINE ID-token guard. Mutations require `x-csrf-token`
- * (enforced by the global CSRF middleware; documented per-route with `@ApiHeader`). `DELETE` is a
- * soft delete. `:id` is an opaque, unvalidated string (a format check would be a 400/404 shape oracle).
+ * Session-guarded (`SUPER_ADMIN`/`ADMIN`; `STAFF` denied), keyed on the auto-increment integer
+ * `Department.id`. Same guard stack as `/system-users` — NOT the LINE ID-token guard. Mutations
+ * require `x-csrf-token` (enforced by the global CSRF middleware; documented per-route with
+ * `@ApiHeader`). `DELETE` is a soft delete. `:id` is parsed with `ParseIntPipe`, so a non-numeric id
+ * is a `400` before the service is reached.
  */
 @ApiTags('Departments')
 @ApiCookieAuth('session')
@@ -132,7 +134,7 @@ export class DepartmentsController {
     type: ErrorResponseDto,
   })
   update(
-    @Param('id') id: string,
+    @Param('id', ParseIntPipe) id: number,
     @Body() dto: UpdateDepartmentDto,
   ): Promise<DepartmentResponseDto> {
     return this.options.update('department', id, dto.name);
@@ -165,7 +167,7 @@ export class DepartmentsController {
     description: 'Session store unavailable.',
     type: ErrorResponseDto,
   })
-  remove(@Param('id') id: string): Promise<void> {
+  remove(@Param('id', ParseIntPipe) id: number): Promise<void> {
     return this.options.softDelete('department', id);
   }
 }

@@ -33,7 +33,7 @@ interface Session {
 }
 
 interface OptionBody {
-  id: string;
+  id: number;
   name: string;
   createdAt: string;
   updatedAt: string;
@@ -223,17 +223,30 @@ describe('Registration options admin CRUD (e2e)', () => {
         .expect(403);
     });
 
-    it('404s a PATCH/DELETE on an unknown id', async () => {
+    it('404s a PATCH/DELETE on an unknown (but numeric) id', async () => {
+      const { agent, token } = await login(ADMIN);
+      await agent
+        .patch(url(`${base}/2147483000`))
+        .set('x-csrf-token', token)
+        .send({ name: name('x') })
+        .expect(404);
+      await agent
+        .delete(url(`${base}/2147483000`))
+        .set('x-csrf-token', token)
+        .expect(404);
+    });
+
+    it('400s a PATCH/DELETE on a non-numeric id (ParseIntPipe)', async () => {
       const { agent, token } = await login(ADMIN);
       await agent
         .patch(url(`${base}/never-existed`))
         .set('x-csrf-token', token)
         .send({ name: name('x') })
-        .expect(404);
+        .expect(400);
       await agent
         .delete(url(`${base}/never-existed`))
         .set('x-csrf-token', token)
-        .expect(404);
+        .expect(400);
     });
   });
 

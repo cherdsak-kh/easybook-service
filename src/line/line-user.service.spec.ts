@@ -49,8 +49,8 @@ const VALID_DTO: CreateLineUserRegistrationDto = {
   lastName: 'Jaidee',
   staffId: '6412345678',
   phone: '081-234-5678',
-  departmentId: 'dep-1',
-  personnelRoleId: 'role-1',
+  departmentId: 1,
+  personnelRoleId: 2,
 };
 
 /** Owner-facing registration row (matches REGISTRATION_OWNER_SELECT: ids + resolved option names). */
@@ -60,8 +60,8 @@ const OWNER_REGISTRATION_ROW = {
   lastName: 'Jaidee',
   staffId: '6412345678',
   phone: '081-234-5678',
-  departmentId: 'dep-1',
-  personnelRoleId: 'role-1',
+  departmentId: 1,
+  personnelRoleId: 2,
   department: { name: 'Computer Science' },
   personnelRole: { name: 'Teacher' },
   createdAt: new Date('2026-07-14T10:00:00.000Z'),
@@ -254,10 +254,8 @@ describe('LineUserService', () => {
 
   describe('getRegistrationOptions', () => {
     it('returns non-deleted departments + personnel roles, id+name, ordered name ASC (SC-B7)', async () => {
-      department.findMany.mockResolvedValue([{ id: 'dep-1', name: 'Biology' }]);
-      personnelRole.findMany.mockResolvedValue([
-        { id: 'role-1', name: 'Teacher' },
-      ]);
+      department.findMany.mockResolvedValue([{ id: 1, name: 'Biology' }]);
+      personnelRole.findMany.mockResolvedValue([{ id: 2, name: 'Teacher' }]);
 
       const result = await service.getRegistrationOptions();
 
@@ -272,8 +270,8 @@ describe('LineUserService', () => {
         orderBy: { name: 'asc' },
       });
       expect(result).toEqual({
-        departments: [{ id: 'dep-1', name: 'Biology' }],
-        personnelRoles: [{ id: 'role-1', name: 'Teacher' }],
+        departments: [{ id: 1, name: 'Biology' }],
+        personnelRoles: [{ id: 2, name: 'Teacher' }],
       });
     });
   });
@@ -283,8 +281,8 @@ describe('LineUserService', () => {
   describe('register', () => {
     const primeTx = () => {
       const tx = makeTx();
-      tx.department.findFirst.mockResolvedValue({ id: 'dep-1' });
-      tx.personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      tx.department.findFirst.mockResolvedValue({ id: 1 });
+      tx.personnelRole.findFirst.mockResolvedValue({ id: 2 });
       $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
         cb(tx),
       );
@@ -317,9 +315,9 @@ describe('LineUserService', () => {
         id: 'reg-1',
         staffId: '6412345678',
         phone: '081-234-5678',
-        departmentId: 'dep-1',
+        departmentId: 1,
         department: 'Computer Science',
-        personnelRoleId: 'role-1',
+        personnelRoleId: 2,
         personnelRole: 'Teacher',
         createdAt: '2026-07-14T10:00:00.000Z',
       });
@@ -337,7 +335,7 @@ describe('LineUserService', () => {
         access: AppAccess.UNREGISTERED,
       });
       tx.department.findFirst.mockResolvedValue(null);
-      tx.personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      tx.personnelRole.findFirst.mockResolvedValue({ id: 2 });
       $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
         cb(tx),
       );
@@ -354,7 +352,7 @@ describe('LineUserService', () => {
         id: 'lu-1',
         access: AppAccess.UNREGISTERED,
       });
-      tx.department.findFirst.mockResolvedValue({ id: 'dep-1' });
+      tx.department.findFirst.mockResolvedValue({ id: 1 });
       tx.personnelRole.findFirst.mockResolvedValue(null);
       $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
         cb(tx),
@@ -472,8 +470,8 @@ describe('LineUserService', () => {
         id: 'lu-1',
         access: AppAccess.PENDING,
       });
-      department.findFirst.mockResolvedValue({ id: 'dep-1' });
-      personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      department.findFirst.mockResolvedValue({ id: 1 });
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
       lineUserRegistration.update.mockResolvedValue(OWNER_REGISTRATION_ROW);
 
       const result = await service.updateRegistration('U123', EDIT_DTO);
@@ -486,8 +484,8 @@ describe('LineUserService', () => {
             lastName: 'Jaidee',
             staffId: '6412345678',
             phone: '081-234-5678',
-            departmentId: 'dep-1',
-            personnelRoleId: 'role-1',
+            departmentId: 1,
+            personnelRoleId: 2,
           },
         }),
       );
@@ -528,7 +526,7 @@ describe('LineUserService', () => {
         access: AppAccess.PENDING,
       });
       department.findFirst.mockResolvedValue(null);
-      personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
 
       await expect(
         service.updateRegistration('U123', EDIT_DTO),
@@ -541,8 +539,8 @@ describe('LineUserService', () => {
         id: 'lu-1',
         access: AppAccess.PENDING,
       });
-      department.findFirst.mockResolvedValue({ id: 'dep-1' });
-      personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      department.findFirst.mockResolvedValue({ id: 1 });
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
       lineUserRegistration.update.mockRejectedValue(
         new Prisma.PrismaClientKnownRequestError('unique', {
           code: 'P2002',
