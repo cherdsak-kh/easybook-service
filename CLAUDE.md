@@ -39,6 +39,7 @@ Other:
 npm run prisma:studio             # inspect the DB
 npm run line:setup-richmenu       # create/upload the two LINE rich menus (needs LINE_CHANNEL_ACCESS_TOKEN)
 npm run auth:seed-superadmin      # create the first SUPER_ADMIN (idempotent; --force to override)
+npm run auth:hash-password -- 'pw'  # print an argon2id hash for a password (debug/DB seeding; no DB, no endpoint by design)
 ```
 
 Redis must be running for anything session-backed. There is still no `docker-compose.yml` — see
