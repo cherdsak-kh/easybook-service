@@ -12,6 +12,7 @@ import {
   Target,
   canDelete,
   canPatch,
+  mayUseSystemReservedOptions,
 } from './system-users.policy';
 
 const ROLES = [
@@ -274,5 +275,40 @@ describe('system-users.policy', () => {
         });
       },
     );
+  });
+
+  // ─────────────── mayUseSystemReservedOptions (02_design_log.md §3.3) ───────────────
+
+  describe('mayUseSystemReservedOptions', () => {
+    it('AC-B13 — a SUPER_ADMIN may see and assign system-reserved options', () => {
+      expect(mayUseSystemReservedOptions(actor(SystemRole.SUPER_ADMIN))).toBe(
+        true,
+      );
+    });
+
+    it.each([SystemRole.ADMIN, SystemRole.STAFF])(
+      'AC-B13 — %s may not',
+      (actorRole) => {
+        expect(mayUseSystemReservedOptions(actor(actorRole))).toBe(false);
+      },
+    );
+
+    it('AC-B13 — returns a raw boolean, never a PolicyResult', () => {
+      // Its callers ask "may I?" to build a WHERE clause, not "reject with what reason?". A denied
+      // actor gets the SAME 400/404 as for a nonexistent option — never a 403 carrying a reason —
+      // so a `reason` field would be dead weight and an invitation to surface the oracle.
+      expect(typeof mayUseSystemReservedOptions(actor(SystemRole.ADMIN))).toBe(
+        'boolean',
+      );
+    });
+
+    it('AC-B13 — depends ONLY on the role, never on the actor id', () => {
+      // Pure, per this file's charter: no I/O, no target, no row.
+      expect(
+        mayUseSystemReservedOptions({ id: 'a', role: SystemRole.SUPER_ADMIN }),
+      ).toBe(
+        mayUseSystemReservedOptions({ id: 'b', role: SystemRole.SUPER_ADMIN }),
+      );
+    });
   });
 });

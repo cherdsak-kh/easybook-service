@@ -235,16 +235,21 @@ export class LineUserService {
   /**
    * The combined, non-deleted option lists for the registration form (SC-3.1). One read per table,
    * each `name ASC`. Ids + names only — no PII, no timestamps.
+   *
+   * `isSystemReserved: false` is HARDCODED, with no parameter to widen it. This surface has no actor
+   * and no `SystemRole` to branch on — the identity is a verified LINE `sub`, and `SystemUser` /
+   * `LineUser` share no session and no authentication surface. So no role check belongs here, and a
+   * LINE caller can never see a reserved option under any circumstance.
    */
   async getRegistrationOptions(): Promise<RegistrationOptionsResponseDto> {
     const [departments, personnelRoles] = await Promise.all([
       this.prisma.department.findMany({
-        where: { deletedAt: null },
+        where: { deletedAt: null, isSystemReserved: false },
         select: { id: true, name: true },
         orderBy: { name: 'asc' },
       }),
       this.prisma.personnelRole.findMany({
-        where: { deletedAt: null },
+        where: { deletedAt: null, isSystemReserved: false },
         select: { id: true, name: true },
         orderBy: { name: 'asc' },
       }),
@@ -253,10 +258,17 @@ export class LineUserService {
   }
 
   /**
-   * Assert both chosen option ids resolve to a NON-DELETED option (SC-3.2/SC-B6). A soft-deleted or
-   * unknown id is a client-side validation failure → `400` (distinct message per field), never a
-   * `409`. The FK's `onDelete: Restrict` does not help here — a soft-deleted option row still exists,
-   * so the DB would accept the FK; this app-level `deletedAt: null` check is what rejects it.
+   * Assert both chosen option ids resolve to a NON-DELETED, NON-RESERVED option (SC-3.2/SC-B6). A
+   * soft-deleted, unknown or system-reserved id is a client-side validation failure → `400` (distinct
+   * message per field), never a `409`. The FK's `onDelete: Restrict` does not help here — a
+   * soft-deleted option row still exists, so the DB would accept the FK; this app-level check is what
+   * rejects it.
+   *
+   * `isSystemReserved: false` is HARDCODED and unconditional: no LINE caller has a `SystemRole`, so
+   * NOBODY may assign a reserved option through this surface. The predicate merges into the SAME
+   * query as `deletedAt: null` — one more attribute of "may this id be referenced", not a second
+   * round trip — and yields the SAME 400 as an unknown id. Never a 403: a distinct status would be an
+   * existence oracle and would defeat the invisibility the reserved flag exists for.
    */
   private async assertActiveOptions(
     client: Pick<Prisma.TransactionClient, 'department' | 'personnelRole'>,
@@ -265,11 +277,15 @@ export class LineUserService {
   ): Promise<void> {
     const [department, personnelRole] = await Promise.all([
       client.department.findFirst({
-        where: { id: departmentId, deletedAt: null },
+        where: { id: departmentId, deletedAt: null, isSystemReserved: false },
         select: { id: true },
       }),
       client.personnelRole.findFirst({
-        where: { id: personnelRoleId, deletedAt: null },
+        where: {
+          id: personnelRoleId,
+          deletedAt: null,
+          isSystemReserved: false,
+        },
         select: { id: true },
       }),
     ]);

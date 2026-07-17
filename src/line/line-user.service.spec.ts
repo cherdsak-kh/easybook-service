@@ -260,12 +260,12 @@ describe('LineUserService', () => {
       const result = await service.getRegistrationOptions();
 
       expect(department.findMany).toHaveBeenCalledWith({
-        where: { deletedAt: null },
+        where: { deletedAt: null, isSystemReserved: false },
         select: { id: true, name: true },
         orderBy: { name: 'asc' },
       });
       expect(personnelRole.findMany).toHaveBeenCalledWith({
-        where: { deletedAt: null },
+        where: { deletedAt: null, isSystemReserved: false },
         select: { id: true, name: true },
         orderBy: { name: 'asc' },
       });
@@ -273,6 +273,22 @@ describe('LineUserService', () => {
         departments: [{ id: 1, name: 'Biology' }],
         personnelRoles: [{ id: 2, name: 'Teacher' }],
       });
+    });
+
+    it('AC-B3 — the reserved filter is HARDCODED: no parameter can widen it for a LINE caller', async () => {
+      // This surface has no actor and no SystemRole to branch on, so there is nothing to widen and
+      // no role check belongs here. A LINE end user can never see a reserved option.
+      department.findMany.mockResolvedValue([]);
+      personnelRole.findMany.mockResolvedValue([]);
+
+      await service.getRegistrationOptions();
+
+      for (const delegate of [department.findMany, personnelRole.findMany]) {
+        const [args] = delegate.mock.calls[0] as [
+          { where: { isSystemReserved: boolean } },
+        ];
+        expect(args.where.isSystemReserved).toBe(false);
+      }
     });
   });
 
@@ -343,6 +359,34 @@ describe('LineUserService', () => {
       await expect(service.register('U123', VALID_DTO)).rejects.toThrow(
         new BadRequestException(INVALID_DEPARTMENT),
       );
+      expect(tx.lineUserRegistration.create).not.toHaveBeenCalled();
+    });
+
+    it('AC-B7 — a system-reserved option is unassignable and 400s exactly like an unknown id', async () => {
+      const tx = makeTx();
+      tx.lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.UNREGISTERED,
+      });
+      // The reserved predicate rides in the same WHERE, so a reserved row simply does not match —
+      // the caller cannot distinguish it from a nonexistent one. Never a 403 (existence oracle).
+      tx.department.findFirst.mockResolvedValue(null);
+      tx.personnelRole.findFirst.mockResolvedValue({ id: 2 });
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+
+      await expect(service.register('U123', VALID_DTO)).rejects.toThrow(
+        new BadRequestException(INVALID_DEPARTMENT),
+      );
+      expect(tx.department.findFirst).toHaveBeenCalledWith({
+        where: {
+          id: VALID_DTO.departmentId,
+          deletedAt: null,
+          isSystemReserved: false,
+        },
+        select: { id: true },
+      });
       expect(tx.lineUserRegistration.create).not.toHaveBeenCalled();
     });
 
@@ -532,6 +576,27 @@ describe('LineUserService', () => {
         service.updateRegistration('U123', EDIT_DTO),
       ).rejects.toThrow(new BadRequestException(INVALID_DEPARTMENT));
       expect(lineUserRegistration.update).not.toHaveBeenCalled();
+    });
+
+    it('AC-B7 — PATCH /registration also filters reserved options out of the assignability check', async () => {
+      lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+      });
+      department.findFirst.mockResolvedValue(null);
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
+
+      await expect(
+        service.updateRegistration('U123', EDIT_DTO),
+      ).rejects.toThrow(new BadRequestException(INVALID_DEPARTMENT));
+      expect(department.findFirst).toHaveBeenCalledWith({
+        where: {
+          id: EDIT_DTO.departmentId,
+          deletedAt: null,
+          isSystemReserved: false,
+        },
+        select: { id: true },
+      });
     });
 
     it('maps a P2002 on staffId (another registration) to 409 STAFF_ID_TAKEN (SC-B10)', async () => {

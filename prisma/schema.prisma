@@ -115,6 +115,18 @@ model Department {
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
+  /// TRUE only for the row the System Developer (SUPER_ADMIN) owns, created exclusively by
+  /// scripts/create-super-admin.ts. A reserved row is INVISIBLE to every non-SUPER_ADMIN option list
+  /// and UNASSIGNABLE by any other actor (-> the same 400 as an unknown option id, never a 403).
+  ///
+  /// This is a FLAG, not a name, and that distinction is load-bearing (see AC-X3): a row NAMED
+  /// 'ผู้พัฒนาระบบ (System Developer)' with isSystemReserved=false is an ordinary, visible, assignable
+  /// option that grants nothing — exactly like a PersonnelRole named "ADMIN". The flag is the boundary.
+  ///
+  /// Settable by NO endpoint: it is absent from every DTO, so `forbidNonWhitelisted: true` 400s any
+  /// attempt to send it (the same construction that protects SystemUser.lineUserId).
+  isSystemReserved Boolean @default(false)
+
   registrations LineUserRegistration[] @relation("RegistrationDepartment")
 
   /// Back-relation for SystemUser.department. VIRTUAL — adds no column to departments.
@@ -142,6 +154,16 @@ model PersonnelRole {
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
+
+  /// TRUE only for the row the System Developer (SUPER_ADMIN) owns — see Department.isSystemReserved
+  /// for the full rationale. Invisible to every non-SUPER_ADMIN option list, unassignable by any
+  /// other actor (the same 400 as an unknown id, never a 403), settable by no endpoint, and written
+  /// exclusively by scripts/create-super-admin.ts.
+  ///
+  /// A FLAG, not a name: a row NAMED 'ผู้ดูแลระบบระดับสูง (System Administrator)' with
+  /// isSystemReserved=false is an ordinary option granting nothing — exactly like the PersonnelRole
+  /// named "ADMIN" that AC-X3 pins. Privilege is SystemUser.role and only that.
+  isSystemReserved Boolean @default(false)
 
   registrations LineUserRegistration[] @relation("RegistrationPersonnelRole")
 

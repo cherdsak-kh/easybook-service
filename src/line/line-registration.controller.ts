@@ -80,7 +80,7 @@ export class LineRegistrationController {
   @ApiOperation({
     summary: 'List the selectable department + personnel-role options.',
     description:
-      'Combined payload so the registration/edit form makes ONE call. Returns only NON-deleted options, each list ordered `name ASC`. Ids feed `departmentId`/`personnelRoleId` on register/edit.',
+      'Combined payload so the registration/edit form makes ONE call. Returns only NON-deleted options, each list ordered `name ASC`. Ids feed `departmentId`/`personnelRoleId` on register/edit. System-reserved options are never returned.',
   })
   @ApiOkResponse({
     description: 'The available options.',

@@ -104,7 +104,7 @@ export class SystemUsersController {
     @CurrentUser() actor: AuthenticatedSystemUser,
     @Body() dto: CreateSystemUserDto,
   ): Promise<SystemUserWithTemporaryPasswordDto> {
-    return this.systemUsers.create(actor.id, dto);
+    return this.systemUsers.create(actorOf(actor), dto);
   }
 
   @Get()

@@ -32,34 +32,58 @@ import {
   canDelete,
   canPatch,
   canResetPassword,
+  mayUseSystemReservedOptions,
 } from './system-users.policy';
 
 /**
  * The write half of the read/write asymmetry (AC-B3/AC-B4). Runs INSIDE the caller's transaction, so
- * an option cannot be soft-deleted between the check and the write.
+ * an option cannot be soft-deleted (or otherwise change) between the check and the write.
  *
  * **The FK does NOT do this job.** `onDelete: Restrict` guards HARD deletes; a soft-deleted option
  * row still exists, so Postgres accepts the reference happily. Only this check rejects it. Do not
  * remove it on the theory that "the FK covers it".
  *
+ * NAMED `...Assignable`, not `...AreActive`: it now answers TWO questions — "is the option active?"
+ * and "may THIS actor reference it?" — and a stale name is how the next reader misses the second.
+ *
  * This is VALIDATION, not authorization — it stays in the service and does NOT go into
  * `system-users.policy.ts` (AC-B12 is about the authz matrix; the policy has no Prisma and no I/O
- * by design, so an existence check could not live there anyway).
+ * by design, so an existence check could not live there anyway). The ROLE half of the reserved-option
+ * rule IS authorization and does live there, as `mayUseSystemReservedOptions`; the caller passes its
+ * verdict in as `opts.allowReserved`. The split is exactly the I/O line. See 02_design_log.md §3.
  */
-async function assertOptionsAreActive(
+async function assertOptionsAssignable(
   tx: Prisma.TransactionClient,
   ids: { departmentId?: number; personnelRoleId?: number },
+  opts: { allowReserved: boolean },
 ): Promise<void> {
+  // A reserved row is INDISTINGUISHABLE from a nonexistent one: same 400, same message. Never a
+  // 403 — that would be an existence oracle and would defeat the whole invisibility requirement.
+  // The predicate merges into the SAME query as `deletedAt: null`; it is one more attribute of
+  // "may this id be referenced", not a second round trip.
+  //
+  // `undefined` is Prisma's documented "skip this filter" — which IS the SUPER_ADMIN exemption. No
+  // branching, no second query shape.
+  const reserved = opts.allowReserved ? undefined : false;
+
   if (ids.departmentId !== undefined) {
     const ok = await tx.department.findFirst({
-      where: { id: ids.departmentId, deletedAt: null },
+      where: {
+        id: ids.departmentId,
+        deletedAt: null,
+        isSystemReserved: reserved,
+      },
       select: { id: true },
     });
     if (!ok) throw new BadRequestException(INVALID_DEPARTMENT);
   }
   if (ids.personnelRoleId !== undefined) {
     const ok = await tx.personnelRole.findFirst({
-      where: { id: ids.personnelRoleId, deletedAt: null },
+      where: {
+        id: ids.personnelRoleId,
+        deletedAt: null,
+        isSystemReserved: reserved,
+      },
       select: { id: true },
     });
     if (!ok) throw new BadRequestException(INVALID_PERSONNEL_ROLE);
@@ -119,9 +143,14 @@ export class SystemUsersService {
    * the message stays generic so it never reveals that the colliding row is deleted.
    *
    * The transaction exists because the option validation must see the same snapshot as the write.
+   *
+   * Takes the whole `Actor`, not just an id: the reserved-option check needs the role. `@Roles(
+   * SUPER_ADMIN)` already means `allowReserved` is always true here, but the computed predicate is
+   * passed anyway rather than hardcoding `true` — if `@Roles` is ever widened to ADMIN, the guard
+   * must not silently become a no-op. Same defence-in-depth as `canPatch`'s `default:` arm.
    */
   async create(
-    actorId: string,
+    actor: Actor,
     dto: CreateSystemUserDto,
   ): Promise<SystemUserWithTemporaryPasswordDto> {
     const temporaryPassword = this.password.generateTemporaryPassword();
@@ -129,10 +158,14 @@ export class SystemUsersService {
 
     try {
       const created = await this.prisma.$transaction(async (tx) => {
-        await assertOptionsAreActive(tx, {
-          departmentId: dto.departmentId,
-          personnelRoleId: dto.personnelRoleId,
-        });
+        await assertOptionsAssignable(
+          tx,
+          {
+            departmentId: dto.departmentId,
+            personnelRoleId: dto.personnelRoleId,
+          },
+          { allowReserved: mayUseSystemReservedOptions(actor) },
+        );
 
         return tx.systemUser.create({
           data: {
@@ -147,14 +180,14 @@ export class SystemUsersService {
             mustChangePassword: true,
             phoneNumber: dto.phoneNumber ?? null,
             profilePictureUrl: dto.profilePictureUrl ?? null,
-            createdById: actorId,
+            createdById: actor.id,
           },
           select: PUBLIC_FIELDS,
         });
       });
 
       // `id=`-only, exactly as before. NEVER log the DTO or the temp password (AC-B7).
-      this.logger.log(`SystemUser created. id=${created.id} by=${actorId}`);
+      this.logger.log(`SystemUser created. id=${created.id} by=${actor.id}`);
       return { ...toSystemUserDto(created), temporaryPassword };
     } catch (error) {
       if (
@@ -283,11 +316,18 @@ export class SystemUsersService {
       const verdict = canPatch(actor, target, patch); // steps 5 + 6
       if (!verdict.allowed) throw new ForbiddenException(verdict.reason);
 
-      // Inside the transaction, so an option cannot be soft-deleted between check and write.
-      await assertOptionsAreActive(tx, {
-        departmentId: patch.departmentId,
-        personnelRoleId: patch.personnelRoleId,
-      });
+      // Inside the transaction, so an option cannot be soft-deleted between check and write. Runs
+      // AFTER canPatch, preserving the existing order: authorization on the target first, body
+      // validation second. An ADMIN naming a reserved option here gets the same 400 as for an
+      // unknown id — this is W4, the attack path this feature exists to close.
+      await assertOptionsAssignable(
+        tx,
+        {
+          departmentId: patch.departmentId,
+          personnelRoleId: patch.personnelRoleId,
+        },
+        { allowReserved: mayUseSystemReservedOptions(actor) },
+      );
 
       const updated = await tx.systemUser.update({
         where: { id: target.id },

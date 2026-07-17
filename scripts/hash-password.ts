@@ -13,7 +13,7 @@
  *
  * A SCRIPT, NOT AN ENDPOINT — deliberately. `POST /api/v1/utils/hash-password`, gated on
  * `NODE_ENV !== 'production'`, was proposed and REJECTED. Do not re-litigate it:
- *   - `seed-super-admin.ts` already records the project's stance: a script "keeps the public attack
+ *   - `create-super-admin.ts` already records the project's stance: a script "keeps the public attack
  *     surface at zero — there is deliberately no bootstrap endpoint." No route in this repo accepts a
  *     raw password for provisioning, and this utility is not the precedent that changes that.
  *   - The `NODE_ENV` gate FAILS OPEN: unset, `'prod'`, or a trailing space all leave the route live,
@@ -32,9 +32,9 @@
  * password passed to this utility as burned — which is fine for the debug/seed values it exists for.
  *
  * The plaintext is never logged, not its value and not its length (same discipline as
- * `seed-super-admin.ts`). The digest on stdout is the only intended output.
+ * `create-super-admin.ts`). The digest on stdout is the only intended output.
  *
- * No Prisma, no Redis, no `.env`: this is a pure hash utility. `seed-super-admin.ts` opens a DB
+ * No Prisma, no Redis, no `.env`: this is a pure hash utility. `create-super-admin.ts` opens a DB
  * connection because it writes a user; there is nothing to write here.
  */
 import { Logger } from '@nestjs/common';

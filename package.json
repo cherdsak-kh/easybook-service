@@ -20,7 +20,7 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
     "line:setup-richmenu": "ts-node scripts/setup-rich-menu.ts",
-    "auth:seed-superadmin": "ts-node scripts/seed-super-admin.ts",
+    "auth:create-superadmin": "ts-node scripts/create-super-admin.ts",
     "auth:hash-password": "ts-node scripts/hash-password.ts",
     "options:seed": "ts-node scripts/seed-options.ts",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",

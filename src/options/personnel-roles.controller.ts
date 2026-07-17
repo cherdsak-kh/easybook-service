@@ -25,16 +25,26 @@ import {
   ApiTags,
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
+import type { AuthenticatedSystemUser } from '../auth/auth.types';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { SessionGuard } from '../auth/guards/session.guard';
 import { ErrorResponseDto } from '../common/dto/error-response.dto';
+import { mayUseSystemReservedOptions } from '../system-users/system-users.policy';
+import type { Actor } from '../system-users/system-users.policy';
 import {
   CreatePersonnelRoleDto,
   PersonnelRoleResponseDto,
   UpdatePersonnelRoleDto,
 } from './dto/personnel-role.dto';
 import { OptionsService } from './options.service';
+
+/** Mirrors `system-users.controller.ts`'s helper — see `departments.controller.ts` for why it is copied. */
+const actorOf = (user: AuthenticatedSystemUser): Actor => ({
+  id: user.id,
+  role: user.role,
+});
 
 /**
  * Admin CRUD for the `PersonnelRole` registration options. Route prefix: `/api/v1/personnel-roles`.
@@ -58,7 +68,8 @@ export class PersonnelRolesController {
   @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN)
   @ApiOperation({
     summary: 'List personnel-role options.',
-    description: 'Non-deleted options only, ordered `name ASC`.',
+    description:
+      'Non-deleted options only, ordered `name ASC`. System-reserved options are visible to SUPER_ADMIN only.',
   })
   @ApiOkResponse({
     description: 'The options.',
@@ -76,8 +87,12 @@ export class PersonnelRolesController {
     description: 'Session store unavailable.',
     type: ErrorResponseDto,
   })
-  list(): Promise<PersonnelRoleResponseDto[]> {
-    return this.options.list('personnelRole');
+  list(
+    @CurrentUser() user: AuthenticatedSystemUser,
+  ): Promise<PersonnelRoleResponseDto[]> {
+    return this.options.list('personnelRole', {
+      includeReserved: mayUseSystemReservedOptions(actorOf(user)),
+    });
   }
 
   @Post()
@@ -119,7 +134,7 @@ export class PersonnelRolesController {
   @ApiOperation({
     summary: 'Rename a personnel-role option.',
     description:
-      'An unknown or soft-deleted id is a 404; an active-name collision is a 409.',
+      'An unknown or soft-deleted id is a 404; an active-name collision is a 409. System-reserved options are not editable and answer 404.',
   })
   @ApiHeader({ name: 'x-csrf-token', required: true })
   @ApiOkResponse({ description: 'Renamed.', type: PersonnelRoleResponseDto })
@@ -156,7 +171,7 @@ export class PersonnelRolesController {
   @ApiOperation({
     summary: 'Soft-delete a personnel-role option.',
     description:
-      'Sets `deletedAt`; never a hard delete, so registrations referencing it keep resolving its name. A second DELETE on the same id is a 404. The name becomes reusable.',
+      'Sets `deletedAt`; never a hard delete, so registrations referencing it keep resolving its name. A second DELETE on the same id is a 404. The name becomes reusable. System-reserved options are not deletable and answer 404.',
   })
   @ApiHeader({ name: 'x-csrf-token', required: true })
   @ApiNoContentResponse({ description: 'Soft-deleted. Empty body.' })

@@ -46,6 +46,32 @@ export const INSUFFICIENT_ROLE = 'Insufficient role.';
 export const CANNOT_RESET_OWN_PASSWORD =
   'You cannot reset your own password. Use the change-password endpoint instead.';
 
+/**
+ * May this actor see and assign the SYSTEM-RESERVED options (the System Developer department /
+ * role)? SUPER_ADMIN only.
+ *
+ * The ONE role -> capability fact behind the reserved-option boundary. It lives here, with the rest
+ * of the matrix, so no second copy can drift: read by both option controllers (to decide whether a
+ * list includes reserved rows) and by SystemUsersService (to decide whether a write may reference
+ * one).
+ *
+ * Pure, per this file's charter. The companion question — "is option id N reserved?" — is a DB
+ * attribute lookup, i.e. VALIDATION, and stays in the service beside assertOptionsAssignable, which
+ * has the same shape and the same reasoning. See 02_design_log.md §3.
+ *
+ * Returns a raw boolean, not a PolicyResult: its callers ask "may I?" (to build a `where` / choose a
+ * filter), not "reject with what reason?". A denied actor gets the SAME 400/404 as for a nonexistent
+ * option — never a 403, which would be an existence oracle — so a `reason` field would be dead weight
+ * and an invitation to surface it. The canX functions return PolicyResult because their reasons ARE
+ * returned as 403 bodies. This one must never be.
+ *
+ * NOTE: this file is no longer read only by /system-users. It is now the back-office authorization
+ * matrix, full stop. That is deliberate and is the opposite of duplication.
+ */
+export function mayUseSystemReservedOptions(actor: Actor): boolean {
+  return actor.role === SystemRole.SUPER_ADMIN;
+}
+
 export function canPatch(
   actor: Actor,
   target: Target,

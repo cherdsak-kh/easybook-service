@@ -38,7 +38,8 @@ Other:
 ```bash
 npm run prisma:studio             # inspect the DB
 npm run line:setup-richmenu       # create/upload the two LINE rich menus (needs LINE_CHANNEL_ACCESS_TOKEN)
-npm run auth:seed-superadmin      # create the first SUPER_ADMIN (idempotent; --force to override)
+npm run auth:create-superadmin    # create the first SUPER_ADMIN — interactive, TTY-only, masked password
+                                  # (idempotent; --force RESETS the existing one's credentials)
 npm run auth:hash-password -- 'pw'  # print an argon2id hash for a password (debug/DB seeding; no DB, no endpoint by design)
 ```
 
@@ -131,6 +132,22 @@ two domains share **no session and no authentication surface**.
   **inside the write transaction** → `400`. The FK does **not** do that job — `onDelete: Restrict`
   guards *hard* deletes, and a soft-deleted row still exists, so Postgres accepts it happily. Adding a
   `deletedAt` filter to the read would return `null` against a non-nullable DTO field and 500 the list.
+- **`isSystemReserved` is the third dimension of that asymmetry.** Both option tables carry it
+  (`@default(false)`); it marks the two rows the System Developer owns. **Only a SUPER_ADMIN may see or
+  assign one** — that one role→capability fact is `mayUseSystemReservedOptions` in
+  `system-users.policy.ts` and exists **nowhere else**. Everyone else gets the **same `400`** as for an
+  unknown id (`INVALID_DEPARTMENT`/`INVALID_PERSONNEL_ROLE`), **never a `403`**: a distinct status would
+  be an existence oracle, and *reserved must be indistinguishable from never-existed*. `PATCH`/`DELETE`
+  on a reserved option is a `404` for **everyone, SUPER_ADMIN included** — they are not CRUD-managed;
+  a rename would break the CLI's resolve-by-name. Reads follow the asymmetry above: an *existing*
+  assignment still resolves the reserved name on a SUPER_ADMIN's own staff row (filtering the nested
+  select would 500 the list) — the boundary is **assignability**, with dropdown invisibility as its UX
+  expression, not secrecy of the string. **It is a FLAG, never a name:** a row *named* 'System
+  Developer' with the flag `false` is an ordinary option granting nothing — same trap as a
+  `PersonnelRole` named `"ADMIN"`. Settable by no endpoint (absent from every DTO ⇒
+  `forbidNonWhitelisted` 400s it); the **only** writer of `true` is `scripts/create-super-admin.ts`.
+  `src/options/` must stay free of `SystemRole` outside `@Roles()` (AC-X3 fails the build), so
+  `OptionsService.list` takes a **boolean**, never a role.
 - **`mustChangePassword` is the forced-reset gate** (camelCase, `@default(true)`). A temp password is
   issued by `POST /system-users` and `POST /system-users/:id/reset-password`, returned **exactly once**
   as `temporaryPassword`, argon2id-hashed at rest, and **never logged** — keep log lines `id=`-only and
@@ -218,10 +235,11 @@ webhook) should use `@ApiExcludeController()`.
 **Environment** (see `.env.example`): `PORT` (3300), `CORS_ORIGIN` (defaults to the Vite dev
 server), `SWAGGER_ENABLED`, `DATABASE_URL`, `LINE_CHANNEL_ACCESS_TOKEN`, `LINE_CHANNEL_SECRET`,
 `REDIS_URL`, `SESSION_SECRET`, `CSRF_SECRET` (must differ from `SESSION_SECRET`),
-`SESSION_COOKIE_NAME` / `_SECURE` / `_SAMESITE`, `SESSION_TTL_SECONDS`, the five `R2_*` vars (see the
-Auth section), and the `SEED_SUPER_ADMIN_*` vars used only by the seed script — note
-`SEED_SUPER_ADMIN_POSITION` / `_DEPARTMENT` keep their names but are now the **name of the option to
-resolve-or-create**, not free text. `src/config/env.validation.ts` fails the boot on a misconfigured
+`SESSION_COOKIE_NAME` / `_SECURE` / `_SAMESITE`, `SESSION_TTL_SECONDS`, and the five `R2_*` vars (see
+the Auth section). There are deliberately **no `SEED_SUPER_ADMIN_*` vars**: the first SUPER_ADMIN is
+created by the interactive, TTY-gated `npm run auth:create-superadmin`, so the root credential never
+sits in a `.env` file, shell history, or a CI log — that env bypass is exactly what the CLI replaced.
+`src/config/env.validation.ts` fails the boot on a misconfigured
 secret — that is a deploy defect, unlike an unreachable Redis, which is a runtime condition that
 degrades to `503`. Backend and frontend are separate origins by design; with cookie sessions and
 `credentials: true`, the `CORS_ORIGIN` allowlist is a security control and must never become `*`.

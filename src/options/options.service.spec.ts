@@ -52,10 +52,12 @@ describe('OptionsService', () => {
     it('returns non-deleted departments ordered name ASC, ISO dates, no deletedAt', async () => {
       department.findMany.mockResolvedValue([ROW]);
 
-      const result = await service.list('department');
+      const result = await service.list('department', {
+        includeReserved: false,
+      });
 
       expect(department.findMany).toHaveBeenCalledWith({
-        where: { deletedAt: null },
+        where: { deletedAt: null, isSystemReserved: false },
         select: { id: true, name: true, createdAt: true, updatedAt: true },
         orderBy: { name: 'asc' },
       });
@@ -71,9 +73,44 @@ describe('OptionsService', () => {
 
     it('routes `personnelRole` to the personnel_roles delegate (never department)', async () => {
       personnelRole.findMany.mockResolvedValue([]);
-      await service.list('personnelRole');
+      await service.list('personnelRole', { includeReserved: false });
       expect(personnelRole.findMany).toHaveBeenCalled();
       expect(department.findMany).not.toHaveBeenCalled();
+    });
+
+    // ─────────────── system-reserved options (02_design_log.md §2.2) ───────────────
+
+    it('AC-B4 — includeReserved:false excludes reserved rows via the WHERE clause, not a post-filter', async () => {
+      department.findMany.mockResolvedValue([]);
+      await service.list('department', { includeReserved: false });
+
+      // The control is the WHERE clause: the caller must never hold a row it may not return.
+      expect(department.findMany).toHaveBeenCalledWith({
+        where: { deletedAt: null, isSystemReserved: false },
+        select: { id: true, name: true, createdAt: true, updatedAt: true },
+        orderBy: { name: 'asc' },
+      });
+    });
+
+    it('AC-B4 — includeReserved:true drops the predicate so a SUPER_ADMIN sees reserved rows', async () => {
+      department.findMany.mockResolvedValue([]);
+      await service.list('department', { includeReserved: true });
+
+      expect(department.findMany).toHaveBeenCalledWith({
+        where: { deletedAt: null },
+        select: { id: true, name: true, createdAt: true, updatedAt: true },
+        orderBy: { name: 'asc' },
+      });
+    });
+
+    it('AC-B4 — both option models honour includeReserved identically', async () => {
+      personnelRole.findMany.mockResolvedValue([]);
+      await service.list('personnelRole', { includeReserved: false });
+      expect(personnelRole.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { deletedAt: null, isSystemReserved: false },
+        }),
+      );
     });
   });
 
@@ -124,6 +161,22 @@ describe('OptionsService', () => {
         new ConflictException(OPTION_NAME_TAKEN),
       );
     });
+
+    it('AC-B8 — excludes reserved rows from the target lookup, so renaming one is a 404', async () => {
+      // The reserved row is filtered in the WHERE, so the lookup misses and the method 404s exactly
+      // as for an unknown id — byte-identical, for EVERY role including SUPER_ADMIN. The method
+      // takes no actor at all, which is what makes that guarantee unconditional.
+      department.findFirst.mockResolvedValue(null);
+
+      await expect(service.update('department', 1, 'Renamed')).rejects.toThrow(
+        new NotFoundException(OPTION_NOT_FOUND),
+      );
+      expect(department.findFirst).toHaveBeenCalledWith({
+        where: { id: 1, deletedAt: null, isSystemReserved: false },
+        select: { id: true },
+      });
+      expect(department.update).not.toHaveBeenCalled();
+    });
   });
 
   describe('softDelete', () => {
@@ -144,6 +197,19 @@ describe('OptionsService', () => {
       ];
       expect(arg.where).toEqual({ id: 1 });
       expect(arg.data.deletedAt).toBeInstanceOf(Date);
+    });
+
+    it('AC-B8 — excludes reserved rows from the target lookup, so deleting one is a 404', async () => {
+      personnelRole.findFirst.mockResolvedValue(null);
+
+      await expect(service.softDelete('personnelRole', 1)).rejects.toThrow(
+        new NotFoundException(OPTION_NOT_FOUND),
+      );
+      expect(personnelRole.findFirst).toHaveBeenCalledWith({
+        where: { id: 1, deletedAt: null, isSystemReserved: false },
+        select: { id: true },
+      });
+      expect(personnelRole.update).not.toHaveBeenCalled();
     });
   });
 });
