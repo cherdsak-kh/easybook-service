@@ -226,7 +226,7 @@ two domains share **no session and no authentication surface**.
 true` — DTOs are the strict transport-boundary contract, unknown/extra fields are rejected. This is
 also the only enforcement needed for "PATCH cannot set `password`/`email`/`lineUserId`": those
 fields simply don't exist on `UpdateSystemUserDto`. Note that `useDefineForClassFields` is effective
-(`target: ES2023`), so `'role' in dto` is *always* true — test presence with `dto.role !== undefined`,
+(it defaults to true at `target` >= ES2022; currently ES2022), so `'role' in dto` is *always* true — test presence with `dto.role !== undefined`,
 and use `@ValidateIf((_o, v) => v !== undefined)` (not `@IsOptional()`) on optional non-nullable
 fields, or an explicit `null` reaches a `NOT NULL` column. Swagger is wired in `main.ts` and can be
 disabled via `SWAGGER_ENABLED=false`; controllers not meant for the public contract (like the LINE
