@@ -8,6 +8,7 @@ import { OptionsService } from './options.service';
 const ROW = {
   id: 1,
   name: 'Computer Science',
+  isSystemReserved: false,
   createdAt: new Date('2026-07-14T10:00:00.000Z'),
   updatedAt: new Date('2026-07-14T10:00:00.000Z'),
 };
@@ -58,17 +59,53 @@ describe('OptionsService', () => {
 
       expect(department.findMany).toHaveBeenCalledWith({
         where: { deletedAt: null, isSystemReserved: false },
-        select: { id: true, name: true, createdAt: true, updatedAt: true },
+        select: {
+          id: true,
+          name: true,
+          isSystemReserved: true,
+          createdAt: true,
+          updatedAt: true,
+        },
         orderBy: { name: 'asc' },
       });
       expect(result).toEqual([
         {
           id: 1,
           name: 'Computer Science',
+          isSystemReserved: false,
           createdAt: '2026-07-14T10:00:00.000Z',
           updatedAt: '2026-07-14T10:00:00.000Z',
         },
       ]);
+    });
+
+    // ─────────────── isSystemReserved threading (02_design_log.md §2) ───────────────
+
+    it('AC-2.1 — threads isSystemReserved through the DTO (read-only), including a reserved row for SUPER_ADMIN', async () => {
+      // A SUPER_ADMIN read (includeReserved: true) can carry a reserved row; the flag surfaces as-is.
+      department.findMany.mockResolvedValue([
+        { ...ROW, id: 9, name: 'System Developer', isSystemReserved: true },
+        ROW,
+      ]);
+
+      const result = await service.list('department', {
+        includeReserved: true,
+      });
+
+      // The reserved row's flag is exposed; the ordinary row's stays false. The select requests it.
+      expect(department.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          select: {
+            id: true,
+            name: true,
+            isSystemReserved: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        }),
+      );
+      expect(result[0].isSystemReserved).toBe(true);
+      expect(result[1].isSystemReserved).toBe(false);
     });
 
     it('routes `personnelRole` to the personnel_roles delegate (never department)', async () => {
@@ -87,7 +124,13 @@ describe('OptionsService', () => {
       // The control is the WHERE clause: the caller must never hold a row it may not return.
       expect(department.findMany).toHaveBeenCalledWith({
         where: { deletedAt: null, isSystemReserved: false },
-        select: { id: true, name: true, createdAt: true, updatedAt: true },
+        select: {
+          id: true,
+          name: true,
+          isSystemReserved: true,
+          createdAt: true,
+          updatedAt: true,
+        },
         orderBy: { name: 'asc' },
       });
     });
@@ -98,7 +141,13 @@ describe('OptionsService', () => {
 
       expect(department.findMany).toHaveBeenCalledWith({
         where: { deletedAt: null },
-        select: { id: true, name: true, createdAt: true, updatedAt: true },
+        select: {
+          id: true,
+          name: true,
+          isSystemReserved: true,
+          createdAt: true,
+          updatedAt: true,
+        },
         orderBy: { name: 'asc' },
       });
     });
@@ -120,7 +169,13 @@ describe('OptionsService', () => {
       const result = await service.create('department', 'Computer Science');
       expect(department.create).toHaveBeenCalledWith({
         data: { name: 'Computer Science' },
-        select: { id: true, name: true, createdAt: true, updatedAt: true },
+        select: {
+          id: true,
+          name: true,
+          isSystemReserved: true,
+          createdAt: true,
+          updatedAt: true,
+        },
       });
       expect(result.name).toBe('Computer Science');
     });
@@ -149,7 +204,13 @@ describe('OptionsService', () => {
       expect(department.update).toHaveBeenCalledWith({
         where: { id: 1 },
         data: { name: 'Renamed' },
-        select: { id: true, name: true, createdAt: true, updatedAt: true },
+        select: {
+          id: true,
+          name: true,
+          isSystemReserved: true,
+          createdAt: true,
+          updatedAt: true,
+        },
       });
       expect(result.name).toBe('Renamed');
     });

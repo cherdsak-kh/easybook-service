@@ -38,6 +38,7 @@ interface Session {
 interface OptionBody {
   id: number;
   name: string;
+  isSystemReserved: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -193,6 +194,32 @@ describe('Registration options admin CRUD (e2e)', () => {
         .expect(404);
     });
 
+    it('AC-2.1 — every option row carries isSystemReserved; a freshly created option is false', async () => {
+      const { agent, token } = await login(ADMIN);
+
+      const created = await agent
+        .post(url(base))
+        .set('x-csrf-token', token)
+        .send({ name: name('reserved-flag') })
+        .expect(201);
+      // Read-only flag present on the create response, and false for an ordinary option.
+      expect((created.body as OptionBody).isSystemReserved).toBe(false);
+
+      const list = await agent.get(url(base)).expect(200);
+      for (const row of list.body as OptionBody[]) {
+        expect(typeof row.isSystemReserved).toBe('boolean');
+      }
+    });
+
+    it('AC-2.2 — isSystemReserved is not settable on create (forbidNonWhitelisted 400)', async () => {
+      const { agent, token } = await login(SUPER);
+      await agent
+        .post(url(base))
+        .set('x-csrf-token', token)
+        .send({ name: name('nowrite'), isSystemReserved: true })
+        .expect(400);
+    });
+
     it('SC-B7 — a duplicate ACTIVE name is 409; re-creating a soft-deleted name is 201 (partial unique)', async () => {
       const { agent, token } = await login(SUPER);
       const n = name('reuse');
@@ -257,6 +284,36 @@ describe('Registration options admin CRUD (e2e)', () => {
         .set('x-csrf-token', token)
         .expect(400);
     });
+  });
+
+  // ─────────────────── isSystemReserved visibility (Item 2, AC-2.4) ───────────────────
+
+  it('AC-2.4 — only SUPER_ADMIN receives a reserved row (isSystemReserved: true); ADMIN never does', async () => {
+    const reservedName = `${OPT_PREFIX}reserved-visible`;
+    // Simulate the create-super-admin script's reserved row (the ONLY writer of true).
+    await prisma.department.create({
+      data: { name: reservedName, isSystemReserved: true },
+      select: { id: true },
+    });
+
+    // SUPER_ADMIN receives the reserved row, flagged true.
+    const superSession = await login(SUPER);
+    const superList = await superSession.agent
+      .get(url('/departments'))
+      .expect(200);
+    const superRow = (superList.body as OptionBody[]).find(
+      (o) => o.name === reservedName,
+    );
+    expect(superRow?.isSystemReserved).toBe(true);
+
+    // ADMIN never receives the reserved row, and every row they DO see is false.
+    const adminSession = await login(ADMIN);
+    const adminList = await adminSession.agent
+      .get(url('/departments'))
+      .expect(200);
+    const adminRows = adminList.body as OptionBody[];
+    expect(adminRows.map((o) => o.name)).not.toContain(reservedName);
+    expect(adminRows.every((o) => o.isSystemReserved === false)).toBe(true);
   });
 
   // ─────────────────── PersonnelRole ≠ SystemRole cross-check (SC-B4) ───────────────────

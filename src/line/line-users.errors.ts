@@ -16,6 +16,16 @@ export const LINE_RICH_MENU_APPLY_FAILED =
   'Failed to apply the LINE rich menu. Please retry.';
 
 /**
+ * An ADMIN attempted an access transition the matrix forbids (design §3, AC-3.2). The body is
+ * well-formed and the enum value is valid — it is the actor's ROLE that is not permitted to make this
+ * transition, so the status is 403 (authorization limit), NOT 400. Reachable only AFTER the 404
+ * precedence check, so it never leaks the existence of an unknown/soft-deleted row. SUPER_ADMIN never
+ * hits this (it bypasses the predicate entirely).
+ */
+export const LINE_USER_ACCESS_TRANSITION_FORBIDDEN =
+  'You are not permitted to make this status change.';
+
+/**
  * Registration conflicts (design §3.1). Distinct messages so the frontend can tell the two apart:
  * the caller already has a registration vs. the submitted ID belongs to someone else.
  */

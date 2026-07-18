@@ -37,6 +37,13 @@ export class PersonnelRoleResponseDto {
   @ApiProperty({ example: 'Teacher' })
   name!: string;
 
+  @ApiProperty({
+    example: false,
+    description:
+      'READ-ONLY. True only for the System-Developer-owned reserved row (visible to SUPER_ADMIN only; always false for everyone else). Settable by no endpoint.',
+  })
+  isSystemReserved!: boolean;
+
   @ApiProperty({ example: '2026-07-14T10:00:00.000Z' })
   createdAt!: string;
 

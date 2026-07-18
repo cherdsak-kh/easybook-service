@@ -103,6 +103,7 @@ describe('LINE Users management (e2e)', () => {
   let prisma: PrismaService;
   let redis: Redis;
   let pushSpy: jest.SpyInstance;
+  let linkSpy: jest.SpyInstance;
 
   const luIds: Record<string, string> = {};
   const server = () => app.getHttpServer();
@@ -217,7 +218,9 @@ describe('LINE Users management (e2e)', () => {
     // hit the real Messaging API — the switch behaviour is unit-tested; here we only need 200s.
     const line = app.get(LineService);
     jest.spyOn(line, 'findRichMenuId').mockResolvedValue('rm-e2e');
-    jest.spyOn(line, 'linkRichMenuToUser').mockResolvedValue(undefined);
+    linkSpy = jest
+      .spyOn(line, 'linkRichMenuToUser')
+      .mockResolvedValue(undefined);
     // Best-effort push on access change — stub it so the PATCH tests never hit the real Messaging API.
     pushSpy = jest.spyOn(line, 'push').mockResolvedValue(undefined);
   }, 60_000);
@@ -524,6 +527,133 @@ describe('LINE Users management (e2e)', () => {
         .set('x-csrf-token', token)
         .send({ access: AppAccess.ALLOWED })
         .expect(200);
+    });
+  });
+
+  // ───────── transition matrix + SUPER_ADMIN bypass (Item 3, AC-3.1/2/3/5/6) ─────────
+
+  describe('PATCH /line-users/:id — ADMIN transition matrix', () => {
+    const idFor = (suffix: string) => luIds[`${LU_PREFIX}${suffix}`];
+    const patchAs = async (
+      email: string,
+      suffix: string,
+      access: AppAccess,
+    ) => {
+      const { agent, token } = await login(email);
+      return agent
+        .patch(url(`/line-users/${idFor(suffix)}`))
+        .set('x-csrf-token', token)
+        .send({ access });
+    };
+    const accessOf = async (suffix: string) =>
+      (
+        await prisma.lineUser.findUnique({
+          where: { id: idFor(suffix) },
+          select: { access: true },
+        })
+      )?.access;
+
+    // Each ✅ cell: the four PO pairs + the two idempotent same-state writes. Fixture `from` states:
+    // pending=PENDING, allowed=ALLOWED, blocked=BLOCKED.
+    it.each([
+      ['pending', AppAccess.ALLOWED],
+      ['pending', AppAccess.BLOCKED],
+      ['allowed', AppAccess.BLOCKED],
+      ['blocked', AppAccess.ALLOWED],
+      ['allowed', AppAccess.ALLOWED],
+      ['blocked', AppAccess.BLOCKED],
+    ] as Array<[string, AppAccess]>)(
+      'AC-3.1 — ADMIN may set %s → %s (200) and it persists',
+      async (suffix, to) => {
+        const res = await patchAs(ADMIN, suffix, to);
+        expect(res.status).toBe(200);
+        expect((res.body as LineUserBody).access).toBe(to);
+        expect(await accessOf(suffix)).toBe(to);
+      },
+    );
+
+    // Each ❌ cell: a target of PENDING/UNREGISTERED is forbidden for ADMIN → 403, no state change.
+    it.each([
+      ['pending', AppAccess.PENDING],
+      ['pending', AppAccess.UNREGISTERED],
+      ['allowed', AppAccess.PENDING],
+      ['allowed', AppAccess.UNREGISTERED],
+      ['blocked', AppAccess.PENDING],
+      ['blocked', AppAccess.UNREGISTERED],
+    ] as Array<[string, AppAccess]>)(
+      'AC-3.2 — ADMIN may NOT set %s → %s (403) and nothing changes',
+      async (suffix, to) => {
+        const before = await accessOf(suffix);
+        const res = await patchAs(ADMIN, suffix, to);
+        expect(res.status).toBe(403);
+        expect(await accessOf(suffix)).toBe(before);
+      },
+    );
+
+    // SUPER_ADMIN bypasses the matrix: any→any on a live row, including forcing PENDING/UNREGISTERED.
+    it.each([
+      ['allowed', AppAccess.PENDING],
+      ['blocked', AppAccess.UNREGISTERED],
+      ['pending', AppAccess.PENDING],
+    ] as Array<[string, AppAccess]>)(
+      'AC-3.3 — SUPER_ADMIN may force %s → %s (200)',
+      async (suffix, to) => {
+        const res = await patchAs(SUPER, suffix, to);
+        expect(res.status).toBe(200);
+        expect(await accessOf(suffix)).toBe(to);
+      },
+    );
+
+    it('AC-3.5 — for ADMIN a soft-deleted id is 404 even for a FORBIDDEN transition (404 before 403)', async () => {
+      const { agent, token } = await login(ADMIN);
+
+      // A forbidden target (PENDING) on a soft-deleted row must be 404, byte-identical to an unknown
+      // id — 404 wins, so the matrix never leaks the row's existence.
+      const deleted = await agent
+        .patch(url(`/line-users/${idFor('deleted')}`))
+        .set('x-csrf-token', token)
+        .send({ access: AppAccess.PENDING })
+        .expect(404);
+      const unknown = await agent
+        .patch(url('/line-users/never-existed'))
+        .set('x-csrf-token', token)
+        .send({ access: AppAccess.PENDING })
+        .expect(404);
+      expect(deleted.body).toEqual(unknown.body);
+
+      // The soft-deleted row is untouched (still PENDING, still deleted).
+      const row = await prisma.lineUser.findUnique({
+        where: { id: idFor('deleted') },
+        select: { access: true, deletedAt: true },
+      });
+      expect(row?.access).toBe(AppAccess.PENDING);
+      expect(row?.deletedAt).not.toBeNull();
+    });
+
+    it('AC-3.6 — SUPER_ADMIN may force a soft-deleted user; DB persists, LINE side-effects are skipped, no 502', async () => {
+      const { agent, token } = await login(SUPER);
+      pushSpy.mockClear();
+      linkSpy.mockClear();
+
+      const res = await agent
+        .patch(url(`/line-users/${idFor('deleted')}`))
+        .set('x-csrf-token', token)
+        .send({ access: AppAccess.ALLOWED })
+        .expect(200);
+      expect((res.body as LineUserBody).access).toBe(AppAccess.ALLOWED);
+
+      // The DB row is the source of truth: access + derived richMenuType persisted, still soft-deleted.
+      const row = await prisma.lineUser.findUnique({
+        where: { id: idFor('deleted') },
+        select: { access: true, richMenuType: true, deletedAt: true },
+      });
+      expect(row?.access).toBe(AppAccess.ALLOWED);
+      expect(row?.richMenuType).toBe('TYPE_2');
+      expect(row?.deletedAt).not.toBeNull();
+
+      // Both LINE side-effects were skipped — the account is unreachable, so no push and no menu link.
+      expect(linkSpy).not.toHaveBeenCalled();
+      expect(pushSpy).not.toHaveBeenCalled();
     });
   });
 });

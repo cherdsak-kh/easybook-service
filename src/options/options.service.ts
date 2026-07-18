@@ -15,6 +15,7 @@ export type OptionModel = 'department' | 'personnelRole';
 export interface OptionResponse {
   id: number;
   name: string;
+  isSystemReserved: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -23,6 +24,7 @@ export interface OptionResponse {
 interface OptionRow {
   id: number;
   name: string;
+  isSystemReserved: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -36,7 +38,13 @@ interface OptionRow {
 interface OptionDelegate {
   findMany(args: {
     where: { deletedAt: null; isSystemReserved?: boolean };
-    select: { id: true; name: true; createdAt: true; updatedAt: true };
+    select: {
+      id: true;
+      name: true;
+      isSystemReserved: true;
+      createdAt: true;
+      updatedAt: true;
+    };
     orderBy: { name: 'asc' };
   }): Promise<OptionRow[]>;
   findFirst(args: {
@@ -45,18 +53,35 @@ interface OptionDelegate {
   }): Promise<{ id: number } | null>;
   create(args: {
     data: { name: string };
-    select: { id: true; name: true; createdAt: true; updatedAt: true };
+    select: {
+      id: true;
+      name: true;
+      isSystemReserved: true;
+      createdAt: true;
+      updatedAt: true;
+    };
   }): Promise<OptionRow>;
   update(args: {
     where: { id: number };
     data: { name?: string; deletedAt?: Date };
-    select: { id: true; name: true; createdAt: true; updatedAt: true };
+    select: {
+      id: true;
+      name: true;
+      isSystemReserved: true;
+      createdAt: true;
+      updatedAt: true;
+    };
   }): Promise<OptionRow>;
 }
 
+// `isSystemReserved` is exposed READ-ONLY (design §2): it is present on every option response, but
+// on NO Create/Update DTO. Non-SUPER_ADMIN callers never receive a reserved row (the `includeReserved`
+// WHERE clause), so they only ever see `false` — the flag carries no information for them and needs no
+// role logic in this layer. `scripts/create-super-admin.ts` remains the sole writer of `true`.
 const PUBLIC_SELECT = {
   id: true,
   name: true,
+  isSystemReserved: true,
   createdAt: true,
   updatedAt: true,
 } as const;
@@ -64,6 +89,7 @@ const PUBLIC_SELECT = {
 const toDto = (row: OptionRow): OptionResponse => ({
   id: row.id,
   name: row.name,
+  isSystemReserved: row.isSystemReserved,
   createdAt: row.createdAt.toISOString(),
   updatedAt: row.updatedAt.toISOString(),
 });

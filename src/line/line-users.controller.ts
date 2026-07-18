@@ -19,6 +19,8 @@ import {
   ApiTags,
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
+import type { AuthenticatedSystemUser } from '../auth/auth.types';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { SessionGuard } from '../auth/guards/session.guard';
@@ -85,7 +87,7 @@ export class LineUsersController {
   @ApiOperation({
     summary: 'Approve or block a LINE user (update `access`).',
     description:
-      'Sets `access` (Approve → ALLOWED, Block → BLOCKED). Returns the updated row. An unknown or soft-deleted id is a 404 that reveals nothing about deletion; an empty body, a bad enum value, or any extra key is a 400.',
+      'Sets `access` (Approve → ALLOWED, Block → BLOCKED). Returns the updated row. ADMIN is bound by the transition matrix (may only reach ALLOWED/BLOCKED, and not from UNREGISTERED); SUPER_ADMIN may set any state and may target soft-deleted rows. An empty body, a bad enum value, or any extra key is a 400.',
   })
   @ApiHeader({ name: 'x-csrf-token', required: true })
   @ApiOkResponse({ description: 'Updated.', type: LineUserResponseDto })
@@ -94,11 +96,13 @@ export class LineUsersController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF, or CSRF failure.',
+    description:
+      'STAFF; CSRF failure; or an access transition not permitted for ADMIN.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
-    description: 'Unknown or soft-deleted id.',
+    description:
+      'Unknown id (both roles); a soft-deleted id is 404 for ADMIN but targetable by SUPER_ADMIN. Reveals nothing about deletion.',
     type: ErrorResponseDto,
   })
   @ApiServiceUnavailableResponse({
@@ -108,7 +112,8 @@ export class LineUsersController {
   updateAccess(
     @Param('id') id: string,
     @Body() dto: UpdateLineUserAccessDto,
+    @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<LineUserResponseDto> {
-    return this.users.updateAccess(id, dto.access);
+    return this.users.updateAccess(id, dto.access, user.role);
   }
 }
