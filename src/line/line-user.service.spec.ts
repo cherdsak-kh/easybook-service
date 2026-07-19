@@ -9,6 +9,7 @@ import {
 import { AppAccess, Prisma, SystemRole } from '@prisma/client';
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
+import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
 import { LineService } from './line.service';
@@ -23,6 +24,7 @@ import {
   INVALID_PERSONNEL_ROLE,
   LINE_USER_ACCESS_TRANSITION_FORBIDDEN,
   LINE_USER_NOT_FOUND,
+  LINE_USER_REGISTRATION_NOT_FOUND,
   REGISTRATION_NOT_EDITABLE,
   STAFF_ID_TAKEN,
 } from './line-users.errors';
@@ -710,7 +712,7 @@ describe('LineUserService', () => {
       });
     });
 
-    it('maps a nested registration relation into the compact summary with resolved option names (AC-B11/SC-B5)', async () => {
+    it('maps a nested registration relation into the compact summary with option ids + resolved names (AC-B11/SC-B5/§B-8a)', async () => {
       $transaction.mockResolvedValue([
         [
           {
@@ -721,6 +723,8 @@ describe('LineUserService', () => {
               lastName: 'Jaidee',
               staffId: '6412345678',
               phone: '081-234-5678',
+              departmentId: 1,
+              personnelRoleId: 2,
               department: { name: 'Computer Science' },
               personnelRole: { name: 'Teacher' },
             },
@@ -731,13 +735,25 @@ describe('LineUserService', () => {
 
       const result = await service.findManyPaginated({ page: 1, limit: 20 });
 
+      // §B-8a additive contract: the summary now carries departmentId + personnelRoleId so the admin
+      // edit modal can pre-select its dropdowns without a second fetch.
       expect(result.data[0].registration).toEqual({
         firstName: 'Somchai',
         lastName: 'Jaidee',
         staffId: '6412345678',
         phone: '081-234-5678',
+        departmentId: 1,
         department: 'Computer Science',
+        personnelRoleId: 2,
         personnelRole: 'Teacher',
+      });
+    });
+
+    it('§B-8a — LINE_USER_PUBLIC_FIELDS selects both option ids on the nested registration', () => {
+      // The additive contract is only satisfiable if the select actually asks for the ids.
+      expect(LINE_USER_PUBLIC_FIELDS.registration.select).toMatchObject({
+        departmentId: true,
+        personnelRoleId: true,
       });
     });
 
@@ -1183,6 +1199,322 @@ describe('LineUserService', () => {
 
       expect(first.access).toBe(AppAccess.ALLOWED);
       expect(second.access).toBe(AppAccess.ALLOWED);
+      expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
+      expect(line.push).not.toHaveBeenCalled();
+    });
+  });
+
+  // ───────────────────────── updateRegistrationByAdmin (admin registration edit) ─────────────────────────
+
+  describe('updateRegistrationByAdmin', () => {
+    const ADMIN_EDIT_DTO: AdminUpdateLineUserRegistrationDto = {
+      firstName: 'Edited',
+      lastName: 'Name',
+      staffId: 'NEW-STAFF',
+      phone: '099-999-9999',
+      departmentId: 3,
+      personnelRoleId: 4,
+    };
+
+    /** The re-read LineUser (LINE_USER_PUBLIC_FIELDS) reflecting the edited registration. */
+    const publicUpdated = {
+      ...publicRow,
+      access: AppAccess.ALLOWED,
+      registration: {
+        firstName: 'Edited',
+        lastName: 'Name',
+        staffId: 'NEW-STAFF',
+        phone: '099-999-9999',
+        departmentId: 3,
+        personnelRoleId: 4,
+        department: { name: 'New Dept' },
+        personnelRole: { name: 'New Role' },
+      },
+    };
+
+    /**
+     * Prime a fully successful world: the target row, an existing registration, an interactive
+     * transaction whose option checks pass and whose update resolves, and the re-read public row.
+     */
+    const primeSuccess = (deletedAt: Date | null = null) => {
+      lineUser.findUnique
+        .mockResolvedValueOnce({ id: 'lu-1', deletedAt })
+        .mockResolvedValueOnce(publicUpdated);
+      lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
+      const tx = {
+        department: { findFirst: jest.fn().mockResolvedValue({ id: 3 }) },
+        personnelRole: { findFirst: jest.fn().mockResolvedValue({ id: 4 }) },
+        lineUserRegistration: {
+          update: jest.fn().mockResolvedValue({ id: 'reg-1' }),
+        },
+      };
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+      return tx;
+    };
+
+    it.each([SystemRole.ADMIN, SystemRole.SUPER_ADMIN])(
+      'AC-B2 — %s edits all six fields, persists them, and returns the updated row (200)',
+      async (role) => {
+        const tx = primeSuccess();
+
+        const result = await service.updateRegistrationByAdmin(
+          'lu-1',
+          ADMIN_EDIT_DTO,
+          role,
+        );
+
+        // `access` is NOT selected on the existence read — the edit is not PENDING-gated (AC-B10).
+        expect(lineUser.findUnique).toHaveBeenNthCalledWith(1, {
+          where: { id: 'lu-1' },
+          select: { id: true, deletedAt: true },
+        });
+        // All six fields written, keyed on the 1:1 lineUserId.
+        expect(tx.lineUserRegistration.update).toHaveBeenCalledWith({
+          where: { lineUserId: 'lu-1' },
+          data: {
+            firstName: 'Edited',
+            lastName: 'Name',
+            staffId: 'NEW-STAFF',
+            phone: '099-999-9999',
+            departmentId: 3,
+            personnelRoleId: 4,
+          },
+        });
+        // Response is the re-read LINE_USER_PUBLIC_FIELDS row, incl. the summary option ids (§B-8a).
+        expect(result.registration).toMatchObject({
+          firstName: 'Edited',
+          staffId: 'NEW-STAFF',
+          departmentId: 3,
+          department: 'New Dept',
+          personnelRoleId: 4,
+          personnelRole: 'New Role',
+        });
+      },
+    );
+
+    it('AC-B9 — a registration edit has NO access side-effect: no matrix, no rich menu, no push', async () => {
+      primeSuccess();
+
+      await service.updateRegistrationByAdmin(
+        'lu-1',
+        ADMIN_EDIT_DTO,
+        SystemRole.ADMIN,
+      );
+
+      // Orthogonal to Item 3: `access`/`richMenuType` are never written and no LINE call fires.
+      expect(lineUser.update).not.toHaveBeenCalled();
+      expect(line.findRichMenuId).not.toHaveBeenCalled();
+      expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
+      expect(line.push).not.toHaveBeenCalled();
+    });
+
+    it('AC-B10 — the existence read never selects `access` (not PENDING-gated)', async () => {
+      primeSuccess();
+      await service.updateRegistrationByAdmin(
+        'lu-1',
+        ADMIN_EDIT_DTO,
+        SystemRole.SUPER_ADMIN,
+      );
+      const firstSelect = (
+        lineUser.findUnique.mock.calls[0] as [
+          { select: Record<string, unknown> },
+        ]
+      )[0].select;
+      expect(firstSelect).not.toHaveProperty('access');
+    });
+
+    it('AC-B5 — a staffId held by ANOTHER registration is a 409 STAFF_ID_TAKEN', async () => {
+      lineUser.findUnique.mockResolvedValueOnce({
+        id: 'lu-1',
+        deletedAt: null,
+      });
+      lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
+      const tx = {
+        department: { findFirst: jest.fn().mockResolvedValue({ id: 3 }) },
+        personnelRole: { findFirst: jest.fn().mockResolvedValue({ id: 4 }) },
+        lineUserRegistration: {
+          update: jest.fn().mockRejectedValue(
+            new Prisma.PrismaClientKnownRequestError('unique', {
+              code: 'P2002',
+              clientVersion: 'x',
+              meta: { target: ['staffId'] },
+            }),
+          ),
+        },
+      };
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+
+      await expect(
+        service.updateRegistrationByAdmin(
+          'lu-1',
+          ADMIN_EDIT_DTO,
+          SystemRole.ADMIN,
+        ),
+      ).rejects.toThrow(new ConflictException(STAFF_ID_TAKEN));
+    });
+
+    it('AC-B5 — re-submitting the row’s OWN current staffId does not self-collide (no false 409)', async () => {
+      // A Prisma update writing the row's own staffId does not violate the unique constraint, so the
+      // update resolves and the method returns 200 — there is no manual own-id exclusion to get wrong.
+      const tx = primeSuccess();
+
+      const result = await service.updateRegistrationByAdmin(
+        'lu-1',
+        ADMIN_EDIT_DTO,
+        SystemRole.ADMIN,
+      );
+
+      expect(tx.lineUserRegistration.update).toHaveBeenCalled();
+      expect(result.access).toBe(AppAccess.ALLOWED);
+    });
+
+    it.each([SystemRole.ADMIN, SystemRole.SUPER_ADMIN])(
+      'AC-B6 — a system-reserved departmentId is 400 for %s (reserved-for-everyone), no write',
+      async (role) => {
+        lineUser.findUnique.mockResolvedValueOnce({
+          id: 'lu-1',
+          deletedAt: null,
+        });
+        lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
+        // The reserved predicate rides in the same WHERE, so a reserved row simply does not match.
+        const tx = {
+          department: { findFirst: jest.fn().mockResolvedValue(null) },
+          personnelRole: { findFirst: jest.fn().mockResolvedValue({ id: 4 }) },
+          lineUserRegistration: { update: jest.fn() },
+        };
+        $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+          cb(tx),
+        );
+
+        await expect(
+          service.updateRegistrationByAdmin('lu-1', ADMIN_EDIT_DTO, role),
+        ).rejects.toThrow(new BadRequestException(INVALID_DEPARTMENT));
+        // The role-blind guard hardcodes isSystemReserved: false — SUPER_ADMIN gets no carve-out here.
+        expect(tx.department.findFirst).toHaveBeenCalledWith({
+          where: { id: 3, deletedAt: null, isSystemReserved: false },
+          select: { id: true },
+        });
+        expect(tx.lineUserRegistration.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([SystemRole.ADMIN, SystemRole.SUPER_ADMIN])(
+      'AC-B6 — a system-reserved personnelRoleId is 400 for %s (reserved-for-everyone), no write',
+      async (role) => {
+        lineUser.findUnique.mockResolvedValueOnce({
+          id: 'lu-1',
+          deletedAt: null,
+        });
+        lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
+        const tx = {
+          department: { findFirst: jest.fn().mockResolvedValue({ id: 3 }) },
+          personnelRole: { findFirst: jest.fn().mockResolvedValue(null) },
+          lineUserRegistration: { update: jest.fn() },
+        };
+        $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+          cb(tx),
+        );
+
+        await expect(
+          service.updateRegistrationByAdmin('lu-1', ADMIN_EDIT_DTO, role),
+        ).rejects.toThrow(new BadRequestException(INVALID_PERSONNEL_ROLE));
+        expect(tx.personnelRole.findFirst).toHaveBeenCalledWith({
+          where: { id: 4, deletedAt: null, isSystemReserved: false },
+          select: { id: true },
+        });
+        expect(tx.lineUserRegistration.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it('AC-B6 — a soft-deleted option id is rejected with 400 (same query as reserved), no write', async () => {
+      lineUser.findUnique.mockResolvedValueOnce({
+        id: 'lu-1',
+        deletedAt: null,
+      });
+      lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
+      const tx = {
+        department: { findFirst: jest.fn().mockResolvedValue(null) },
+        personnelRole: { findFirst: jest.fn().mockResolvedValue({ id: 4 }) },
+        lineUserRegistration: { update: jest.fn() },
+      };
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+
+      await expect(
+        service.updateRegistrationByAdmin(
+          'lu-1',
+          ADMIN_EDIT_DTO,
+          SystemRole.ADMIN,
+        ),
+      ).rejects.toThrow(new BadRequestException(INVALID_DEPARTMENT));
+      expect(tx.lineUserRegistration.update).not.toHaveBeenCalled();
+    });
+
+    it('AC-B7 — a user with NO registration is a distinct 404 (LINE_USER_REGISTRATION_NOT_FOUND), never a 500', async () => {
+      lineUser.findUnique.mockResolvedValueOnce({
+        id: 'lu-1',
+        deletedAt: null,
+      });
+      lineUserRegistration.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.updateRegistrationByAdmin(
+          'lu-1',
+          ADMIN_EDIT_DTO,
+          SystemRole.ADMIN,
+        ),
+      ).rejects.toThrow(
+        new NotFoundException(LINE_USER_REGISTRATION_NOT_FOUND),
+      );
+      expect($transaction).not.toHaveBeenCalled();
+    });
+
+    it('AC-B8 — an unknown id is a 404 LINE_USER_NOT_FOUND for both roles, no registration read', async () => {
+      for (const role of [SystemRole.ADMIN, SystemRole.SUPER_ADMIN]) {
+        jest.clearAllMocks();
+        lineUser.findUnique.mockResolvedValueOnce(null);
+        await expect(
+          service.updateRegistrationByAdmin('gone', ADMIN_EDIT_DTO, role),
+        ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
+        expect(lineUserRegistration.findFirst).not.toHaveBeenCalled();
+      }
+    });
+
+    it('AC-B8 — a soft-deleted target is a 404 for ADMIN, byte-identical to unknown, no write', async () => {
+      lineUser.findUnique.mockResolvedValueOnce({
+        id: 'lu-1',
+        deletedAt: new Date(),
+      });
+
+      await expect(
+        service.updateRegistrationByAdmin(
+          'lu-1',
+          ADMIN_EDIT_DTO,
+          SystemRole.ADMIN,
+        ),
+      ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
+      // 404 wins before the registration gate — never leaks that the row exists but is deleted.
+      expect(lineUserRegistration.findFirst).not.toHaveBeenCalled();
+      expect($transaction).not.toHaveBeenCalled();
+    });
+
+    it('AC-B8 — SUPER_ADMIN MAY edit a soft-deleted user; persists, returns 200, no LINE side-effect', async () => {
+      const tx = primeSuccess(new Date());
+
+      const result = await service.updateRegistrationByAdmin(
+        'lu-1',
+        ADMIN_EDIT_DTO,
+        SystemRole.SUPER_ADMIN,
+      );
+
+      expect(tx.lineUserRegistration.update).toHaveBeenCalled();
+      expect(result.access).toBe(AppAccess.ALLOWED);
+      // No 502/500 path — a registration edit has no LINE side-effect to skip in the first place.
       expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
       expect(line.push).not.toHaveBeenCalled();
     });

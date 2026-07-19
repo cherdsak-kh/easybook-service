@@ -9,6 +9,8 @@ import {
 } from '@nestjs/common';
 import { SystemRole } from '@prisma/client';
 import {
+  ApiBadRequestResponse,
+  ApiConflictResponse,
   ApiCookieAuth,
   ApiForbiddenResponse,
   ApiHeader,
@@ -25,6 +27,7 @@ import { Roles } from '../auth/decorators/roles.decorator';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { SessionGuard } from '../auth/guards/session.guard';
 import { ErrorResponseDto } from '../common/dto/error-response.dto';
+import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { LineUserResponseDto } from './dto/line-user-response.dto';
 import { ListLineUsersQueryDto } from './dto/list-line-users-query.dto';
 import { PaginatedLineUsersResponseDto } from './dto/paginated-line-users-response.dto';
@@ -115,5 +118,52 @@ export class LineUsersController {
     @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<LineUserResponseDto> {
     return this.users.updateAccess(id, dto.access, user.role);
+  }
+
+  // Two path segments (`:id/registration`) — cannot collide with the single-segment admin `:id` or
+  // the LIFF literal `PATCH /line-users/registration`. Independent of the Item 3 access endpoint: a
+  // registration edit has NO access side-effect (no matrix, no rich menu, no push). `:id` stays an
+  // opaque, unvalidated string, same shape-oracle rationale as `updateAccess`.
+  @Patch(':id/registration')
+  @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN)
+  @ApiOperation({
+    summary: "Edit a LINE user's registration fields (admin).",
+    description:
+      'Full re-submit of firstName, lastName, staffId, phone, departmentId, personnelRoleId. Does NOT change `access` or the rich menu — it is orthogonal to the approve/block transition matrix. Both ADMIN and SUPER_ADMIN may edit. A system-reserved or soft-deleted option id is rejected for every actor (400). For ADMIN a soft-deleted user is 404; SUPER_ADMIN may edit one, with no LINE side-effect.',
+  })
+  @ApiHeader({ name: 'x-csrf-token', required: true })
+  @ApiOkResponse({ description: 'Updated.', type: LineUserResponseDto })
+  @ApiBadRequestResponse({
+    description:
+      'Malformed/blank field, bad phone, an extra key (including `lineUserId`), or a deleted/unknown/system-reserved option id.',
+    type: ErrorResponseDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'No session.',
+    type: ErrorResponseDto,
+  })
+  @ApiForbiddenResponse({
+    description: 'STAFF, or a CSRF failure.',
+    type: ErrorResponseDto,
+  })
+  @ApiNotFoundResponse({
+    description:
+      'Unknown id (both roles); a soft-deleted id for ADMIN; or the user exists but has no registration to edit.',
+    type: ErrorResponseDto,
+  })
+  @ApiConflictResponse({
+    description: 'The `staffId` is taken by another registration (P2002).',
+    type: ErrorResponseDto,
+  })
+  @ApiServiceUnavailableResponse({
+    description: 'Session store unavailable.',
+    type: ErrorResponseDto,
+  })
+  updateRegistrationByAdmin(
+    @Param('id') id: string,
+    @Body() dto: AdminUpdateLineUserRegistrationDto,
+    @CurrentUser() user: AuthenticatedSystemUser,
+  ): Promise<LineUserResponseDto> {
+    return this.users.updateRegistrationByAdmin(id, dto, user.role);
   }
 }

@@ -8,6 +8,16 @@
 export const LINE_USER_NOT_FOUND = 'LINE user not found.';
 
 /**
+ * The admin `PATCH /line-users/:id/registration` target exists (and, for an ADMIN, is not
+ * soft-deleted) but has no `LineUserRegistration` row to edit (an UNREGISTERED follower, or any row
+ * lacking a registration). A **404 with a distinct message** — NOT an existence leak: it is only
+ * reachable AFTER the user is confirmed to exist, and admins already see `registration: null` on the
+ * list. Returned instead of a 500 when there is nothing to update.
+ */
+export const LINE_USER_REGISTRATION_NOT_FOUND =
+  'This LINE user has no registration to edit.';
+
+/**
  * `updateAccess` writes the DB first, then applies the derived rich menu on LINE. A LINE-apply
  * failure surfaces as a retryable 502 (design §4); the DB `access`/`richMenuType` are already the
  * source of truth, and a re-approve/re-block is idempotent.

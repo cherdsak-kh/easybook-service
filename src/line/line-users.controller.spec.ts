@@ -21,6 +21,7 @@ describe('LineUsersController', () => {
   const users = {
     findManyPaginated: jest.fn(),
     updateAccess: jest.fn(),
+    updateRegistrationByAdmin: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -100,6 +101,63 @@ describe('LineUsersController', () => {
         controller.updateAccess(
           'gone',
           { access: AppAccess.BLOCKED },
+          actor(SystemRole.ADMIN),
+        ),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
+  describe('PATCH /line-users/:id/registration', () => {
+    const dto = {
+      firstName: 'Somchai',
+      lastName: 'Jaidee',
+      staffId: '6412345678',
+      phone: '081-234-5678',
+      departmentId: 1,
+      personnelRoleId: 2,
+    };
+
+    it('passes the id, the DTO, and the actor role to the service and returns the updated row', async () => {
+      const updated = { id: 'lu-1', access: AppAccess.ALLOWED };
+      users.updateRegistrationByAdmin.mockResolvedValue(updated);
+
+      const result = await controller.updateRegistrationByAdmin(
+        'lu-1',
+        dto,
+        actor(SystemRole.ADMIN),
+      );
+
+      // The actor's session role (not any body field) is forwarded to the service.
+      expect(users.updateRegistrationByAdmin).toHaveBeenCalledWith(
+        'lu-1',
+        dto,
+        SystemRole.ADMIN,
+      );
+      expect(result).toBe(updated);
+    });
+
+    it('forwards SUPER_ADMIN as the role', async () => {
+      users.updateRegistrationByAdmin.mockResolvedValue({ id: 'lu-1' });
+      await controller.updateRegistrationByAdmin(
+        'lu-1',
+        dto,
+        actor(SystemRole.SUPER_ADMIN),
+      );
+      expect(users.updateRegistrationByAdmin).toHaveBeenCalledWith(
+        'lu-1',
+        dto,
+        SystemRole.SUPER_ADMIN,
+      );
+    });
+
+    it('propagates a NotFoundException from the service (no registration / unknown / soft-deleted)', async () => {
+      users.updateRegistrationByAdmin.mockRejectedValue(
+        new NotFoundException(),
+      );
+      await expect(
+        controller.updateRegistrationByAdmin(
+          'gone',
+          dto,
           actor(SystemRole.ADMIN),
         ),
       ).rejects.toBeInstanceOf(NotFoundException);

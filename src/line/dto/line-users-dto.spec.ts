@@ -1,6 +1,7 @@
 import { ValidationPipe } from '@nestjs/common';
 import type { ArgumentMetadata } from '@nestjs/common';
 import { AppAccess } from '@prisma/client';
+import { AdminUpdateLineUserRegistrationDto } from './admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './create-line-user-registration.dto';
 import { ListLineUsersQueryDto } from './list-line-users-query.dto';
 import { UpdateLineUserAccessDto } from './update-line-user-access.dto';
@@ -162,6 +163,59 @@ describe('CreateLineUserRegistrationDto (through the global ValidationPipe)', ()
     ['a missing required field', { ...VALID, phone: undefined }],
     ['a bad phone', { ...VALID, phone: 'not a phone!!' }],
   ])('rejects %s (AC-B6)', async (_label, body) => {
+    await expect(messagesOf(body)).resolves.toBeInstanceOf(Array);
+  });
+});
+
+describe('AdminUpdateLineUserRegistrationDto (through the global ValidationPipe)', () => {
+  const { validate, messagesOf } = runner<AdminUpdateLineUserRegistrationDto>(
+    AdminUpdateLineUserRegistrationDto,
+    'body',
+  );
+
+  const VALID = {
+    firstName: 'Somchai',
+    lastName: 'Jaidee',
+    staffId: '6412345678',
+    phone: '081-234-5678',
+    departmentId: 1,
+    personnelRoleId: 2,
+  };
+
+  it('AC-B4 — reuses the create validation by inheritance: accepts a valid payload, trims, coerces ids', async () => {
+    await expect(
+      validate({
+        ...VALID,
+        firstName: '  Somchai  ',
+        departmentId: '3',
+        personnelRoleId: '4',
+      }),
+    ).resolves.toMatchObject({
+      firstName: 'Somchai',
+      departmentId: 3,
+      personnelRoleId: 4,
+    });
+  });
+
+  it('AC-B3 — a client-supplied lineUserId is rejected via forbidNonWhitelisted (immutable identity)', async () => {
+    const messages = await messagesOf({ ...VALID, lineUserId: 'U-evil' });
+    expect(messages.join(' ')).toContain(
+      'property lineUserId should not exist',
+    );
+  });
+
+  it.each(['firstName', 'lastName', 'staffId'])(
+    'AC-B4 — rejects a blank %s',
+    async (field) => {
+      const messages = await messagesOf({ ...VALID, [field]: '   ' });
+      expect(messages.join(' ')).toMatch(new RegExp(field));
+    },
+  );
+
+  it.each([
+    ['a missing required field', { ...VALID, phone: undefined }],
+    ['a bad phone', { ...VALID, phone: 'not a phone!!' }],
+  ])('AC-B4 — rejects %s', async (_label, body) => {
     await expect(messagesOf(body)).resolves.toBeInstanceOf(Array);
   });
 });

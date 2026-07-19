@@ -11,6 +11,7 @@ import { Prisma, SystemRole } from '@prisma/client';
 import type { AppAccess, LineUser, RichMenuType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { canAdminSetAccess } from './line-access.policy';
+import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { LineUserRegistrationResponseDto } from './dto/line-user-registration-response.dto';
 import { LineUserResponseDto } from './dto/line-user-response.dto';
@@ -27,6 +28,7 @@ import {
   LINE_RICH_MENU_APPLY_FAILED,
   LINE_USER_ACCESS_TRANSITION_FORBIDDEN,
   LINE_USER_NOT_FOUND,
+  LINE_USER_REGISTRATION_NOT_FOUND,
   REGISTRATION_NOT_EDITABLE,
   STAFF_ID_TAKEN,
 } from './line-users.errors';
@@ -86,6 +88,8 @@ export const LINE_USER_PUBLIC_FIELDS = {
       lastName: true,
       staffId: true,
       phone: true,
+      departmentId: true,
+      personnelRoleId: true,
       department: { select: { name: true } },
       personnelRole: { select: { name: true } },
     },
@@ -576,6 +580,95 @@ export class LineUserService {
     return this.toDto(updated);
   }
 
+  /**
+   * Admin edit of a LINE user's registration fields (`PATCH /line-users/:id/registration`). Keyed on
+   * the cuid `LineUser.id`. A FULL re-submit of the six editable fields; `role` is the authenticated
+   * actor's `SystemRole` and governs only the soft-deleted visibility (below), NOT the fields.
+   *
+   * **Orthogonal to the Item 3 access matrix (AC-B9/AC-B10):** this method never reads or writes
+   * `access`/`richMenuType`, never calls `updateAccess`, never applies a rich menu, and never pushes.
+   * A registration edit has NO LINE side-effect — do not wire in `updateAccess` "for consistency".
+   *
+   * Precedence mirrors `updateAccess`'s existence-oracle discipline, then adds a registration gate:
+   *   1. row == null                    → 404 LINE_USER_NOT_FOUND (both roles; no existence leak)
+   *   2. ADMIN && row.deletedAt != null → 404 LINE_USER_NOT_FOUND (byte-identical to (1))
+   *      // SUPER_ADMIN falls through and may edit a soft-deleted user's registration
+   *   3. no registration row            → 404 LINE_USER_REGISTRATION_NOT_FOUND (distinct; not a 500)
+   *   4. $transaction: assert options active/non-reserved (400), then update the row
+   *   5. re-read the LineUser and return its LineUserResponseDto (200)
+   *
+   * `access` is deliberately NOT selected — the edit is not PENDING-gated. `assertActiveOptions` is
+   * the SAME role-blind guard the LIFF self-edit uses: a system-reserved option is rejected for EVERY
+   * actor, SUPER_ADMIN included (a LINE end-user is never a System Developer). `staffId` is globally
+   * `@unique`; a collision with ANOTHER registration → 409 via `mapRegistrationWriteError` (P2002),
+   * while re-writing the row's own current `staffId` does not self-collide (no false 409).
+   */
+  async updateRegistrationByAdmin(
+    id: string,
+    dto: AdminUpdateLineUserRegistrationDto,
+    role: SystemRole,
+  ): Promise<LineUserResponseDto> {
+    // Plain reads outside the tx (mirrors updateRegistration). `access` is NOT selected — the edit is
+    // orthogonal to the access matrix and is not PENDING-gated.
+    const row = await this.prisma.lineUser.findUnique({
+      where: { id },
+      select: { id: true, deletedAt: true },
+    });
+
+    // 1/2. Unknown id → 404 for both roles; for ADMIN a soft-deleted id is a byte-identical 404
+    // (shape-oracle discipline). SUPER_ADMIN falls through and may edit a soft-deleted user.
+    if (!row) throw new NotFoundException(LINE_USER_NOT_FOUND);
+    if (role === SystemRole.ADMIN && row.deletedAt !== null) {
+      throw new NotFoundException(LINE_USER_NOT_FOUND);
+    }
+
+    // 3. The registration sub-resource must exist to edit. Distinct 404 (never a 500) — reachable only
+    // after the user is confirmed to exist, so it leaks nothing an admin cannot already see.
+    const registration = await this.prisma.lineUserRegistration.findFirst({
+      where: { lineUserId: row.id, deletedAt: null },
+      select: { id: true },
+    });
+    if (!registration) {
+      throw new NotFoundException(LINE_USER_REGISTRATION_NOT_FOUND);
+    }
+
+    try {
+      // One transaction so the option-validity check and the write are atomic (as `register` does).
+      await this.prisma.$transaction(async (tx) => {
+        await this.assertActiveOptions(
+          tx,
+          dto.departmentId,
+          dto.personnelRoleId,
+        );
+        await tx.lineUserRegistration.update({
+          // The 1:1 key. Writing the row's own current staffId is a no-op — no self-collision.
+          where: { lineUserId: row.id },
+          data: {
+            firstName: dto.firstName,
+            lastName: dto.lastName,
+            staffId: dto.staffId,
+            phone: dto.phone,
+            departmentId: dto.departmentId,
+            personnelRoleId: dto.personnelRoleId,
+          },
+        });
+      });
+    } catch (error) {
+      // A P2002 on staffId → 409 STAFF_ID_TAKEN; the 400 from assertActiveOptions passes through.
+      throw this.mapRegistrationWriteError(error);
+    }
+
+    const updated = await this.prisma.lineUser.findUnique({
+      where: { id: row.id },
+      select: LINE_USER_PUBLIC_FIELDS,
+    });
+
+    // PII discipline: log the id only, never the submitted field values or the body. `updated` is
+    // guaranteed non-null — the LineUser row is never hard-deleted, and it existed at step 1.
+    this.logger.log(`LineUser registration edited by admin. id=${row.id}`);
+    return this.toDto(updated!);
+  }
+
   toDto(user: PublicLineUser): LineUserResponseDto {
     return {
       id: user.id,
@@ -592,7 +685,9 @@ export class LineUserService {
             lastName: user.registration.lastName,
             staffId: user.registration.staffId,
             phone: user.registration.phone,
+            departmentId: user.registration.departmentId,
             department: user.registration.department.name,
+            personnelRoleId: user.registration.personnelRoleId,
             personnelRole: user.registration.personnelRole.name,
           }
         : null,
