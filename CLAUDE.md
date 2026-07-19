@@ -21,6 +21,7 @@ npm run prisma:generate           # regenerate the Prisma client after schema ch
 npm run prisma:migrate            # apply/create migrations (prisma migrate dev)
 npm run start:dev                 # watch mode, http://localhost:3300
 npm run build                     # nest build
+npm run typecheck                 # tsc --noEmit -p tsconfig.json (type gate, no emit)
 npm run lint                      # eslint --fix over src/apps/libs/test
 npm run format                    # prettier --write over src and test
 ```
@@ -41,6 +42,7 @@ npm run line:setup-richmenu       # create/upload the two LINE rich menus (needs
 npm run auth:create-superadmin    # create the first SUPER_ADMIN — interactive, TTY-only, masked password
                                   # (idempotent; --force RESETS the existing one's credentials)
 npm run auth:hash-password -- 'pw'  # print an argon2id hash for a password (debug/DB seeding; no DB, no endpoint by design)
+npm run options:seed              # seed baseline Department / PersonnelRole options (never writes isSystemReserved)
 ```
 
 Redis must be running for anything session-backed. There is still no `docker-compose.yml` — see
@@ -51,8 +53,11 @@ the DOCKER-1 backlog item.
 **Module wiring** (`src/app.module.ts`): `ConfigModule` (global, `validate: validateEnv`) →
 `PrismaModule` (global) → `RedisModule` (global) → `CsrfModule` (global) → `ThrottlerModule`
 (registered `global: true` so `LoginThrottleGuard` can resolve it) → `HealthModule` → `LineModule`
-→ `AuthModule` → `SystemUsersModule`. Domain modules (Resource, Booking, etc.) don't exist yet —
-they are added as their own future tasks; don't assume they're stubbed out anywhere.
+→ `AuthModule` → `SystemUsersModule` → `OptionsModule`. `OptionsModule` (`src/options/`) exposes the
+admin-curated `Department` / `PersonnelRole` option tables via `DepartmentsController` /
+`PersonnelRolesController` — the same tables `SystemUser` and LINE registrations reference (see the
+`isSystemReserved` note below). Booking/Resource domain modules don't exist yet — they are added as
+their own future tasks; don't assume they're stubbed out anywhere.
 `AuthModule` ↔ `SystemUsersModule` is a genuine circular reference resolved with `forwardRef` on both
 sides: `SystemUsersModule` needs the guards, and `AuthSystemController` needs `SystemUsersService`
 (which owns every `SystemUser` write — `PATCH /auth/system/me` and the avatar's `profilePictureUrl`
@@ -88,6 +93,17 @@ importing `PrismaModule`. Prisma 7 specifics:
 - `LineUserService` owns the `LineUser` Prisma model: upsert-on-follow (preserves existing
   `access`/`richMenuType` on re-follow), soft-delete-on-unfollow (`deletedAt`, never a hard
   delete), and applying a user's `richMenuType` to their live LINE account.
+- Two HTTP controllers front that model, and **controller order matters** (register
+  `LineRegistrationController` before `LineUsersController` so the 2-segment client route isn't shadowed):
+  - `LineRegistrationController` — the **unauthenticated client** surface a registered LINE user hits
+    from the LIFF app: submit/read their own `LineUserRegistration` (a separate 1:1 model whose data is
+    user-submitted, unlike the LINE-sourced `LineUser` display fields), plus the option lists to pick
+    from. Identity comes only from the verified LINE `sub` claim, never a client-supplied `U…` id.
+  - `LineUsersController` — the **back-office** surface (`@Roles(SUPER_ADMIN, ADMIN)`, CSRF + session):
+    paginated list, `PATCH /line-users/:id` (access approve/block/reinstate — see `line-access.policy.ts`,
+    where an ADMIN transition is gated and SUPER_ADMIN bypasses via an override), and
+    `PATCH /line-users/:id/registration` (admin corrects registration typos; `lineUserId` is immutable,
+    and a reserved `departmentId`/`personnelRoleId` is the **same 400 as an unknown id** — see below).
 - Rich menus are matched by **name + pixel size**, not by a stored LINE-side ID
   (`RICH_MENU_SPECS` in `rich-menu.constants.ts`, resolved via `LineService.findRichMenuId`).
   This is deliberate — it stays correct even if a menu is recreated with a new ID. The two
