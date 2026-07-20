@@ -8,12 +8,32 @@
 export const LINE_USER_NOT_FOUND = 'LINE user not found.';
 
 /**
+ * The admin `PATCH /line-users/:id/registration` target exists (and, for an ADMIN, is not
+ * soft-deleted) but has no `LineUserRegistration` row to edit (an UNREGISTERED follower, or any row
+ * lacking a registration). A **404 with a distinct message** — NOT an existence leak: it is only
+ * reachable AFTER the user is confirmed to exist, and admins already see `registration: null` on the
+ * list. Returned instead of a 500 when there is nothing to update.
+ */
+export const LINE_USER_REGISTRATION_NOT_FOUND =
+  'This LINE user has no registration to edit.';
+
+/**
  * `updateAccess` writes the DB first, then applies the derived rich menu on LINE. A LINE-apply
  * failure surfaces as a retryable 502 (design §4); the DB `access`/`richMenuType` are already the
  * source of truth, and a re-approve/re-block is idempotent.
  */
 export const LINE_RICH_MENU_APPLY_FAILED =
   'Failed to apply the LINE rich menu. Please retry.';
+
+/**
+ * An ADMIN attempted an access transition the matrix forbids (design §3, AC-3.2). The body is
+ * well-formed and the enum value is valid — it is the actor's ROLE that is not permitted to make this
+ * transition, so the status is 403 (authorization limit), NOT 400. Reachable only AFTER the 404
+ * precedence check, so it never leaks the existence of an unknown/soft-deleted row. SUPER_ADMIN never
+ * hits this (it bypasses the predicate entirely).
+ */
+export const LINE_USER_ACCESS_TRANSITION_FORBIDDEN =
+  'You are not permitted to make this status change.';
 
 /**
  * Registration conflicts (design §3.1). Distinct messages so the frontend can tell the two apart:

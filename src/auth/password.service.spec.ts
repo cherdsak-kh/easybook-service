@@ -62,4 +62,39 @@ describe('PasswordService', () => {
       await service.dummyHash(),
     );
   });
+
+  describe('generateTemporaryPassword', () => {
+    it('is 16 chars from the unambiguous alphabet — no 0/O/1/l/I to misread', () => {
+      for (let i = 0; i < 200; i += 1) {
+        const temp = service.generateTemporaryPassword();
+        expect(temp).toHaveLength(16);
+        // The alphabet, spelled out independently of the implementation's constant.
+        expect(temp).toMatch(
+          /^[ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789]{16}$/,
+        );
+        expect(temp).not.toMatch(/[0O1lI]/);
+      }
+    });
+
+    it('satisfies the >= 12 char rule the change-password endpoint enforces', () => {
+      expect(service.generateTemporaryPassword().length).toBeGreaterThanOrEqual(
+        12,
+      );
+    });
+
+    it('never repeats — 500 draws are distinct (a fixed or low-entropy temp password is a breach)', () => {
+      const seen = new Set<string>();
+      for (let i = 0; i < 500; i += 1)
+        seen.add(service.generateTemporaryPassword());
+      expect(seen.size).toBe(500);
+    });
+
+    it('hashes to an argon2id digest that verifies, and the digest never contains the plaintext', async () => {
+      const temp = service.generateTemporaryPassword();
+      const digest = await service.hash(temp);
+
+      expect(digest).not.toContain(temp);
+      await expect(service.verify(digest, temp)).resolves.toBe(true);
+    });
+  });
 });

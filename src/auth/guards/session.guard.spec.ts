@@ -1,8 +1,16 @@
-import { ExecutionContext, UnauthorizedException } from '@nestjs/common';
+import {
+  ExecutionContext,
+  ForbiddenException,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
 import { SystemRole } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { PUBLIC_FIELDS } from '../../system-users/system-users.fields';
-import { SESSION_ABSOLUTE_MAX_AGE_MS } from '../auth.constants';
+import {
+  MUST_CHANGE_PASSWORD,
+  SESSION_ABSOLUTE_MAX_AGE_MS,
+} from '../auth.constants';
 import type { RequestWithSystemUser } from '../auth.types';
 import { SessionGuard } from './session.guard';
 
@@ -12,8 +20,9 @@ const dbRow = {
   firstName: 'Ada',
   lastName: 'Lovelace',
   role: SystemRole.SUPER_ADMIN,
-  position: 'Director',
-  department: 'IT',
+  department: { id: 7, name: 'IT' },
+  personnelRole: { id: 9, name: 'Director' },
+  mustChangePassword: false,
   phoneNumber: null,
   profilePictureUrl: null,
   isActive: true,
@@ -27,8 +36,10 @@ describe('SessionGuard', () => {
   let guard: SessionGuard;
   const findUnique = jest.fn();
   const destroy = jest.fn((cb: (err?: unknown) => void) => cb());
+  const getAllAndOverride = jest.fn();
 
   const prisma = { systemUser: { findUnique } } as unknown as PrismaService;
+  const reflector = { getAllAndOverride } as unknown as Reflector;
 
   const makeRequest = (
     session?: Partial<{ systemUserId: string; createdAt: number }>,
@@ -40,11 +51,14 @@ describe('SessionGuard', () => {
   const contextFor = (req: RequestWithSystemUser): ExecutionContext =>
     ({
       switchToHttp: () => ({ getRequest: () => req }),
+      getHandler: () => () => undefined,
+      getClass: () => class {},
     }) as unknown as ExecutionContext;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    guard = new SessionGuard(prisma);
+    getAllAndOverride.mockReturnValue(undefined); // deny by default — no decorator present
+    guard = new SessionGuard(prisma, reflector);
   });
 
   it('rejects a request with no session', async () => {
@@ -131,6 +145,80 @@ describe('SessionGuard', () => {
 
     await expect(guard.canActivate(contextFor(req))).rejects.toThrow(
       UnauthorizedException,
+    );
+  });
+
+  // ─────────────────── the forced-reset gate (AC-B8/AC-B9) ───────────────────
+
+  describe('forced-reset gate', () => {
+    const gatedRow = { ...dbRow, mustChangePassword: true };
+    const live = () =>
+      makeRequest({ systemUserId: 'user-1', createdAt: Date.now() });
+
+    it('AC-B8 — 403s a gated user on a NON-exempt handler, and keeps the session alive', async () => {
+      findUnique.mockResolvedValue(gatedRow);
+      const req = live();
+
+      await expect(guard.canActivate(contextFor(req))).rejects.toThrow(
+        new ForbiddenException(MUST_CHANGE_PASSWORD),
+      );
+      // The session SURVIVES: this is a credential state, not a lifecycle failure. Destroying it
+      // would strand the user at a login screen whose password is the one they must change.
+      expect(destroy).not.toHaveBeenCalled();
+    });
+
+    it('lets a gated user through a handler carrying @AllowPasswordChangeGate()', async () => {
+      findUnique.mockResolvedValue(gatedRow);
+      getAllAndOverride.mockReturnValue(true);
+      const req = live();
+
+      await expect(guard.canActivate(contextFor(req))).resolves.toBe(true);
+      expect(req.systemUser?.mustChangePassword).toBe(true);
+    });
+
+    it('reads the exemption from the handler AND the class, in that order', async () => {
+      findUnique.mockResolvedValue(gatedRow);
+      getAllAndOverride.mockReturnValue(true);
+
+      await guard.canActivate(contextFor(live()));
+
+      expect(getAllAndOverride).toHaveBeenCalledWith(
+        'allowPasswordChangeGate',
+        expect.arrayContaining([expect.anything(), expect.anything()]),
+      );
+    });
+
+    it('AC-B9 — a user with mustChangePassword=false passes everywhere, with no exemption needed', async () => {
+      findUnique.mockResolvedValue(dbRow); // mustChangePassword: false
+      await expect(guard.canActivate(contextFor(live()))).resolves.toBe(true);
+    });
+
+    it('costs no extra query — the flag rides along on the row already read', async () => {
+      findUnique.mockResolvedValue(gatedRow);
+      getAllAndOverride.mockReturnValue(true);
+
+      await guard.canActivate(contextFor(live()));
+
+      expect(findUnique).toHaveBeenCalledTimes(1);
+      expect(Object.keys(PUBLIC_FIELDS)).toContain('mustChangePassword');
+    });
+
+    it.each([
+      ['soft-deleted', { ...gatedRow, deletedAt: new Date() }],
+      ['suspended', { ...gatedRow, isActive: false }],
+    ])(
+      'ORDERING — a %s user gets 401 (session destroyed) even while gated: the lifecycle flags win',
+      async (_label, row) => {
+        findUnique.mockResolvedValue(row);
+        const req = live();
+
+        // NOT a 403: a suspended or deleted user must never reach the reset screen and rotate
+        // their own credential.
+        await expect(guard.canActivate(contextFor(req))).rejects.toThrow(
+          UnauthorizedException,
+        );
+        expect(destroy).toHaveBeenCalledTimes(1);
+      },
     );
   });
 });

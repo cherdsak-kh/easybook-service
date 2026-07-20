@@ -31,11 +31,18 @@ export class UpdatePersonnelRoleDto {
 
 /** Public view of a `PersonnelRole` option. `deletedAt` is NEVER exposed. */
 export class PersonnelRoleResponseDto {
-  @ApiProperty({ example: 'clx9z8y7x6w5v4u3t2s1r0q9' })
-  id!: string;
+  @ApiProperty({ example: 1, description: 'Auto-increment integer id.' })
+  id!: number;
 
   @ApiProperty({ example: 'Teacher' })
   name!: string;
+
+  @ApiProperty({
+    example: false,
+    description:
+      'READ-ONLY. True only for the System-Developer-owned reserved row (visible to SUPER_ADMIN only; always false for everyone else). Settable by no endpoint.',
+  })
+  isSystemReserved!: boolean;
 
   @ApiProperty({ example: '2026-07-14T10:00:00.000Z' })
   createdAt!: string;

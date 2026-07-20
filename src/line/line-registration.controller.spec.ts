@@ -19,8 +19,8 @@ const DTO: CreateLineUserRegistrationDto = {
   lastName: 'Jaidee',
   staffId: '6412345678',
   phone: '081-234-5678',
-  departmentId: 'dep-1',
-  personnelRoleId: 'role-1',
+  departmentId: 1,
+  personnelRoleId: 2,
 };
 
 describe('LineRegistrationController', () => {

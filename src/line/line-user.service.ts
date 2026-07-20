@@ -7,9 +7,11 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma } from '@prisma/client';
+import { Prisma, SystemRole } from '@prisma/client';
 import type { AppAccess, LineUser, RichMenuType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { canAdminSetAccess } from './line-access.policy';
+import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { LineUserRegistrationResponseDto } from './dto/line-user-registration-response.dto';
 import { LineUserResponseDto } from './dto/line-user-response.dto';
@@ -24,7 +26,9 @@ import {
   INVALID_DEPARTMENT,
   INVALID_PERSONNEL_ROLE,
   LINE_RICH_MENU_APPLY_FAILED,
+  LINE_USER_ACCESS_TRANSITION_FORBIDDEN,
   LINE_USER_NOT_FOUND,
+  LINE_USER_REGISTRATION_NOT_FOUND,
   REGISTRATION_NOT_EDITABLE,
   STAFF_ID_TAKEN,
 } from './line-users.errors';
@@ -84,6 +88,8 @@ export const LINE_USER_PUBLIC_FIELDS = {
       lastName: true,
       staffId: true,
       phone: true,
+      departmentId: true,
+      personnelRoleId: true,
       department: { select: { name: true } },
       personnelRole: { select: { name: true } },
     },
@@ -235,16 +241,21 @@ export class LineUserService {
   /**
    * The combined, non-deleted option lists for the registration form (SC-3.1). One read per table,
    * each `name ASC`. Ids + names only — no PII, no timestamps.
+   *
+   * `isSystemReserved: false` is HARDCODED, with no parameter to widen it. This surface has no actor
+   * and no `SystemRole` to branch on — the identity is a verified LINE `sub`, and `SystemUser` /
+   * `LineUser` share no session and no authentication surface. So no role check belongs here, and a
+   * LINE caller can never see a reserved option under any circumstance.
    */
   async getRegistrationOptions(): Promise<RegistrationOptionsResponseDto> {
     const [departments, personnelRoles] = await Promise.all([
       this.prisma.department.findMany({
-        where: { deletedAt: null },
+        where: { deletedAt: null, isSystemReserved: false },
         select: { id: true, name: true },
         orderBy: { name: 'asc' },
       }),
       this.prisma.personnelRole.findMany({
-        where: { deletedAt: null },
+        where: { deletedAt: null, isSystemReserved: false },
         select: { id: true, name: true },
         orderBy: { name: 'asc' },
       }),
@@ -253,23 +264,34 @@ export class LineUserService {
   }
 
   /**
-   * Assert both chosen option ids resolve to a NON-DELETED option (SC-3.2/SC-B6). A soft-deleted or
-   * unknown id is a client-side validation failure → `400` (distinct message per field), never a
-   * `409`. The FK's `onDelete: Restrict` does not help here — a soft-deleted option row still exists,
-   * so the DB would accept the FK; this app-level `deletedAt: null` check is what rejects it.
+   * Assert both chosen option ids resolve to a NON-DELETED, NON-RESERVED option (SC-3.2/SC-B6). A
+   * soft-deleted, unknown or system-reserved id is a client-side validation failure → `400` (distinct
+   * message per field), never a `409`. The FK's `onDelete: Restrict` does not help here — a
+   * soft-deleted option row still exists, so the DB would accept the FK; this app-level check is what
+   * rejects it.
+   *
+   * `isSystemReserved: false` is HARDCODED and unconditional: no LINE caller has a `SystemRole`, so
+   * NOBODY may assign a reserved option through this surface. The predicate merges into the SAME
+   * query as `deletedAt: null` — one more attribute of "may this id be referenced", not a second
+   * round trip — and yields the SAME 400 as an unknown id. Never a 403: a distinct status would be an
+   * existence oracle and would defeat the invisibility the reserved flag exists for.
    */
   private async assertActiveOptions(
     client: Pick<Prisma.TransactionClient, 'department' | 'personnelRole'>,
-    departmentId: string,
-    personnelRoleId: string,
+    departmentId: number,
+    personnelRoleId: number,
   ): Promise<void> {
     const [department, personnelRole] = await Promise.all([
       client.department.findFirst({
-        where: { id: departmentId, deletedAt: null },
+        where: { id: departmentId, deletedAt: null, isSystemReserved: false },
         select: { id: true },
       }),
       client.personnelRole.findFirst({
-        where: { id: personnelRoleId, deletedAt: null },
+        where: {
+          id: personnelRoleId,
+          deletedAt: null,
+          isSystemReserved: false,
+        },
         select: { id: true },
       }),
     ]);
@@ -471,30 +493,65 @@ export class LineUserService {
 
   /**
    * Approve/block a LINE user by writing `access` AND the derived `richMenuType`, then applying the
-   * menu on LINE. Keyed on the cuid `LineUser.id`.
+   * menu on LINE. Keyed on the cuid `LineUser.id`. `role` is the authenticated actor's `SystemRole`
+   * (passed from the controller's session), which governs the permitted transitions (design §3).
+   *
+   * Role-aware read + precedence (404 BEFORE 403, so the matrix never leaks existence):
+   *   1. row == null                    → 404 (both roles; unknown id, no existence leak)
+   *   2. ADMIN && row.deletedAt != null → 404 (ADMIN may not act on soft-deleted — indistinguishable
+   *                                            from unknown; SUPER_ADMIN can target it)
+   *   3. ADMIN && !canAdminSetAccess    → 403 (role/authorization limit; the body is well-formed)
+   *   4. write + drive side-effects
+   *
+   * SUPER_ADMIN bypasses steps 2–3 entirely (any→any, soft-deleted included).
    *
    * DB-first (design §4): the row is the source of truth, so it is written before the LINE call.
-   * If `applyRichMenu` fails, the DB is already correct and the error surfaces as a retryable `502`
-   * — a re-approve/re-block re-writes the same state and re-applies the menu, which is idempotent on
-   * LINE (linking an already-linked menu is a no-op). A guarded read (`findFirst({ id, deletedAt:
-   * null })`) keeps an unknown or soft-deleted id a byte-identical `404`.
+   * `accessToRichMenuType` stays the SOLE derivation. For a REACHABLE user (`deletedAt == null`):
+   * `applyRichMenu` failure surfaces as a retryable `502` — a re-approve/re-block re-writes the same
+   * state and re-applies the menu, idempotent on LINE (linking an already-linked menu is a no-op).
+   * For a SOFT-DELETED user (only reachable by SUPER_ADMIN forcing an unfollowed account): the LINE
+   * side is unreachable, so BOTH side-effects (menu apply + push) are SKIPPED — persist the DB row and
+   * return 200, never a 502/500, idempotent on re-run.
    */
   async updateAccess(
     id: string,
     access: AppAccess,
+    role: SystemRole,
   ): Promise<LineUserResponseDto> {
-    const existing = await this.prisma.lineUser.findFirst({
-      where: { id, deletedAt: null },
-      select: { id: true },
+    const row = await this.prisma.lineUser.findUnique({
+      where: { id },
+      select: { id: true, access: true, deletedAt: true },
     });
-    if (!existing) throw new NotFoundException(LINE_USER_NOT_FOUND);
+
+    // 1. Unknown id → 404 for both roles. 2. For ADMIN a soft-deleted id is also a 404, byte-identical
+    // to unknown (shape-oracle discipline); SUPER_ADMIN falls through and may target it.
+    if (!row) throw new NotFoundException(LINE_USER_NOT_FOUND);
+    if (role === SystemRole.ADMIN && row.deletedAt !== null) {
+      throw new NotFoundException(LINE_USER_NOT_FOUND);
+    }
+
+    // 3. Role/authorization limit — checked AFTER the 404 precedence so it never reveals existence.
+    // SUPER_ADMIN bypasses the matrix entirely.
+    if (role === SystemRole.ADMIN && !canAdminSetAccess(row.access, access)) {
+      throw new ForbiddenException(LINE_USER_ACCESS_TRANSITION_FORBIDDEN);
+    }
 
     const richMenuType = accessToRichMenuType(access);
     const updated = await this.prisma.lineUser.update({
-      where: { id: existing.id },
+      where: { id: row.id },
       data: { access, richMenuType },
       select: LINE_USER_PUBLIC_FIELDS,
     });
+
+    // Soft-deleted (SUPER_ADMIN-only reach): the account has unfollowed the OA and is unreachable on
+    // LINE. Skip BOTH side-effects — linking a menu would fail (spurious 502) and the push would no-op.
+    // The DB is the source of truth; persist and return 200, idempotent on re-run.
+    if (row.deletedAt !== null) {
+      this.logger.log(
+        `LineUser access changed (soft-deleted; LINE side-effects skipped). id=${updated.id} access=${access} richMenuType=${richMenuType}`,
+      );
+      return this.toDto(updated);
+    }
 
     try {
       await this.applyRichMenu({
@@ -523,6 +580,95 @@ export class LineUserService {
     return this.toDto(updated);
   }
 
+  /**
+   * Admin edit of a LINE user's registration fields (`PATCH /line-users/:id/registration`). Keyed on
+   * the cuid `LineUser.id`. A FULL re-submit of the six editable fields; `role` is the authenticated
+   * actor's `SystemRole` and governs only the soft-deleted visibility (below), NOT the fields.
+   *
+   * **Orthogonal to the Item 3 access matrix (AC-B9/AC-B10):** this method never reads or writes
+   * `access`/`richMenuType`, never calls `updateAccess`, never applies a rich menu, and never pushes.
+   * A registration edit has NO LINE side-effect — do not wire in `updateAccess` "for consistency".
+   *
+   * Precedence mirrors `updateAccess`'s existence-oracle discipline, then adds a registration gate:
+   *   1. row == null                    → 404 LINE_USER_NOT_FOUND (both roles; no existence leak)
+   *   2. ADMIN && row.deletedAt != null → 404 LINE_USER_NOT_FOUND (byte-identical to (1))
+   *      // SUPER_ADMIN falls through and may edit a soft-deleted user's registration
+   *   3. no registration row            → 404 LINE_USER_REGISTRATION_NOT_FOUND (distinct; not a 500)
+   *   4. $transaction: assert options active/non-reserved (400), then update the row
+   *   5. re-read the LineUser and return its LineUserResponseDto (200)
+   *
+   * `access` is deliberately NOT selected — the edit is not PENDING-gated. `assertActiveOptions` is
+   * the SAME role-blind guard the LIFF self-edit uses: a system-reserved option is rejected for EVERY
+   * actor, SUPER_ADMIN included (a LINE end-user is never a System Developer). `staffId` is globally
+   * `@unique`; a collision with ANOTHER registration → 409 via `mapRegistrationWriteError` (P2002),
+   * while re-writing the row's own current `staffId` does not self-collide (no false 409).
+   */
+  async updateRegistrationByAdmin(
+    id: string,
+    dto: AdminUpdateLineUserRegistrationDto,
+    role: SystemRole,
+  ): Promise<LineUserResponseDto> {
+    // Plain reads outside the tx (mirrors updateRegistration). `access` is NOT selected — the edit is
+    // orthogonal to the access matrix and is not PENDING-gated.
+    const row = await this.prisma.lineUser.findUnique({
+      where: { id },
+      select: { id: true, deletedAt: true },
+    });
+
+    // 1/2. Unknown id → 404 for both roles; for ADMIN a soft-deleted id is a byte-identical 404
+    // (shape-oracle discipline). SUPER_ADMIN falls through and may edit a soft-deleted user.
+    if (!row) throw new NotFoundException(LINE_USER_NOT_FOUND);
+    if (role === SystemRole.ADMIN && row.deletedAt !== null) {
+      throw new NotFoundException(LINE_USER_NOT_FOUND);
+    }
+
+    // 3. The registration sub-resource must exist to edit. Distinct 404 (never a 500) — reachable only
+    // after the user is confirmed to exist, so it leaks nothing an admin cannot already see.
+    const registration = await this.prisma.lineUserRegistration.findFirst({
+      where: { lineUserId: row.id, deletedAt: null },
+      select: { id: true },
+    });
+    if (!registration) {
+      throw new NotFoundException(LINE_USER_REGISTRATION_NOT_FOUND);
+    }
+
+    try {
+      // One transaction so the option-validity check and the write are atomic (as `register` does).
+      await this.prisma.$transaction(async (tx) => {
+        await this.assertActiveOptions(
+          tx,
+          dto.departmentId,
+          dto.personnelRoleId,
+        );
+        await tx.lineUserRegistration.update({
+          // The 1:1 key. Writing the row's own current staffId is a no-op — no self-collision.
+          where: { lineUserId: row.id },
+          data: {
+            firstName: dto.firstName,
+            lastName: dto.lastName,
+            staffId: dto.staffId,
+            phone: dto.phone,
+            departmentId: dto.departmentId,
+            personnelRoleId: dto.personnelRoleId,
+          },
+        });
+      });
+    } catch (error) {
+      // A P2002 on staffId → 409 STAFF_ID_TAKEN; the 400 from assertActiveOptions passes through.
+      throw this.mapRegistrationWriteError(error);
+    }
+
+    const updated = await this.prisma.lineUser.findUnique({
+      where: { id: row.id },
+      select: LINE_USER_PUBLIC_FIELDS,
+    });
+
+    // PII discipline: log the id only, never the submitted field values or the body. `updated` is
+    // guaranteed non-null — the LineUser row is never hard-deleted, and it existed at step 1.
+    this.logger.log(`LineUser registration edited by admin. id=${row.id}`);
+    return this.toDto(updated!);
+  }
+
   toDto(user: PublicLineUser): LineUserResponseDto {
     return {
       id: user.id,
@@ -539,7 +685,9 @@ export class LineUserService {
             lastName: user.registration.lastName,
             staffId: user.registration.staffId,
             phone: user.registration.phone,
+            departmentId: user.registration.departmentId,
             department: user.registration.department.name,
+            personnelRoleId: user.registration.personnelRoleId,
             personnelRole: user.registration.personnelRole.name,
           }
         : null,

@@ -1,6 +1,7 @@
 import { ValidationPipe } from '@nestjs/common';
 import type { ArgumentMetadata } from '@nestjs/common';
 import { AppAccess } from '@prisma/client';
+import { AdminUpdateLineUserRegistrationDto } from './admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './create-line-user-registration.dto';
 import { ListLineUsersQueryDto } from './list-line-users-query.dto';
 import { UpdateLineUserAccessDto } from './update-line-user-access.dto';
@@ -108,14 +109,20 @@ describe('CreateLineUserRegistrationDto (through the global ValidationPipe)', ()
     lastName: 'Jaidee',
     staffId: '6412345678',
     phone: '081-234-5678',
-    departmentId: 'clx1a2b3c4d5e6f7g8h9i0j1',
-    personnelRoleId: 'clx9z8y7x6w5v4u3t2s1r0q9',
+    departmentId: 1,
+    personnelRoleId: 2,
   };
 
   it('accepts a valid payload and trims string fields (SC-B1)', async () => {
     await expect(
       validate({ ...VALID, firstName: '  Somchai  ' }),
     ).resolves.toMatchObject({ ...VALID, firstName: 'Somchai' });
+  });
+
+  it('coerces stringified integer option ids to numbers (@Type(() => Number))', async () => {
+    await expect(
+      validate({ ...VALID, departmentId: '3', personnelRoleId: '4' }),
+    ).resolves.toMatchObject({ departmentId: 3, personnelRoleId: 4 });
   });
 
   it('rejects a client-supplied lineUserId via forbidNonWhitelisted (impersonation guard)', async () => {
@@ -136,21 +143,79 @@ describe('CreateLineUserRegistrationDto (through the global ValidationPipe)', ()
     expect(joined).toContain('property role should not exist');
   });
 
-  it.each([
-    'firstName',
-    'lastName',
-    'staffId',
-    'departmentId',
-    'personnelRoleId',
-  ])('rejects a blank %s (SC-B1/SC-B6)', async (field) => {
-    const messages = await messagesOf({ ...VALID, [field]: '   ' });
-    expect(messages.join(' ')).toMatch(new RegExp(field));
-  });
+  it.each(['firstName', 'lastName', 'staffId'])(
+    'rejects a blank %s (SC-B1/SC-B6)',
+    async (field) => {
+      const messages = await messagesOf({ ...VALID, [field]: '   ' });
+      expect(messages.join(' ')).toMatch(new RegExp(field));
+    },
+  );
+
+  it.each(['departmentId', 'personnelRoleId'])(
+    'rejects a non-integer %s (SC-B6)',
+    async (field) => {
+      const messages = await messagesOf({ ...VALID, [field]: 'not-a-number' });
+      expect(messages.join(' ')).toMatch(new RegExp(field));
+    },
+  );
 
   it.each([
     ['a missing required field', { ...VALID, phone: undefined }],
     ['a bad phone', { ...VALID, phone: 'not a phone!!' }],
   ])('rejects %s (AC-B6)', async (_label, body) => {
+    await expect(messagesOf(body)).resolves.toBeInstanceOf(Array);
+  });
+});
+
+describe('AdminUpdateLineUserRegistrationDto (through the global ValidationPipe)', () => {
+  const { validate, messagesOf } = runner<AdminUpdateLineUserRegistrationDto>(
+    AdminUpdateLineUserRegistrationDto,
+    'body',
+  );
+
+  const VALID = {
+    firstName: 'Somchai',
+    lastName: 'Jaidee',
+    staffId: '6412345678',
+    phone: '081-234-5678',
+    departmentId: 1,
+    personnelRoleId: 2,
+  };
+
+  it('AC-B4 — reuses the create validation by inheritance: accepts a valid payload, trims, coerces ids', async () => {
+    await expect(
+      validate({
+        ...VALID,
+        firstName: '  Somchai  ',
+        departmentId: '3',
+        personnelRoleId: '4',
+      }),
+    ).resolves.toMatchObject({
+      firstName: 'Somchai',
+      departmentId: 3,
+      personnelRoleId: 4,
+    });
+  });
+
+  it('AC-B3 — a client-supplied lineUserId is rejected via forbidNonWhitelisted (immutable identity)', async () => {
+    const messages = await messagesOf({ ...VALID, lineUserId: 'U-evil' });
+    expect(messages.join(' ')).toContain(
+      'property lineUserId should not exist',
+    );
+  });
+
+  it.each(['firstName', 'lastName', 'staffId'])(
+    'AC-B4 — rejects a blank %s',
+    async (field) => {
+      const messages = await messagesOf({ ...VALID, [field]: '   ' });
+      expect(messages.join(' ')).toMatch(new RegExp(field));
+    },
+  );
+
+  it.each([
+    ['a missing required field', { ...VALID, phone: undefined }],
+    ['a bad phone', { ...VALID, phone: 'not a phone!!' }],
+  ])('AC-B4 — rejects %s', async (_label, body) => {
     await expect(messagesOf(body)).resolves.toBeInstanceOf(Array);
   });
 });

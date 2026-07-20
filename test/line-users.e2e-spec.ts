@@ -11,6 +11,7 @@ import {
   clearThrottleCounters,
   createE2eApp,
   prismaOf,
+  ensureE2eOptions,
   purgeE2eUsers,
   redisOf,
   waitForRedis,
@@ -44,7 +45,9 @@ interface RegistrationSummary {
   lastName: string;
   staffId: string;
   phone: string;
+  departmentId: number;
   department: string;
+  personnelRoleId: number;
   personnelRole: string;
 }
 
@@ -102,6 +105,7 @@ describe('LINE Users management (e2e)', () => {
   let prisma: PrismaService;
   let redis: Redis;
   let pushSpy: jest.SpyInstance;
+  let linkSpy: jest.SpyInstance;
 
   const luIds: Record<string, string> = {};
   const server = () => app.getHttpServer();
@@ -119,9 +123,9 @@ describe('LINE Users management (e2e)', () => {
   };
 
   // Ids of the fixture option rows (the registration FK targets), refreshed each seed.
-  const optionIds: { departmentId: string; personnelRoleId: string } = {
-    departmentId: '',
-    personnelRoleId: '',
+  const optionIds: { departmentId: number; personnelRoleId: number } = {
+    departmentId: 0,
+    personnelRoleId: 0,
   };
   const DEPT_NAME = `${LU_PREFIX}Engineering`;
   const ROLE_NAME = `${LU_PREFIX}Staff`;
@@ -160,7 +164,13 @@ describe('LINE Users management (e2e)', () => {
     optionIds.personnelRoleId = prole.id;
 
     const passwordHash = await new PasswordService().hash(PASSWORD);
-    const base = { passwordHash, position: 'Director', department: 'IT' };
+    // mustChangePassword: false — these fixtures are already-onboarded users. The model default
+    // is TRUE (deny by default), so omitting it would gate every fixture into a 403.
+    const base = {
+      passwordHash,
+      mustChangePassword: false,
+      ...(await ensureE2eOptions(prisma)),
+    };
     for (const [email, role] of [
       [SUPER, SystemRole.SUPER_ADMIN],
       [ADMIN, SystemRole.ADMIN],
@@ -210,7 +220,9 @@ describe('LINE Users management (e2e)', () => {
     // hit the real Messaging API — the switch behaviour is unit-tested; here we only need 200s.
     const line = app.get(LineService);
     jest.spyOn(line, 'findRichMenuId').mockResolvedValue('rm-e2e');
-    jest.spyOn(line, 'linkRichMenuToUser').mockResolvedValue(undefined);
+    linkSpy = jest
+      .spyOn(line, 'linkRichMenuToUser')
+      .mockResolvedValue(undefined);
     // Best-effort push on access change — stub it so the PATCH tests never hit the real Messaging API.
     pushSpy = jest.spyOn(line, 'push').mockResolvedValue(undefined);
   }, 60_000);
@@ -341,8 +353,11 @@ describe('LINE Users management (e2e)', () => {
         lastName: 'Allowed',
         staffId: `${LU_PREFIX}stid-allowed`,
         phone: '081-000-0000',
-        // department + personnelRole are the RESOLVED option names, not ids.
+        // §B-8a additive: the summary now carries the raw FK ids (for the admin edit modal's
+        // dropdown pre-select) alongside the RESOLVED option names.
+        departmentId: optionIds.departmentId,
         department: DEPT_NAME,
+        personnelRoleId: optionIds.personnelRoleId,
         personnelRole: ROLE_NAME,
       });
 
@@ -517,6 +532,414 @@ describe('LINE Users management (e2e)', () => {
         .set('x-csrf-token', token)
         .send({ access: AppAccess.ALLOWED })
         .expect(200);
+    });
+  });
+
+  // ───────── transition matrix + SUPER_ADMIN bypass (Item 3, AC-3.1/2/3/5/6) ─────────
+
+  describe('PATCH /line-users/:id — ADMIN transition matrix', () => {
+    const idFor = (suffix: string) => luIds[`${LU_PREFIX}${suffix}`];
+    const patchAs = async (
+      email: string,
+      suffix: string,
+      access: AppAccess,
+    ) => {
+      const { agent, token } = await login(email);
+      return agent
+        .patch(url(`/line-users/${idFor(suffix)}`))
+        .set('x-csrf-token', token)
+        .send({ access });
+    };
+    const accessOf = async (suffix: string) =>
+      (
+        await prisma.lineUser.findUnique({
+          where: { id: idFor(suffix) },
+          select: { access: true },
+        })
+      )?.access;
+
+    // Each ✅ cell: the four PO pairs + the two idempotent same-state writes. Fixture `from` states:
+    // pending=PENDING, allowed=ALLOWED, blocked=BLOCKED.
+    it.each([
+      ['pending', AppAccess.ALLOWED],
+      ['pending', AppAccess.BLOCKED],
+      ['allowed', AppAccess.BLOCKED],
+      ['blocked', AppAccess.ALLOWED],
+      ['allowed', AppAccess.ALLOWED],
+      ['blocked', AppAccess.BLOCKED],
+    ] as Array<[string, AppAccess]>)(
+      'AC-3.1 — ADMIN may set %s → %s (200) and it persists',
+      async (suffix, to) => {
+        const res = await patchAs(ADMIN, suffix, to);
+        expect(res.status).toBe(200);
+        expect((res.body as LineUserBody).access).toBe(to);
+        expect(await accessOf(suffix)).toBe(to);
+      },
+    );
+
+    // Each ❌ cell: a target of PENDING/UNREGISTERED is forbidden for ADMIN → 403, no state change.
+    it.each([
+      ['pending', AppAccess.PENDING],
+      ['pending', AppAccess.UNREGISTERED],
+      ['allowed', AppAccess.PENDING],
+      ['allowed', AppAccess.UNREGISTERED],
+      ['blocked', AppAccess.PENDING],
+      ['blocked', AppAccess.UNREGISTERED],
+    ] as Array<[string, AppAccess]>)(
+      'AC-3.2 — ADMIN may NOT set %s → %s (403) and nothing changes',
+      async (suffix, to) => {
+        const before = await accessOf(suffix);
+        const res = await patchAs(ADMIN, suffix, to);
+        expect(res.status).toBe(403);
+        expect(await accessOf(suffix)).toBe(before);
+      },
+    );
+
+    // SUPER_ADMIN bypasses the matrix: any→any on a live row, including forcing PENDING/UNREGISTERED.
+    it.each([
+      ['allowed', AppAccess.PENDING],
+      ['blocked', AppAccess.UNREGISTERED],
+      ['pending', AppAccess.PENDING],
+    ] as Array<[string, AppAccess]>)(
+      'AC-3.3 — SUPER_ADMIN may force %s → %s (200)',
+      async (suffix, to) => {
+        const res = await patchAs(SUPER, suffix, to);
+        expect(res.status).toBe(200);
+        expect(await accessOf(suffix)).toBe(to);
+      },
+    );
+
+    it('AC-3.5 — for ADMIN a soft-deleted id is 404 even for a FORBIDDEN transition (404 before 403)', async () => {
+      const { agent, token } = await login(ADMIN);
+
+      // A forbidden target (PENDING) on a soft-deleted row must be 404, byte-identical to an unknown
+      // id — 404 wins, so the matrix never leaks the row's existence.
+      const deleted = await agent
+        .patch(url(`/line-users/${idFor('deleted')}`))
+        .set('x-csrf-token', token)
+        .send({ access: AppAccess.PENDING })
+        .expect(404);
+      const unknown = await agent
+        .patch(url('/line-users/never-existed'))
+        .set('x-csrf-token', token)
+        .send({ access: AppAccess.PENDING })
+        .expect(404);
+      expect(deleted.body).toEqual(unknown.body);
+
+      // The soft-deleted row is untouched (still PENDING, still deleted).
+      const row = await prisma.lineUser.findUnique({
+        where: { id: idFor('deleted') },
+        select: { access: true, deletedAt: true },
+      });
+      expect(row?.access).toBe(AppAccess.PENDING);
+      expect(row?.deletedAt).not.toBeNull();
+    });
+
+    it('AC-3.6 — SUPER_ADMIN may force a soft-deleted user; DB persists, LINE side-effects are skipped, no 502', async () => {
+      const { agent, token } = await login(SUPER);
+      pushSpy.mockClear();
+      linkSpy.mockClear();
+
+      const res = await agent
+        .patch(url(`/line-users/${idFor('deleted')}`))
+        .set('x-csrf-token', token)
+        .send({ access: AppAccess.ALLOWED })
+        .expect(200);
+      expect((res.body as LineUserBody).access).toBe(AppAccess.ALLOWED);
+
+      // The DB row is the source of truth: access + derived richMenuType persisted, still soft-deleted.
+      const row = await prisma.lineUser.findUnique({
+        where: { id: idFor('deleted') },
+        select: { access: true, richMenuType: true, deletedAt: true },
+      });
+      expect(row?.access).toBe(AppAccess.ALLOWED);
+      expect(row?.richMenuType).toBe('TYPE_2');
+      expect(row?.deletedAt).not.toBeNull();
+
+      // Both LINE side-effects were skipped — the account is unreachable, so no push and no menu link.
+      expect(linkSpy).not.toHaveBeenCalled();
+      expect(pushSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  // ───────── admin registration edit (Fix B, AC-B1..B12) ─────────
+
+  describe('PATCH /line-users/:id/registration', () => {
+    const regUrl = (suffix: string) =>
+      url(`/line-users/${luIds[`${LU_PREFIX}${suffix}`]}/registration`);
+
+    const validBody = () => ({
+      firstName: 'Edited',
+      lastName: 'Person',
+      staffId: `${LU_PREFIX}stid-edited`,
+      phone: '099-888-7777',
+      departmentId: optionIds.departmentId,
+      personnelRoleId: optionIds.personnelRoleId,
+    });
+
+    const regRowOf = (suffix: string) =>
+      prisma.lineUserRegistration.findFirst({
+        where: { lineUserId: luIds[`${LU_PREFIX}${suffix}`] },
+        select: {
+          firstName: true,
+          lastName: true,
+          staffId: true,
+          phone: true,
+          departmentId: true,
+          personnelRoleId: true,
+        },
+      });
+
+    const accessOf = async (suffix: string) =>
+      (
+        await prisma.lineUser.findUnique({
+          where: { id: luIds[`${LU_PREFIX}${suffix}`] },
+          select: { access: true },
+        })
+      )?.access;
+
+    it('AC-B2/B9 — ADMIN edits all six fields; DB persists them, access is unchanged, no LINE side-effect', async () => {
+      const { agent, token } = await login(ADMIN);
+      pushSpy.mockClear();
+      linkSpy.mockClear();
+
+      const res = await agent
+        .patch(regUrl('allowed'))
+        .set('x-csrf-token', token)
+        .send(validBody())
+        .expect(200);
+
+      const body = res.body as LineUserBody;
+      // The response is a LineUserResponseDto whose summary carries the edited values + the FK ids.
+      expect(body.access).toBe(AppAccess.ALLOWED);
+      expect(body.registration).toMatchObject({
+        firstName: 'Edited',
+        lastName: 'Person',
+        staffId: `${LU_PREFIX}stid-edited`,
+        phone: '099-888-7777',
+        departmentId: optionIds.departmentId,
+        personnelRoleId: optionIds.personnelRoleId,
+      });
+
+      // All six fields persisted.
+      expect(await regRowOf('allowed')).toEqual({
+        firstName: 'Edited',
+        lastName: 'Person',
+        staffId: `${LU_PREFIX}stid-edited`,
+        phone: '099-888-7777',
+        departmentId: optionIds.departmentId,
+        personnelRoleId: optionIds.personnelRoleId,
+      });
+      // Orthogonal to the access matrix: access untouched, and NO rich-menu apply / push fired.
+      expect(await accessOf('allowed')).toBe(AppAccess.ALLOWED);
+      expect(linkSpy).not.toHaveBeenCalled();
+      expect(pushSpy).not.toHaveBeenCalled();
+    });
+
+    it('AC-B2 — SUPER_ADMIN may also edit a (live) registration', async () => {
+      const { agent, token } = await login(SUPER);
+      await agent
+        .patch(regUrl('allowed'))
+        .set('x-csrf-token', token)
+        .send({ ...validBody(), firstName: 'BySuper' })
+        .expect(200);
+      const row = await regRowOf('allowed');
+      expect(row?.firstName).toBe('BySuper');
+    });
+
+    it('AC-B5 — re-submitting the row’s OWN current staffId is not a false 409', async () => {
+      const { agent, token } = await login(ADMIN);
+      await agent
+        .patch(regUrl('allowed'))
+        .set('x-csrf-token', token)
+        // keep the fixture's existing staffId, change only the name
+        .send({
+          ...validBody(),
+          staffId: `${LU_PREFIX}stid-allowed`,
+          firstName: 'SameStaffId',
+        })
+        .expect(200);
+      const row = await regRowOf('allowed');
+      expect(row?.staffId).toBe(`${LU_PREFIX}stid-allowed`);
+      expect(row?.firstName).toBe('SameStaffId');
+    });
+
+    it('AC-B5 — a staffId held by ANOTHER registration is a 409', async () => {
+      // Give the PENDING fixture its own registration with a distinct staffId.
+      await prisma.lineUserRegistration.create({
+        data: {
+          lineUserId: luIds[`${LU_PREFIX}pending`],
+          firstName: 'Other',
+          lastName: 'Holder',
+          staffId: `${LU_PREFIX}stid-other`,
+          phone: '081-111-1111',
+          departmentId: optionIds.departmentId,
+          personnelRoleId: optionIds.personnelRoleId,
+        },
+      });
+
+      const { agent, token } = await login(ADMIN);
+      await agent
+        .patch(regUrl('allowed'))
+        .set('x-csrf-token', token)
+        .send({ ...validBody(), staffId: `${LU_PREFIX}stid-other` })
+        .expect(409);
+
+      // The clash left the row unchanged.
+      expect((await regRowOf('allowed'))?.staffId).toBe(
+        `${LU_PREFIX}stid-allowed`,
+      );
+    });
+
+    it('AC-B6 — a system-reserved option is 400 for BOTH ADMIN and SUPER_ADMIN (reserved-for-everyone)', async () => {
+      const reserved = await prisma.department.create({
+        data: { name: `${LU_PREFIX}Reserved`, isSystemReserved: true },
+        select: { id: true },
+      });
+
+      for (const email of [ADMIN, SUPER]) {
+        const { agent, token } = await login(email);
+        await agent
+          .patch(regUrl('allowed'))
+          .set('x-csrf-token', token)
+          .send({ ...validBody(), departmentId: reserved.id })
+          .expect(400);
+      }
+      // Never assigned — the row keeps its original department.
+      expect((await regRowOf('allowed'))?.departmentId).toBe(
+        optionIds.departmentId,
+      );
+    });
+
+    it('AC-B6 — a soft-deleted option id is 400', async () => {
+      const deletedDept = await prisma.department.create({
+        data: { name: `${LU_PREFIX}Gone`, deletedAt: new Date() },
+        select: { id: true },
+      });
+      const { agent, token } = await login(ADMIN);
+      await agent
+        .patch(regUrl('allowed'))
+        .set('x-csrf-token', token)
+        .send({ ...validBody(), departmentId: deletedDept.id })
+        .expect(400);
+    });
+
+    it('AC-B7 — a user with no registration is a 404 (distinct message), never a 500', async () => {
+      const { agent, token } = await login(ADMIN);
+      const res = await agent
+        .patch(regUrl('pending'))
+        .set('x-csrf-token', token)
+        .send(validBody())
+        .expect(404);
+      expect((res.body as { message: string }).message).toBe(
+        'This LINE user has no registration to edit.',
+      );
+    });
+
+    it('AC-B8 — an unknown id is 404, byte-identical to a soft-deleted id under ADMIN', async () => {
+      const { agent, token } = await login(ADMIN);
+      const unknown = await agent
+        .patch(url('/line-users/never-existed/registration'))
+        .set('x-csrf-token', token)
+        .send(validBody())
+        .expect(404);
+      const deleted = await agent
+        .patch(regUrl('deleted'))
+        .set('x-csrf-token', token)
+        .send(validBody())
+        .expect(404);
+      // The soft-deleted 404 reveals nothing an unknown id does not (no existence/deletion leak).
+      expect(deleted.body).toEqual(unknown.body);
+      expect(JSON.stringify(deleted.body)).not.toContain('deletedAt');
+    });
+
+    it('AC-B8 — SUPER_ADMIN may edit a soft-deleted user’s registration; persists, no LINE side-effect', async () => {
+      // Give the soft-deleted fixture a registration to edit.
+      await prisma.lineUserRegistration.create({
+        data: {
+          lineUserId: luIds[`${LU_PREFIX}deleted`],
+          firstName: 'Ghost',
+          lastName: 'User',
+          staffId: `${LU_PREFIX}stid-deleted`,
+          phone: '082-222-2222',
+          departmentId: optionIds.departmentId,
+          personnelRoleId: optionIds.personnelRoleId,
+        },
+      });
+      pushSpy.mockClear();
+      linkSpy.mockClear();
+
+      const { agent, token } = await login(SUPER);
+      await agent
+        .patch(regUrl('deleted'))
+        .set('x-csrf-token', token)
+        .send({ ...validBody(), firstName: 'Revised' })
+        .expect(200);
+
+      const row = await regRowOf('deleted');
+      expect(row?.firstName).toBe('Revised');
+      // Still soft-deleted, and no LINE side-effect fired (no 502/500 path here).
+      const lu = await prisma.lineUser.findUnique({
+        where: { id: luIds[`${LU_PREFIX}deleted`] },
+        select: { deletedAt: true },
+      });
+      expect(lu?.deletedAt).not.toBeNull();
+      expect(linkSpy).not.toHaveBeenCalled();
+      expect(pushSpy).not.toHaveBeenCalled();
+    });
+
+    it('AC-B3/B4 — a lineUserId key, a blank field, and a bad phone are each 400', async () => {
+      const { agent, token } = await login(ADMIN);
+      const patch = (body: Record<string, unknown>) =>
+        agent.patch(regUrl('allowed')).set('x-csrf-token', token).send(body);
+
+      await patch({ ...validBody(), lineUserId: 'U-evil' }).expect(400);
+      await patch({ ...validBody(), firstName: '   ' }).expect(400);
+      await patch({ ...validBody(), phone: 'not a phone!!' }).expect(400);
+    });
+
+    it('AC-B9 — a PATCH without x-csrf-token is 403 and does not change the registration', async () => {
+      const { agent } = await login(ADMIN);
+      await agent.patch(regUrl('allowed')).send(validBody()).expect(403);
+      expect((await regRowOf('allowed'))?.firstName).toBe('Bob');
+    });
+
+    it('AC-B2 — STAFF is 403 and no session is 401', async () => {
+      const staff = await login(STAFF);
+      await staff.agent
+        .patch(regUrl('allowed'))
+        .set('x-csrf-token', staff.token)
+        .send(validBody())
+        .expect(403);
+
+      const anon = request.agent(server());
+      const csrf = await anon.get(url('/auth/system/csrf')).expect(200);
+      const anonToken = (csrf.body as { csrfToken: string }).csrfToken;
+      await anon
+        .patch(regUrl('allowed'))
+        .set('x-csrf-token', anonToken)
+        .send(validBody())
+        .expect(401);
+    });
+
+    it('AC-B9 — registration edits and access changes are independently governed (neither triggers the other)', async () => {
+      const { agent, token } = await login(ADMIN);
+
+      // An access change on the same user does not alter the registration fields.
+      await agent
+        .patch(url(`/line-users/${luIds[`${LU_PREFIX}allowed`]}`))
+        .set('x-csrf-token', token)
+        .send({ access: AppAccess.BLOCKED })
+        .expect(200);
+      expect((await regRowOf('allowed'))?.firstName).toBe('Bob');
+
+      // A registration edit on the same user does not alter access (still BLOCKED from above).
+      await agent
+        .patch(regUrl('allowed'))
+        .set('x-csrf-token', token)
+        .send({ ...validBody(), firstName: 'Independent' })
+        .expect(200);
+      expect(await accessOf('allowed')).toBe(AppAccess.BLOCKED);
     });
   });
 });

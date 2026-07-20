@@ -5,7 +5,7 @@
  * form is not empty on day one. Admins curate the lists afterward via the admin CRUD endpoints.
  *
  * A SEED SCRIPT, NOT A MIGRATION (project convention: migrations are DDL-only; seeds are idempotent
- * scripts like `seed-super-admin.ts`). Safe to re-run.
+ * scripts like `create-super-admin.ts`). Safe to re-run.
  *
  * Idempotent: a partial-unique `name` index means an `upsert`-on-name is not expressible, so for each
  * starter name we `findFirst({ name, deletedAt: null })` and `create` only if absent. Existing rows

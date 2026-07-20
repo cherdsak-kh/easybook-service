@@ -4,11 +4,13 @@ import { Transform } from 'class-transformer';
 import {
   IsBoolean,
   IsEnum,
+  IsInt,
   IsOptional,
   IsString,
   IsUrl,
   Matches,
   MaxLength,
+  Min,
   MinLength,
   ValidateIf,
 } from 'class-validator';
@@ -70,21 +72,25 @@ export class UpdateSystemUserDto {
   @MaxLength(120)
   lastName?: string;
 
-  @ApiPropertyOptional({ example: 'Teacher', maxLength: 100 })
+  // The two option FKs. NOT NULL columns -> @ValidateIf, never @IsOptional (an explicit null must
+  // 400 at the pipe, not reach the column). Must reference an ACTIVE option — the service checks
+  // that inside the write transaction and 400s otherwise; the FK alone does NOT do that job,
+  // because a soft-deleted option row still exists and Postgres accepts it happily.
+  @ApiPropertyOptional({ example: 3, description: 'Department option id.' })
   @ValidateIf((_o, v: unknown) => v !== undefined)
-  @Transform(trim)
-  @IsString()
-  @MinLength(1)
-  @MaxLength(100)
-  position?: string;
+  @IsInt()
+  @Min(1)
+  departmentId?: number;
 
-  @ApiPropertyOptional({ example: 'Computer Science', maxLength: 120 })
+  @ApiPropertyOptional({
+    example: 5,
+    description:
+      'PersonnelRole option id — the job title ("Position" in the UI). NOT `role`; grants zero privilege.',
+  })
   @ValidateIf((_o, v: unknown) => v !== undefined)
-  @Transform(trim)
-  @IsString()
-  @MinLength(1)
-  @MaxLength(120)
-  department?: string;
+  @IsInt()
+  @Min(1)
+  personnelRoleId?: number;
 
   // The two NULLABLE columns: @IsOptional() skips on null AND undefined -> explicit null clears.
   @ApiPropertyOptional({

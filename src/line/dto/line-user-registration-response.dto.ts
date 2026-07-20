@@ -22,8 +22,8 @@ export class LineUserRegistrationResponseDto {
   @ApiProperty({ example: '081-234-5678' })
   phone!: string;
 
-  @ApiProperty({ example: 'clx1a2b3c4d5e6f7g8h9i0j1' })
-  departmentId!: string;
+  @ApiProperty({ example: 1, description: 'Auto-increment integer id.' })
+  departmentId!: number;
 
   @ApiProperty({
     example: 'Computer Science',
@@ -31,8 +31,8 @@ export class LineUserRegistrationResponseDto {
   })
   department!: string;
 
-  @ApiProperty({ example: 'clx9z8y7x6w5v4u3t2s1r0q9' })
-  personnelRoleId!: string;
+  @ApiProperty({ example: 1, description: 'Auto-increment integer id.' })
+  personnelRoleId!: number;
 
   @ApiProperty({
     example: 'Teacher',

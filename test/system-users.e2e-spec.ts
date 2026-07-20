@@ -10,6 +10,7 @@ import {
   clearThrottleCounters,
   createE2eApp,
   prismaOf,
+  ensureE2eOptions,
   purgeE2eUsers,
   redisOf,
   waitForRedis,
@@ -57,7 +58,13 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
   const seed = async () => {
     await purgeE2eUsers(prisma, PREFIX);
     const passwordHash = await new PasswordService().hash(PASSWORD);
-    const base = { passwordHash, position: 'Director', department: 'IT' };
+    // mustChangePassword: false — these fixtures are already-onboarded users. The model default
+    // is TRUE (deny by default), so omitting it would gate every fixture into a 403.
+    const base = {
+      passwordHash,
+      mustChangePassword: false,
+      ...(await ensureE2eOptions(prisma)),
+    };
 
     for (const [email, firstName, lastName, role] of [
       [SUPER, 'E2E', 'Super', SystemRole.SUPER_ADMIN],
@@ -244,14 +251,18 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
   // ─────────────────────────── create ───────────────────────────
 
   describe('POST /system-users', () => {
-    const newUser = {
-      email: `${PREFIX}created@easybook.local`,
-      password: 'a-long-enough-password',
-      firstName: 'Created',
-      lastName: 'User',
-      position: 'Teacher',
-      department: 'Computer Science',
-    };
+    // No `password`: the SERVER issues a temp password now. `position`/`department` are FK ids.
+    let newUser: Record<string, unknown>;
+    beforeEach(async () => {
+      const { departmentId, personnelRoleId } = await ensureE2eOptions(prisma);
+      newUser = {
+        email: `${PREFIX}created@easybook.local`,
+        firstName: 'Created',
+        lastName: 'User',
+        departmentId,
+        personnelRoleId,
+      };
+    });
 
     it('AC-24 — a SUPER_ADMIN creates a user (201), stamped with createdById', async () => {
       const { agent, token } = await login(SUPER);
@@ -266,11 +277,12 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         role: SystemRole.STAFF,
         isActive: true,
         lineUserId: null,
+        mustChangePassword: true, // the server issued a temp password
       });
       expect(JSON.stringify(res.body)).not.toContain('passwordHash');
 
       const row = await prisma.systemUser.findUnique({
-        where: { email: newUser.email },
+        where: { email: newUser.email as string },
         select: { createdById: true },
       });
       expect(row?.createdById).toBe(ids[SUPER]);
@@ -296,14 +308,14 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       const res = await agent
         .post(url('/system-users'))
         .set('x-csrf-token', token)
-        .send({ ...newUser, email: newUser.email.toUpperCase() })
+        .send({ ...newUser, email: (newUser.email as string).toUpperCase() })
         .expect(409);
       expect((res.body as { message: string }).message).toBe(
         'A system user with this email already exists.',
       );
 
       await expect(
-        prisma.systemUser.count({ where: { email: newUser.email } }),
+        prisma.systemUser.count({ where: { email: newUser.email as string } }),
       ).resolves.toBe(1);
     });
 
@@ -316,13 +328,13 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         .expect(400);
     });
 
-    it('AC-37 — a missing position/department, or a non-https avatar URL, is a 400', async () => {
+    it('AC-37 — a missing personnelRoleId/departmentId, or a non-https avatar URL, is a 400', async () => {
       const { agent, token } = await login(SUPER);
       const post = (body: Record<string, unknown>) =>
         agent.post(url('/system-users')).set('x-csrf-token', token).send(body);
 
-      await post({ ...newUser, position: undefined }).expect(400);
-      await post({ ...newUser, department: undefined }).expect(400);
+      await post({ ...newUser, personnelRoleId: undefined }).expect(400);
+      await post({ ...newUser, departmentId: undefined }).expect(400);
       await post({
         ...newUser,
         profilePictureUrl: 'http://cdn.x.com/a.jpg',
@@ -333,12 +345,13 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       }).expect(400);
     });
 
-    it('rejects a password shorter than 12 characters', async () => {
+    it('AC-B7 — `password` is absent from the DTO, so an admin-chosen password is a 400', async () => {
+      // It would be a second credential path that bypasses the forced-reset gate entirely.
       const { agent, token } = await login(SUPER);
       await agent
         .post(url('/system-users'))
         .set('x-csrf-token', token)
-        .send({ ...newUser, password: 'short' })
+        .send({ ...newUser, password: 'a-long-enough-password' })
         .expect(400);
     });
   });
@@ -444,13 +457,14 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
 
     it('AC-49 — a SUPER_ADMIN may patch their own profile fields → 200', async () => {
       const { agent, token } = await login(SUPER);
+      const { departmentId, personnelRoleId } = await ensureE2eOptions(prisma);
       await agent
         .patch(url(`/system-users/${ids[SUPER]}`))
         .set('x-csrf-token', token)
         .send({
           firstName: 'Ada',
-          position: 'Director',
-          department: 'IT',
+          personnelRoleId,
+          departmentId,
           phoneNumber: '02-123-4567',
         })
         .expect(200)
@@ -634,11 +648,9 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         .set('x-csrf-token', token)
         .send({
           email: STAFF,
-          password: 'a-long-enough-password',
           firstName: 'Impostor',
           lastName: 'User',
-          position: 'p',
-          department: 'd',
+          ...(await ensureE2eOptions(prisma)),
         })
         .expect(409);
 

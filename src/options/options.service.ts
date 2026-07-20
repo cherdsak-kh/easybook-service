@@ -13,16 +13,18 @@ export type OptionModel = 'department' | 'personnelRole';
 
 /** The wire shape both `DepartmentResponseDto` and `PersonnelRoleResponseDto` satisfy structurally. */
 export interface OptionResponse {
-  id: string;
+  id: number;
   name: string;
+  isSystemReserved: boolean;
   createdAt: string;
   updatedAt: string;
 }
 
 /** A `Department`/`PersonnelRole` row narrowed to the public select. Dates are still `Date`s. */
 interface OptionRow {
-  id: string;
+  id: number;
   name: string;
+  isSystemReserved: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -35,28 +37,51 @@ interface OptionRow {
  */
 interface OptionDelegate {
   findMany(args: {
-    where: { deletedAt: null };
-    select: { id: true; name: true; createdAt: true; updatedAt: true };
+    where: { deletedAt: null; isSystemReserved?: boolean };
+    select: {
+      id: true;
+      name: true;
+      isSystemReserved: true;
+      createdAt: true;
+      updatedAt: true;
+    };
     orderBy: { name: 'asc' };
   }): Promise<OptionRow[]>;
   findFirst(args: {
-    where: { id: string; deletedAt: null };
+    where: { id: number; deletedAt: null; isSystemReserved?: boolean };
     select: { id: true };
-  }): Promise<{ id: string } | null>;
+  }): Promise<{ id: number } | null>;
   create(args: {
     data: { name: string };
-    select: { id: true; name: true; createdAt: true; updatedAt: true };
+    select: {
+      id: true;
+      name: true;
+      isSystemReserved: true;
+      createdAt: true;
+      updatedAt: true;
+    };
   }): Promise<OptionRow>;
   update(args: {
-    where: { id: string };
+    where: { id: number };
     data: { name?: string; deletedAt?: Date };
-    select: { id: true; name: true; createdAt: true; updatedAt: true };
+    select: {
+      id: true;
+      name: true;
+      isSystemReserved: true;
+      createdAt: true;
+      updatedAt: true;
+    };
   }): Promise<OptionRow>;
 }
 
+// `isSystemReserved` is exposed READ-ONLY (design §2): it is present on every option response, but
+// on NO Create/Update DTO. Non-SUPER_ADMIN callers never receive a reserved row (the `includeReserved`
+// WHERE clause), so they only ever see `false` — the flag carries no information for them and needs no
+// role logic in this layer. `scripts/create-super-admin.ts` remains the sole writer of `true`.
 const PUBLIC_SELECT = {
   id: true,
   name: true,
+  isSystemReserved: true,
   createdAt: true,
   updatedAt: true,
 } as const;
@@ -64,6 +89,7 @@ const PUBLIC_SELECT = {
 const toDto = (row: OptionRow): OptionResponse => ({
   id: row.id,
   name: row.name,
+  isSystemReserved: row.isSystemReserved,
   createdAt: row.createdAt.toISOString(),
   updatedAt: row.updatedAt.toISOString(),
 });
@@ -88,10 +114,30 @@ export class OptionsService {
       : this.prisma.personnelRole;
   }
 
-  /** Non-deleted options, `name ASC` (stable). */
-  async list(model: OptionModel): Promise<OptionResponse[]> {
+  /**
+   * Non-deleted options, `name ASC` (stable).
+   *
+   * `includeReserved` is REQUIRED and deliberately non-defaulted: a `= false` default would be
+   * safe-by-default but would let a new call site forget the decision exists. A required parameter
+   * makes the compiler force every present and future caller to state its intent.
+   *
+   * It is a BOOLEAN, never a role. The role -> capability decision is
+   * `mayUseSystemReservedOptions(actor)` in `system-users.policy.ts`, called by the controller: this
+   * module must not mix option data with RBAC (AC-X3 fails the build if a `SystemRole` token appears
+   * in option logic here).
+   *
+   * The filter is a WHERE clause, not a post-fetch drop, on purpose: the controller must never hold a
+   * row it is not allowed to return. Filtering after the read would be one `console.log`, one future
+   * `find()`, one debug-endpoint reuse away from a leak.
+   */
+  async list(
+    model: OptionModel,
+    opts: { includeReserved: boolean },
+  ): Promise<OptionResponse[]> {
     const rows = await this.delegate(model).findMany({
-      where: { deletedAt: null },
+      where: opts.includeReserved
+        ? { deletedAt: null }
+        : { deletedAt: null, isSystemReserved: false },
       select: PUBLIC_SELECT,
       orderBy: { name: 'asc' },
     });
@@ -115,14 +161,23 @@ export class OptionsService {
     }
   }
 
-  /** Rename an option. `404` on unknown/soft-deleted id; `409` on an active-name collision. */
+  /**
+   * Rename an option. `404` on unknown/soft-deleted id; `409` on an active-name collision.
+   *
+   * A SYSTEM-RESERVED target is also a `404` — for EVERY role, SUPER_ADMIN included. Reserved rows
+   * are simply not CRUD-managed; `scripts/create-super-admin.ts` is their only writer. Renaming one
+   * must fail regardless of actor because that script resolves them BY NAME, so a rename would make
+   * the next run create a SECOND reserved row. Immutability is the correct semantic, not a limitation.
+   * For an ADMIN the uniform 404 is additionally mandatory: a distinct 403 would be an existence
+   * oracle, and reserved must be indistinguishable from never-existed.
+   */
   async update(
     model: OptionModel,
-    id: string,
+    id: number,
     name: string,
   ): Promise<OptionResponse> {
     const existing = await this.delegate(model).findFirst({
-      where: { id, deletedAt: null },
+      where: { id, deletedAt: null, isSystemReserved: false },
       select: { id: true },
     });
     if (!existing) throw new NotFoundException(OPTION_NOT_FOUND);
@@ -143,10 +198,14 @@ export class OptionsService {
   /**
    * Soft-delete an option (`update` setting `deletedAt`, NEVER a hard delete). A second delete on
    * the same id is a `404`, byte-identical to an unknown id (the read filters `deletedAt: null`).
+   *
+   * A SYSTEM-RESERVED target is likewise a `404` for every role, SUPER_ADMIN included (see `update`):
+   * nothing re-creates a deleted reserved row, and it would vanish from the SUPER_ADMIN's own
+   * dropdown. Its permanently-active name is also what makes an ordinary row of the same name a 409.
    */
-  async softDelete(model: OptionModel, id: string): Promise<void> {
+  async softDelete(model: OptionModel, id: number): Promise<void> {
     const existing = await this.delegate(model).findFirst({
-      where: { id, deletedAt: null },
+      where: { id, deletedAt: null, isSystemReserved: false },
       select: { id: true },
     });
     if (!existing) throw new NotFoundException(OPTION_NOT_FOUND);

@@ -79,15 +79,16 @@ model LineUserRegistration {
   /// Loosely validated in the DTO (Thai formats), mirroring SystemUser.phoneNumber. Stored as given.
   phone String
 
-  /// FK -> Department.id. Required: every registration picks a department option (SC-2.4/Q4).
-  /// `onDelete: Restrict` refuses a stray hard delete of a referenced option — normal deletes are
-  /// soft (deletedAt), so a referenced row is never hard-deleted. Resolves for display even when the
-  /// option is soft-deleted (the FK row persists; only deletedAt is set).
-  departmentId String
+  /// FK -> Department.id (an auto-increment Int). Required: every registration picks a department
+  /// option (SC-2.4/Q4). `onDelete: Restrict` refuses a stray hard delete of a referenced option —
+  /// normal deletes are soft (deletedAt), so a referenced row is never hard-deleted. Resolves for
+  /// display even when the option is soft-deleted (the FK row persists; only deletedAt is set).
+  departmentId Int
   department   Department @relation("RegistrationDepartment", fields: [departmentId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
-  /// FK -> PersonnelRole.id (the LINE end-user's self-declared role — NOT SystemRole). Required.
-  personnelRoleId String
+  /// FK -> PersonnelRole.id (an auto-increment Int; the LINE end-user's self-declared role — NOT
+  /// SystemRole). Required.
+  personnelRoleId Int
   personnelRole   PersonnelRole @relation("RegistrationPersonnelRole", fields: [personnelRoleId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
   createdAt DateTime @default(now())
@@ -108,33 +109,66 @@ model LineUserRegistration {
 /// authored in raw SQL in the migration — the PSL cannot express it), so `name` is deliberately NOT
 /// `@unique` here: a soft-deleted name is REUSABLE (SC-2.3/Q2). Holds no PII.
 model Department {
-  id        String    @id @default(cuid())
+  id        Int       @id @default(autoincrement())
   name      String
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
+  /// TRUE only for the row the System Developer (SUPER_ADMIN) owns, created exclusively by
+  /// scripts/create-super-admin.ts. A reserved row is INVISIBLE to every non-SUPER_ADMIN option list
+  /// and UNASSIGNABLE by any other actor (-> the same 400 as an unknown option id, never a 403).
+  ///
+  /// This is a FLAG, not a name, and that distinction is load-bearing (see AC-X3): a row NAMED
+  /// 'ผู้พัฒนาระบบ (System Developer)' with isSystemReserved=false is an ordinary, visible, assignable
+  /// option that grants nothing — exactly like a PersonnelRole named "ADMIN". The flag is the boundary.
+  ///
+  /// Settable by NO endpoint: it is absent from every DTO, so `forbidNonWhitelisted: true` 400s any
+  /// attempt to send it (the same construction that protects SystemUser.lineUserId).
+  isSystemReserved Boolean @default(false)
+
   registrations LineUserRegistration[] @relation("RegistrationDepartment")
+
+  /// Back-relation for SystemUser.department. VIRTUAL — adds no column to departments.
+  systemUsers SystemUser[] @relation("SystemUserDepartment")
 
   @@index([deletedAt])
   @@map("departments")
 }
 
-/// Admin-curated PERSONNEL role options (Teacher, Support Staff, …) for the LINE registration form —
-/// the LINE end-user's self-declared role, a client-portal/registration concern.
+/// Admin-curated PERSONNEL role options (Teacher, Support Staff, …) — a JOB TITLE.
+///
+/// TWO consumers since 2026-07-16: (1) the LINE registration form — the end-user's self-declared
+/// role; (2) back-office staff job titles (SystemUser.personnelRoleId, the former free-text
+/// `position` column). One curated vocabulary, two readers.
 ///
 /// CRITICAL: `PersonnelRole` is NOT `SystemRole`. `SystemRole` (SUPER_ADMIN | ADMIN | STAFF, on
-/// SystemUser) is the back-office RBAC enum. They share NO table, enum, type, endpoint, or seed, and
-/// never cross a code path. Soft-deleted, name reusable (partial unique index — same as Department).
-/// Holds no PII.
+/// SystemUser) is the back-office RBAC enum and the only grantor of privilege. They share NO table,
+/// enum, type, endpoint, or seed, and never cross a code path. A `SystemUser` now holds BOTH: only
+/// `SystemRole` grants privilege, and a `PersonnelRole` named "ADMIN" is a string — an inert label
+/// on a STAFF user who still gets 403 everywhere. Never compare, map, or fall back between them.
+/// Soft-deleted, name reusable (partial unique index — same as Department). Holds no PII.
 model PersonnelRole {
-  id        String    @id @default(cuid())
+  id        Int       @id @default(autoincrement())
   name      String
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
+  /// TRUE only for the row the System Developer (SUPER_ADMIN) owns — see Department.isSystemReserved
+  /// for the full rationale. Invisible to every non-SUPER_ADMIN option list, unassignable by any
+  /// other actor (the same 400 as an unknown id, never a 403), settable by no endpoint, and written
+  /// exclusively by scripts/create-super-admin.ts.
+  ///
+  /// A FLAG, not a name: a row NAMED 'ผู้ดูแลระบบระดับสูง (System Administrator)' with
+  /// isSystemReserved=false is an ordinary option granting nothing — exactly like the PersonnelRole
+  /// named "ADMIN" that AC-X3 pins. Privilege is SystemUser.role and only that.
+  isSystemReserved Boolean @default(false)
+
   registrations LineUserRegistration[] @relation("RegistrationPersonnelRole")
+
+  /// Back-relation for SystemUser.personnelRole. VIRTUAL — adds no column to personnel_roles.
+  systemUsers SystemUser[] @relation("SystemUserPersonnelRole")
 
   @@index([deletedAt])
   @@map("personnel_roles")
@@ -168,14 +202,45 @@ model SystemUser {
   lastName  String
   role      SystemRole @default(STAFF)
 
-  /// Educational-context profile. Free text, NOT enums, by PO decision (DD-7).
-  /// e.g. "Teacher", "Admin Staff", "Director".
-  position          String
-  /// e.g. "Computer Science", "Registrar's Office".
-  department        String
+  /// Forced-reset flag. TRUE from the moment a temp password is issued (POST /system-users,
+  /// POST /system-users/:id/reset-password); cleared ONLY by a successful POST /auth/system/password.
+  /// camelCase, no @map — live columns in this schema are camelCase.
+  ///
+  /// ORTHOGONAL to isActive and deletedAt (a third independent flag, not a fourth lifecycle state):
+  /// isActive=false is a suspension, deletedAt is soft deletion, and BOTH are 401s at SessionGuard —
+  /// they fire FIRST, so a suspended or deleted user never reaches the reset screen. This flag is a
+  /// CREDENTIAL state: the user is fully valid, they just may not do anything but change it (403).
+  /// Enforced server-side in SessionGuard; a frontend redirect is UX, never the control.
+  mustChangePassword Boolean @default(true)
+
+  /// FK -> Department.id. Required: every staff member belongs to exactly one department option.
+  /// Replaces the former free-text `department` column (DD-7 superseded by the PO, 2026-07-16 —
+  /// see claude_planning/20260716_1342_staff_management/02_design_log.md §0). The values are still
+  /// admin-curated DATA, never a Prisma enum, which is what DD-7 actually protected.
+  ///
+  /// `onDelete: Restrict` refuses a stray HARD delete of a referenced option. Normal option deletes
+  /// are SOFT (deletedAt), so this rarely fires — and a soft-deleted option is still a live FK
+  /// target, which is deliberate: READS ignore `deletedAt` (an existing assignment keeps resolving
+  /// its name forever), WRITES require an ACTIVE option (checked in the service -> 400).
+  departmentId Int
+  department   Department @relation("SystemUserDepartment", fields: [departmentId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// FK -> PersonnelRole.id — the staff member's JOB TITLE ("Teacher", "Director"). The former
+  /// free-text `position` column; "position" is the UI label, `personnelRole` is the model.
+  ///
+  /// CRITICAL: this is NOT `role` above. `role` is SystemRole (SUPER_ADMIN | ADMIN | STAFF) — the
+  /// back-office RBAC enum and the ONLY thing that grants privilege. `personnelRole` is an
+  /// admin-curated label that grants ZERO privilege, and a PersonnelRole named "ADMIN" is just a
+  /// string. A SystemUser holds BOTH. They are never interchangeable, never compared, and never
+  /// cross a code path. Any future `if (user.personnelRole.name === 'ADMIN')` is a privilege-
+  /// escalation bug — the guard test in test/ exists to catch exactly that.
+  personnelRoleId Int
+  personnelRole   PersonnelRole @relation("SystemUserPersonnelRole", fields: [personnelRoleId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
   /// Display only. Loosely validated (Thai formats + office extensions).
   phoneNumber       String?
-  /// https URL only. Rendered by the client; the backend NEVER fetches it.
+  /// https URL only. Rendered by the client; the backend NEVER fetches it. Written server-side by
+  /// POST /auth/system/me/avatar (an R2 object URL); also settable to any https URL by an admin.
   profilePictureUrl String?
 
   isActive    Boolean   @default(true)
@@ -204,5 +269,7 @@ model SystemUser {
   updatedAt DateTime @updatedAt
 
   @@index([createdById])
+  @@index([departmentId])
+  @@index([personnelRoleId])
   @@map("system_users")
 }

@@ -20,16 +20,22 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
     "line:setup-richmenu": "ts-node scripts/setup-rich-menu.ts",
-    "auth:seed-superadmin": "ts-node scripts/seed-super-admin.ts",
+    "auth:create-superadmin": "ts-node scripts/create-super-admin.ts",
+    "auth:hash-password": "ts-node scripts/hash-password.ts",
     "options:seed": "ts-node scripts/seed-options.ts",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
-    "test:e2e": "jest --config ./test/jest-e2e.json"
+    "test:e2e": "jest --config ./test/jest-e2e.json",
+    "prepare": "node -e \"try{require('child_process').execSync('husky',{stdio:'inherit'})}catch(e){}\""
+  },
+  "lint-staged": {
+    "*.ts": "eslint --fix"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1088.0",
     "@line/bot-sdk": "^11.1.0",
     "@nestjs/common": "^11.0.1",
     "@nestjs/config": "^4.0.0",
@@ -64,6 +70,7 @@
     "@types/express-session": "^1.19.0",
     "@types/jest": "^30.0.0",
     "@types/morgan": "^1.9.10",
+    "@types/multer": "^2.2.0",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.20.0",
     "@types/supertest": "^7.0.0",
@@ -72,7 +79,9 @@
     "eslint-config-prettier": "^10.0.1",
     "eslint-plugin-prettier": "^5.2.2",
     "globals": "^17.0.0",
+    "husky": "^9.1.7",
     "jest": "^30.0.0",
+    "lint-staged": "^17.0.8",
     "prettier": "^3.4.2",
     "prisma": "^7.8.0",
     "source-map-support": "^0.5.21",

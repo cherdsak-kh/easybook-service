@@ -33,7 +33,7 @@ const menuType1: MenuDef = {
     size: { width: 2500, height: 843 },
     selected: true,
     name: 'easy-book-liff',
-    chatBarText: 'LIFF App',
+    chatBarText: 'EasyBook App',
     areas: [
       {
         bounds: { x: 0, y: 0, width: 2500, height: 843 },
@@ -51,7 +51,7 @@ const menuType2: MenuDef = {
     size: { width: 2500, height: 1686 },
     selected: false,
     name: 'easy-book-main',
-    chatBarText: 'Menu',
+    chatBarText: 'เริ่มต้นใช้งาน',
     areas: [
       {
         // Top banner → opens the LIFF app.
@@ -91,11 +91,29 @@ async function main(): Promise<void> {
     const line = app.get(LineService);
     const defaultKey = process.env.DEFAULT_RICH_MENU ?? 'type1';
 
+    // Delete any pre-existing menus this script owns (matched by name), so a
+    // rerun replaces them instead of accumulating duplicates.
+    const managedNames = new Set(MENUS.map(({ menu }) => menu.name));
+    const existing = await line.listRichMenus();
+    for (const menu of existing) {
+      if (managedNames.has(menu.name)) {
+        await line.deleteRichMenu(menu.richMenuId);
+        console.log(
+          `Deleted existing rich menu '${menu.name}':`,
+          menu.richMenuId,
+        );
+      }
+    }
+
     for (const { key, image, menu } of MENUS) {
       const richMenuId = await line.createRichMenu(menu);
       console.log(`Created rich menu '${key}':`, richMenuId);
 
-      await line.setRichMenuImage(richMenuId, readFileSync(image), 'image/jpeg');
+      await line.setRichMenuImage(
+        richMenuId,
+        readFileSync(image),
+        'image/jpeg',
+      );
       console.log(`  uploaded ${image}`);
 
       if (key === defaultKey) {

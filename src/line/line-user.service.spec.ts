@@ -6,9 +6,10 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { AppAccess, Prisma } from '@prisma/client';
+import { AppAccess, Prisma, SystemRole } from '@prisma/client';
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
+import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
 import { LineService } from './line.service';
@@ -21,7 +22,9 @@ import {
   ALREADY_REGISTERED,
   INVALID_DEPARTMENT,
   INVALID_PERSONNEL_ROLE,
+  LINE_USER_ACCESS_TRANSITION_FORBIDDEN,
   LINE_USER_NOT_FOUND,
+  LINE_USER_REGISTRATION_NOT_FOUND,
   REGISTRATION_NOT_EDITABLE,
   STAFF_ID_TAKEN,
 } from './line-users.errors';
@@ -49,8 +52,8 @@ const VALID_DTO: CreateLineUserRegistrationDto = {
   lastName: 'Jaidee',
   staffId: '6412345678',
   phone: '081-234-5678',
-  departmentId: 'dep-1',
-  personnelRoleId: 'role-1',
+  departmentId: 1,
+  personnelRoleId: 2,
 };
 
 /** Owner-facing registration row (matches REGISTRATION_OWNER_SELECT: ids + resolved option names). */
@@ -60,8 +63,8 @@ const OWNER_REGISTRATION_ROW = {
   lastName: 'Jaidee',
   staffId: '6412345678',
   phone: '081-234-5678',
-  departmentId: 'dep-1',
-  personnelRoleId: 'role-1',
+  departmentId: 1,
+  personnelRoleId: 2,
   department: { name: 'Computer Science' },
   personnelRole: { name: 'Teacher' },
   createdAt: new Date('2026-07-14T10:00:00.000Z'),
@@ -74,6 +77,7 @@ describe('LineUserService', () => {
     upsert: jest.fn(),
     updateMany: jest.fn(),
     findFirst: jest.fn(),
+    findUnique: jest.fn(),
     findMany: jest.fn(),
     count: jest.fn(),
     update: jest.fn(),
@@ -254,27 +258,41 @@ describe('LineUserService', () => {
 
   describe('getRegistrationOptions', () => {
     it('returns non-deleted departments + personnel roles, id+name, ordered name ASC (SC-B7)', async () => {
-      department.findMany.mockResolvedValue([{ id: 'dep-1', name: 'Biology' }]);
-      personnelRole.findMany.mockResolvedValue([
-        { id: 'role-1', name: 'Teacher' },
-      ]);
+      department.findMany.mockResolvedValue([{ id: 1, name: 'Biology' }]);
+      personnelRole.findMany.mockResolvedValue([{ id: 2, name: 'Teacher' }]);
 
       const result = await service.getRegistrationOptions();
 
       expect(department.findMany).toHaveBeenCalledWith({
-        where: { deletedAt: null },
+        where: { deletedAt: null, isSystemReserved: false },
         select: { id: true, name: true },
         orderBy: { name: 'asc' },
       });
       expect(personnelRole.findMany).toHaveBeenCalledWith({
-        where: { deletedAt: null },
+        where: { deletedAt: null, isSystemReserved: false },
         select: { id: true, name: true },
         orderBy: { name: 'asc' },
       });
       expect(result).toEqual({
-        departments: [{ id: 'dep-1', name: 'Biology' }],
-        personnelRoles: [{ id: 'role-1', name: 'Teacher' }],
+        departments: [{ id: 1, name: 'Biology' }],
+        personnelRoles: [{ id: 2, name: 'Teacher' }],
       });
+    });
+
+    it('AC-B3 — the reserved filter is HARDCODED: no parameter can widen it for a LINE caller', async () => {
+      // This surface has no actor and no SystemRole to branch on, so there is nothing to widen and
+      // no role check belongs here. A LINE end user can never see a reserved option.
+      department.findMany.mockResolvedValue([]);
+      personnelRole.findMany.mockResolvedValue([]);
+
+      await service.getRegistrationOptions();
+
+      for (const delegate of [department.findMany, personnelRole.findMany]) {
+        const [args] = delegate.mock.calls[0] as [
+          { where: { isSystemReserved: boolean } },
+        ];
+        expect(args.where.isSystemReserved).toBe(false);
+      }
     });
   });
 
@@ -283,8 +301,8 @@ describe('LineUserService', () => {
   describe('register', () => {
     const primeTx = () => {
       const tx = makeTx();
-      tx.department.findFirst.mockResolvedValue({ id: 'dep-1' });
-      tx.personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      tx.department.findFirst.mockResolvedValue({ id: 1 });
+      tx.personnelRole.findFirst.mockResolvedValue({ id: 2 });
       $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
         cb(tx),
       );
@@ -317,9 +335,9 @@ describe('LineUserService', () => {
         id: 'reg-1',
         staffId: '6412345678',
         phone: '081-234-5678',
-        departmentId: 'dep-1',
+        departmentId: 1,
         department: 'Computer Science',
-        personnelRoleId: 'role-1',
+        personnelRoleId: 2,
         personnelRole: 'Teacher',
         createdAt: '2026-07-14T10:00:00.000Z',
       });
@@ -337,7 +355,7 @@ describe('LineUserService', () => {
         access: AppAccess.UNREGISTERED,
       });
       tx.department.findFirst.mockResolvedValue(null);
-      tx.personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      tx.personnelRole.findFirst.mockResolvedValue({ id: 2 });
       $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
         cb(tx),
       );
@@ -348,13 +366,41 @@ describe('LineUserService', () => {
       expect(tx.lineUserRegistration.create).not.toHaveBeenCalled();
     });
 
+    it('AC-B7 — a system-reserved option is unassignable and 400s exactly like an unknown id', async () => {
+      const tx = makeTx();
+      tx.lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.UNREGISTERED,
+      });
+      // The reserved predicate rides in the same WHERE, so a reserved row simply does not match —
+      // the caller cannot distinguish it from a nonexistent one. Never a 403 (existence oracle).
+      tx.department.findFirst.mockResolvedValue(null);
+      tx.personnelRole.findFirst.mockResolvedValue({ id: 2 });
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+
+      await expect(service.register('U123', VALID_DTO)).rejects.toThrow(
+        new BadRequestException(INVALID_DEPARTMENT),
+      );
+      expect(tx.department.findFirst).toHaveBeenCalledWith({
+        where: {
+          id: VALID_DTO.departmentId,
+          deletedAt: null,
+          isSystemReserved: false,
+        },
+        select: { id: true },
+      });
+      expect(tx.lineUserRegistration.create).not.toHaveBeenCalled();
+    });
+
     it('rejects a deleted/unknown personnelRoleId with 400 (SC-B6)', async () => {
       const tx = makeTx();
       tx.lineUser.findFirst.mockResolvedValue({
         id: 'lu-1',
         access: AppAccess.UNREGISTERED,
       });
-      tx.department.findFirst.mockResolvedValue({ id: 'dep-1' });
+      tx.department.findFirst.mockResolvedValue({ id: 1 });
       tx.personnelRole.findFirst.mockResolvedValue(null);
       $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
         cb(tx),
@@ -472,8 +518,8 @@ describe('LineUserService', () => {
         id: 'lu-1',
         access: AppAccess.PENDING,
       });
-      department.findFirst.mockResolvedValue({ id: 'dep-1' });
-      personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      department.findFirst.mockResolvedValue({ id: 1 });
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
       lineUserRegistration.update.mockResolvedValue(OWNER_REGISTRATION_ROW);
 
       const result = await service.updateRegistration('U123', EDIT_DTO);
@@ -486,8 +532,8 @@ describe('LineUserService', () => {
             lastName: 'Jaidee',
             staffId: '6412345678',
             phone: '081-234-5678',
-            departmentId: 'dep-1',
-            personnelRoleId: 'role-1',
+            departmentId: 1,
+            personnelRoleId: 2,
           },
         }),
       );
@@ -528,7 +574,7 @@ describe('LineUserService', () => {
         access: AppAccess.PENDING,
       });
       department.findFirst.mockResolvedValue(null);
-      personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
 
       await expect(
         service.updateRegistration('U123', EDIT_DTO),
@@ -536,13 +582,34 @@ describe('LineUserService', () => {
       expect(lineUserRegistration.update).not.toHaveBeenCalled();
     });
 
+    it('AC-B7 — PATCH /registration also filters reserved options out of the assignability check', async () => {
+      lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+      });
+      department.findFirst.mockResolvedValue(null);
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
+
+      await expect(
+        service.updateRegistration('U123', EDIT_DTO),
+      ).rejects.toThrow(new BadRequestException(INVALID_DEPARTMENT));
+      expect(department.findFirst).toHaveBeenCalledWith({
+        where: {
+          id: EDIT_DTO.departmentId,
+          deletedAt: null,
+          isSystemReserved: false,
+        },
+        select: { id: true },
+      });
+    });
+
     it('maps a P2002 on staffId (another registration) to 409 STAFF_ID_TAKEN (SC-B10)', async () => {
       lineUser.findFirst.mockResolvedValue({
         id: 'lu-1',
         access: AppAccess.PENDING,
       });
-      department.findFirst.mockResolvedValue({ id: 'dep-1' });
-      personnelRole.findFirst.mockResolvedValue({ id: 'role-1' });
+      department.findFirst.mockResolvedValue({ id: 1 });
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
       lineUserRegistration.update.mockRejectedValue(
         new Prisma.PrismaClientKnownRequestError('unique', {
           code: 'P2002',
@@ -645,7 +712,7 @@ describe('LineUserService', () => {
       });
     });
 
-    it('maps a nested registration relation into the compact summary with resolved option names (AC-B11/SC-B5)', async () => {
+    it('maps a nested registration relation into the compact summary with option ids + resolved names (AC-B11/SC-B5/§B-8a)', async () => {
       $transaction.mockResolvedValue([
         [
           {
@@ -656,6 +723,8 @@ describe('LineUserService', () => {
               lastName: 'Jaidee',
               staffId: '6412345678',
               phone: '081-234-5678',
+              departmentId: 1,
+              personnelRoleId: 2,
               department: { name: 'Computer Science' },
               personnelRole: { name: 'Teacher' },
             },
@@ -666,13 +735,25 @@ describe('LineUserService', () => {
 
       const result = await service.findManyPaginated({ page: 1, limit: 20 });
 
+      // §B-8a additive contract: the summary now carries departmentId + personnelRoleId so the admin
+      // edit modal can pre-select its dropdowns without a second fetch.
       expect(result.data[0].registration).toEqual({
         firstName: 'Somchai',
         lastName: 'Jaidee',
         staffId: '6412345678',
         phone: '081-234-5678',
+        departmentId: 1,
         department: 'Computer Science',
+        personnelRoleId: 2,
         personnelRole: 'Teacher',
+      });
+    });
+
+    it('§B-8a — LINE_USER_PUBLIC_FIELDS selects both option ids on the nested registration', () => {
+      // The additive contract is only satisfiable if the select actually asks for the ids.
+      expect(LINE_USER_PUBLIC_FIELDS.registration.select).toMatchObject({
+        departmentId: true,
+        personnelRoleId: true,
       });
     });
 
@@ -736,8 +817,21 @@ describe('LineUserService', () => {
   // ───────────────────────── updateAccess ─────────────────────────
 
   describe('updateAccess', () => {
+    // `jest.clearAllMocks()` (parent beforeEach) clears call records but NOT implementations, so a
+    // reject set by one test would leak into the next. Re-establish success defaults per test; the
+    // tests that need a failure override these afterwards.
+    beforeEach(() => {
+      line.findRichMenuId.mockResolvedValue('rm-default');
+      line.linkRichMenuToUser.mockResolvedValue(undefined);
+      line.push.mockResolvedValue(undefined);
+    });
+
+    /** Prime the role-aware read (`findUnique` selects id/access/deletedAt). */
+    const primeRead = (access: AppAccess, deletedAt: Date | null = null) =>
+      lineUser.findUnique.mockResolvedValue({ id: 'lu-1', access, deletedAt });
+
     it('Approve writes access + richMenuType TYPE_2 and applies the TYPE_2 menu on LINE (AC-B7)', async () => {
-      lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
+      primeRead(AppAccess.PENDING);
       lineUser.update.mockResolvedValue({
         ...publicRow,
         access: AppAccess.ALLOWED,
@@ -745,8 +839,16 @@ describe('LineUserService', () => {
       });
       line.findRichMenuId.mockResolvedValue('rm-type2');
 
-      const result = await service.updateAccess('lu-1', AppAccess.ALLOWED);
+      const result = await service.updateAccess(
+        'lu-1',
+        AppAccess.ALLOWED,
+        SystemRole.ADMIN,
+      );
 
+      expect(lineUser.findUnique).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        select: { id: true, access: true, deletedAt: true },
+      });
       expect(lineUser.update).toHaveBeenCalledWith({
         where: { id: 'lu-1' },
         data: { access: AppAccess.ALLOWED, richMenuType: 'TYPE_2' },
@@ -767,7 +869,7 @@ describe('LineUserService', () => {
     });
 
     it('Block writes richMenuType TYPE_1 and applies the TYPE_1 menu on LINE (AC-B8)', async () => {
-      lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
+      primeRead(AppAccess.PENDING);
       lineUser.update.mockResolvedValue({
         ...publicRow,
         access: AppAccess.BLOCKED,
@@ -775,7 +877,7 @@ describe('LineUserService', () => {
       });
       line.findRichMenuId.mockResolvedValue('rm-type1');
 
-      await service.updateAccess('lu-1', AppAccess.BLOCKED);
+      await service.updateAccess('lu-1', AppAccess.BLOCKED, SystemRole.ADMIN);
 
       expect(lineUser.update).toHaveBeenCalledWith({
         where: { id: 'lu-1' },
@@ -794,8 +896,8 @@ describe('LineUserService', () => {
       ]);
     });
 
-    it('PENDING pushes the exact PENDING copy to the LINE-side U… id', async () => {
-      lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
+    it('PENDING pushes the exact PENDING copy to the LINE-side U… id (SUPER_ADMIN forcing PENDING)', async () => {
+      primeRead(AppAccess.ALLOWED);
       lineUser.update.mockResolvedValue({
         ...publicRow,
         access: AppAccess.PENDING,
@@ -803,15 +905,19 @@ describe('LineUserService', () => {
       });
       line.findRichMenuId.mockResolvedValue('rm-type1');
 
-      await service.updateAccess('lu-1', AppAccess.PENDING);
+      await service.updateAccess(
+        'lu-1',
+        AppAccess.PENDING,
+        SystemRole.SUPER_ADMIN,
+      );
 
       expect(line.push).toHaveBeenCalledWith('U123', [
         { type: 'text', text: PENDING_MSG },
       ]);
     });
 
-    it('UNREGISTERED sends NO push', async () => {
-      lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
+    it('UNREGISTERED sends NO push (SUPER_ADMIN forcing UNREGISTERED)', async () => {
+      primeRead(AppAccess.BLOCKED);
       lineUser.update.mockResolvedValue({
         ...publicRow,
         access: AppAccess.UNREGISTERED,
@@ -819,13 +925,17 @@ describe('LineUserService', () => {
       });
       line.findRichMenuId.mockResolvedValue('rm-type1');
 
-      await service.updateAccess('lu-1', AppAccess.UNREGISTERED);
+      await service.updateAccess(
+        'lu-1',
+        AppAccess.UNREGISTERED,
+        SystemRole.SUPER_ADMIN,
+      );
 
       expect(line.push).not.toHaveBeenCalled();
     });
 
     it('best-effort: a push failure is swallowed (logged, not thrown) after the DB + menu succeed', async () => {
-      lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
+      primeRead(AppAccess.PENDING);
       lineUser.update.mockResolvedValue({
         ...publicRow,
         access: AppAccess.ALLOWED,
@@ -839,7 +949,11 @@ describe('LineUserService', () => {
         .mockImplementation(() => undefined);
 
       // Resolves successfully despite the push failure — no 500/502.
-      const result = await service.updateAccess('lu-1', AppAccess.ALLOWED);
+      const result = await service.updateAccess(
+        'lu-1',
+        AppAccess.ALLOWED,
+        SystemRole.ADMIN,
+      );
 
       expect(result.access).toBe(AppAccess.ALLOWED);
       expect(result.richMenuType).toBe('TYPE_2');
@@ -850,7 +964,7 @@ describe('LineUserService', () => {
     });
 
     it('502s when the LINE apply fails, but the DB row was already updated (AC-B10)', async () => {
-      lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
+      primeRead(AppAccess.PENDING);
       lineUser.update.mockResolvedValue({
         ...publicRow,
         access: AppAccess.ALLOWED,
@@ -860,7 +974,7 @@ describe('LineUserService', () => {
       line.linkRichMenuToUser.mockRejectedValue(new Error('LINE 500'));
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED),
+        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
       ).rejects.toBeInstanceOf(BadGatewayException);
       // The DB write happened BEFORE the failing LINE call — source of truth is correct.
       expect(lineUser.update).toHaveBeenCalledWith({
@@ -870,8 +984,9 @@ describe('LineUserService', () => {
       });
     });
 
-    it('is idempotent: a retry after a 502 re-writes the same state and re-applies the menu (AC-B9)', async () => {
-      lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
+    it('is idempotent: an ADMIN retry after a 502 re-writes the same state and re-applies the menu (AC-B9)', async () => {
+      // The idempotent ALLOWED→ALLOWED same-state write is exactly the design's 502-retry case.
+      primeRead(AppAccess.ALLOWED);
       lineUser.update.mockResolvedValue({
         ...publicRow,
         access: AppAccess.ALLOWED,
@@ -884,21 +999,524 @@ describe('LineUserService', () => {
         .mockResolvedValueOnce(undefined);
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED),
+        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
       ).rejects.toBeInstanceOf(BadGatewayException);
-      const retry = await service.updateAccess('lu-1', AppAccess.ALLOWED);
+      const retry = await service.updateAccess(
+        'lu-1',
+        AppAccess.ALLOWED,
+        SystemRole.ADMIN,
+      );
       expect(retry.access).toBe(AppAccess.ALLOWED);
       expect(retry.richMenuType).toBe('TYPE_2');
     });
 
-    it('404s an unknown or soft-deleted id, writes nothing, and never calls LINE (AC-B10)', async () => {
-      lineUser.findFirst.mockResolvedValue(null);
+    it('404s an unknown id for both roles, writes nothing, and never calls LINE (AC-B10)', async () => {
+      lineUser.findUnique.mockResolvedValue(null);
+
+      for (const role of [SystemRole.ADMIN, SystemRole.SUPER_ADMIN]) {
+        await expect(
+          service.updateAccess('gone', AppAccess.ALLOWED, role),
+        ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
+      }
+      expect(lineUser.update).not.toHaveBeenCalled();
+      expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
+    });
+
+    // ───────── ADMIN transition matrix (design §3, AC-3.1/AC-3.2) ─────────
+
+    // Every ✅ cell: the four PO pairs + the two idempotent same-state writes (502 retry).
+    const ADMIN_ALLOWED: Array<[AppAccess, AppAccess]> = [
+      [AppAccess.PENDING, AppAccess.ALLOWED],
+      [AppAccess.PENDING, AppAccess.BLOCKED],
+      [AppAccess.ALLOWED, AppAccess.BLOCKED],
+      [AppAccess.BLOCKED, AppAccess.ALLOWED],
+      [AppAccess.ALLOWED, AppAccess.ALLOWED],
+      [AppAccess.BLOCKED, AppAccess.BLOCKED],
+    ];
+
+    it.each(ADMIN_ALLOWED)(
+      'AC-3.1 — ADMIN %s→%s is permitted: writes the DB and drives the LINE side-effect',
+      async (from, to) => {
+        primeRead(from);
+        lineUser.update.mockResolvedValue({
+          ...publicRow,
+          access: to,
+          richMenuType: accessToRichMenuType(to),
+        });
+        line.findRichMenuId.mockResolvedValue('rm-x');
+
+        const result = await service.updateAccess('lu-1', to, SystemRole.ADMIN);
+
+        expect(result.access).toBe(to);
+        expect(lineUser.update).toHaveBeenCalledWith({
+          where: { id: 'lu-1' },
+          data: { access: to, richMenuType: accessToRichMenuType(to) },
+          select: LINE_USER_PUBLIC_FIELDS,
+        });
+        expect(line.linkRichMenuToUser).toHaveBeenCalled();
+      },
+    );
+
+    // Every ❌ cell: any `to ∈ {PENDING, UNREGISTERED}` from any state, and any `from = UNREGISTERED`.
+    const ADMIN_FORBIDDEN: Array<[AppAccess, AppAccess]> = [
+      [AppAccess.PENDING, AppAccess.PENDING],
+      [AppAccess.PENDING, AppAccess.UNREGISTERED],
+      [AppAccess.ALLOWED, AppAccess.PENDING],
+      [AppAccess.ALLOWED, AppAccess.UNREGISTERED],
+      [AppAccess.BLOCKED, AppAccess.PENDING],
+      [AppAccess.BLOCKED, AppAccess.UNREGISTERED],
+      [AppAccess.UNREGISTERED, AppAccess.ALLOWED],
+      [AppAccess.UNREGISTERED, AppAccess.BLOCKED],
+      [AppAccess.UNREGISTERED, AppAccess.PENDING],
+      [AppAccess.UNREGISTERED, AppAccess.UNREGISTERED],
+    ];
+
+    it.each(ADMIN_FORBIDDEN)(
+      'AC-3.2 — ADMIN %s→%s is 403, writes nothing, and never calls LINE',
+      async (from, to) => {
+        primeRead(from);
+
+        await expect(
+          service.updateAccess('lu-1', to, SystemRole.ADMIN),
+        ).rejects.toBeInstanceOf(ForbiddenException);
+        expect(lineUser.update).not.toHaveBeenCalled();
+        expect(line.findRichMenuId).not.toHaveBeenCalled();
+        expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
+        expect(line.push).not.toHaveBeenCalled();
+      },
+    );
+
+    it('AC-3.2 — the 403 carries the forbidden-transition message', async () => {
+      primeRead(AppAccess.ALLOWED);
+      await expect(
+        service.updateAccess('lu-1', AppAccess.PENDING, SystemRole.ADMIN),
+      ).rejects.toThrow(
+        new ForbiddenException(LINE_USER_ACCESS_TRANSITION_FORBIDDEN),
+      );
+    });
+
+    // ───────── SUPER_ADMIN bypass (design §3, AC-3.3) ─────────
+
+    const SUPER_ANY: Array<[AppAccess, AppAccess]> = [
+      [AppAccess.UNREGISTERED, AppAccess.ALLOWED],
+      [AppAccess.ALLOWED, AppAccess.PENDING],
+      [AppAccess.BLOCKED, AppAccess.UNREGISTERED],
+      [AppAccess.PENDING, AppAccess.PENDING],
+    ];
+
+    it.each(SUPER_ANY)(
+      'AC-3.3 — SUPER_ADMIN %s→%s bypasses the matrix and writes the DB',
+      async (from, to) => {
+        primeRead(from);
+        lineUser.update.mockResolvedValue({
+          ...publicRow,
+          access: to,
+          richMenuType: accessToRichMenuType(to),
+        });
+        line.findRichMenuId.mockResolvedValue('rm-x');
+
+        const result = await service.updateAccess(
+          'lu-1',
+          to,
+          SystemRole.SUPER_ADMIN,
+        );
+
+        expect(result.access).toBe(to);
+        expect(lineUser.update).toHaveBeenCalled();
+      },
+    );
+
+    // ───────── precedence: 404 BEFORE 403 for a soft-deleted row under ADMIN (AC-3.5) ─────────
+
+    it('AC-3.5 — ADMIN on a soft-deleted id is 404 (not 403), even when the transition would be forbidden', async () => {
+      // A forbidden transition (→PENDING) on a soft-deleted row: 404 wins, so the matrix never leaks
+      // the row's existence.
+      primeRead(AppAccess.PENDING, new Date());
 
       await expect(
-        service.updateAccess('gone', AppAccess.ALLOWED),
+        service.updateAccess('lu-1', AppAccess.PENDING, SystemRole.ADMIN),
       ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
       expect(lineUser.update).not.toHaveBeenCalled();
       expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
+    });
+
+    it('AC-3.5 — ADMIN on a soft-deleted id is 404 even when the transition would be allowed', async () => {
+      primeRead(AppAccess.PENDING, new Date());
+
+      await expect(
+        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+      ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
+      expect(lineUser.update).not.toHaveBeenCalled();
+    });
+
+    // ───────── SUPER_ADMIN on a soft-deleted row: skip BOTH side-effects (AC-3.6) ─────────
+
+    it('AC-3.6 — SUPER_ADMIN forcing a soft-deleted user writes the DB, skips menu + push, returns 200', async () => {
+      primeRead(AppAccess.PENDING, new Date());
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.ALLOWED,
+        richMenuType: 'TYPE_2',
+      });
+
+      const result = await service.updateAccess(
+        'lu-1',
+        AppAccess.ALLOWED,
+        SystemRole.SUPER_ADMIN,
+      );
+
+      // DB persisted with the derived rich menu (source of truth), no LINE side-effects, no 502/500.
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        data: { access: AppAccess.ALLOWED, richMenuType: 'TYPE_2' },
+        select: LINE_USER_PUBLIC_FIELDS,
+      });
+      expect(result.access).toBe(AppAccess.ALLOWED);
+      expect(result.richMenuType).toBe('TYPE_2');
+      expect(line.findRichMenuId).not.toHaveBeenCalled();
+      expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
+      expect(line.push).not.toHaveBeenCalled();
+    });
+
+    it('AC-3.6 — the soft-deleted skip is idempotent: a re-run re-writes the same state and re-skips', async () => {
+      primeRead(AppAccess.ALLOWED, new Date());
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.ALLOWED,
+        richMenuType: 'TYPE_2',
+      });
+
+      const first = await service.updateAccess(
+        'lu-1',
+        AppAccess.ALLOWED,
+        SystemRole.SUPER_ADMIN,
+      );
+      const second = await service.updateAccess(
+        'lu-1',
+        AppAccess.ALLOWED,
+        SystemRole.SUPER_ADMIN,
+      );
+
+      expect(first.access).toBe(AppAccess.ALLOWED);
+      expect(second.access).toBe(AppAccess.ALLOWED);
+      expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
+      expect(line.push).not.toHaveBeenCalled();
+    });
+  });
+
+  // ───────────────────────── updateRegistrationByAdmin (admin registration edit) ─────────────────────────
+
+  describe('updateRegistrationByAdmin', () => {
+    const ADMIN_EDIT_DTO: AdminUpdateLineUserRegistrationDto = {
+      firstName: 'Edited',
+      lastName: 'Name',
+      staffId: 'NEW-STAFF',
+      phone: '099-999-9999',
+      departmentId: 3,
+      personnelRoleId: 4,
+    };
+
+    /** The re-read LineUser (LINE_USER_PUBLIC_FIELDS) reflecting the edited registration. */
+    const publicUpdated = {
+      ...publicRow,
+      access: AppAccess.ALLOWED,
+      registration: {
+        firstName: 'Edited',
+        lastName: 'Name',
+        staffId: 'NEW-STAFF',
+        phone: '099-999-9999',
+        departmentId: 3,
+        personnelRoleId: 4,
+        department: { name: 'New Dept' },
+        personnelRole: { name: 'New Role' },
+      },
+    };
+
+    /**
+     * Prime a fully successful world: the target row, an existing registration, an interactive
+     * transaction whose option checks pass and whose update resolves, and the re-read public row.
+     */
+    const primeSuccess = (deletedAt: Date | null = null) => {
+      lineUser.findUnique
+        .mockResolvedValueOnce({ id: 'lu-1', deletedAt })
+        .mockResolvedValueOnce(publicUpdated);
+      lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
+      const tx = {
+        department: { findFirst: jest.fn().mockResolvedValue({ id: 3 }) },
+        personnelRole: { findFirst: jest.fn().mockResolvedValue({ id: 4 }) },
+        lineUserRegistration: {
+          update: jest.fn().mockResolvedValue({ id: 'reg-1' }),
+        },
+      };
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+      return tx;
+    };
+
+    it.each([SystemRole.ADMIN, SystemRole.SUPER_ADMIN])(
+      'AC-B2 — %s edits all six fields, persists them, and returns the updated row (200)',
+      async (role) => {
+        const tx = primeSuccess();
+
+        const result = await service.updateRegistrationByAdmin(
+          'lu-1',
+          ADMIN_EDIT_DTO,
+          role,
+        );
+
+        // `access` is NOT selected on the existence read — the edit is not PENDING-gated (AC-B10).
+        expect(lineUser.findUnique).toHaveBeenNthCalledWith(1, {
+          where: { id: 'lu-1' },
+          select: { id: true, deletedAt: true },
+        });
+        // All six fields written, keyed on the 1:1 lineUserId.
+        expect(tx.lineUserRegistration.update).toHaveBeenCalledWith({
+          where: { lineUserId: 'lu-1' },
+          data: {
+            firstName: 'Edited',
+            lastName: 'Name',
+            staffId: 'NEW-STAFF',
+            phone: '099-999-9999',
+            departmentId: 3,
+            personnelRoleId: 4,
+          },
+        });
+        // Response is the re-read LINE_USER_PUBLIC_FIELDS row, incl. the summary option ids (§B-8a).
+        expect(result.registration).toMatchObject({
+          firstName: 'Edited',
+          staffId: 'NEW-STAFF',
+          departmentId: 3,
+          department: 'New Dept',
+          personnelRoleId: 4,
+          personnelRole: 'New Role',
+        });
+      },
+    );
+
+    it('AC-B9 — a registration edit has NO access side-effect: no matrix, no rich menu, no push', async () => {
+      primeSuccess();
+
+      await service.updateRegistrationByAdmin(
+        'lu-1',
+        ADMIN_EDIT_DTO,
+        SystemRole.ADMIN,
+      );
+
+      // Orthogonal to Item 3: `access`/`richMenuType` are never written and no LINE call fires.
+      expect(lineUser.update).not.toHaveBeenCalled();
+      expect(line.findRichMenuId).not.toHaveBeenCalled();
+      expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
+      expect(line.push).not.toHaveBeenCalled();
+    });
+
+    it('AC-B10 — the existence read never selects `access` (not PENDING-gated)', async () => {
+      primeSuccess();
+      await service.updateRegistrationByAdmin(
+        'lu-1',
+        ADMIN_EDIT_DTO,
+        SystemRole.SUPER_ADMIN,
+      );
+      const firstSelect = (
+        lineUser.findUnique.mock.calls[0] as [
+          { select: Record<string, unknown> },
+        ]
+      )[0].select;
+      expect(firstSelect).not.toHaveProperty('access');
+    });
+
+    it('AC-B5 — a staffId held by ANOTHER registration is a 409 STAFF_ID_TAKEN', async () => {
+      lineUser.findUnique.mockResolvedValueOnce({
+        id: 'lu-1',
+        deletedAt: null,
+      });
+      lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
+      const tx = {
+        department: { findFirst: jest.fn().mockResolvedValue({ id: 3 }) },
+        personnelRole: { findFirst: jest.fn().mockResolvedValue({ id: 4 }) },
+        lineUserRegistration: {
+          update: jest.fn().mockRejectedValue(
+            new Prisma.PrismaClientKnownRequestError('unique', {
+              code: 'P2002',
+              clientVersion: 'x',
+              meta: { target: ['staffId'] },
+            }),
+          ),
+        },
+      };
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+
+      await expect(
+        service.updateRegistrationByAdmin(
+          'lu-1',
+          ADMIN_EDIT_DTO,
+          SystemRole.ADMIN,
+        ),
+      ).rejects.toThrow(new ConflictException(STAFF_ID_TAKEN));
+    });
+
+    it('AC-B5 — re-submitting the row’s OWN current staffId does not self-collide (no false 409)', async () => {
+      // A Prisma update writing the row's own staffId does not violate the unique constraint, so the
+      // update resolves and the method returns 200 — there is no manual own-id exclusion to get wrong.
+      const tx = primeSuccess();
+
+      const result = await service.updateRegistrationByAdmin(
+        'lu-1',
+        ADMIN_EDIT_DTO,
+        SystemRole.ADMIN,
+      );
+
+      expect(tx.lineUserRegistration.update).toHaveBeenCalled();
+      expect(result.access).toBe(AppAccess.ALLOWED);
+    });
+
+    it.each([SystemRole.ADMIN, SystemRole.SUPER_ADMIN])(
+      'AC-B6 — a system-reserved departmentId is 400 for %s (reserved-for-everyone), no write',
+      async (role) => {
+        lineUser.findUnique.mockResolvedValueOnce({
+          id: 'lu-1',
+          deletedAt: null,
+        });
+        lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
+        // The reserved predicate rides in the same WHERE, so a reserved row simply does not match.
+        const tx = {
+          department: { findFirst: jest.fn().mockResolvedValue(null) },
+          personnelRole: { findFirst: jest.fn().mockResolvedValue({ id: 4 }) },
+          lineUserRegistration: { update: jest.fn() },
+        };
+        $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+          cb(tx),
+        );
+
+        await expect(
+          service.updateRegistrationByAdmin('lu-1', ADMIN_EDIT_DTO, role),
+        ).rejects.toThrow(new BadRequestException(INVALID_DEPARTMENT));
+        // The role-blind guard hardcodes isSystemReserved: false — SUPER_ADMIN gets no carve-out here.
+        expect(tx.department.findFirst).toHaveBeenCalledWith({
+          where: { id: 3, deletedAt: null, isSystemReserved: false },
+          select: { id: true },
+        });
+        expect(tx.lineUserRegistration.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([SystemRole.ADMIN, SystemRole.SUPER_ADMIN])(
+      'AC-B6 — a system-reserved personnelRoleId is 400 for %s (reserved-for-everyone), no write',
+      async (role) => {
+        lineUser.findUnique.mockResolvedValueOnce({
+          id: 'lu-1',
+          deletedAt: null,
+        });
+        lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
+        const tx = {
+          department: { findFirst: jest.fn().mockResolvedValue({ id: 3 }) },
+          personnelRole: { findFirst: jest.fn().mockResolvedValue(null) },
+          lineUserRegistration: { update: jest.fn() },
+        };
+        $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+          cb(tx),
+        );
+
+        await expect(
+          service.updateRegistrationByAdmin('lu-1', ADMIN_EDIT_DTO, role),
+        ).rejects.toThrow(new BadRequestException(INVALID_PERSONNEL_ROLE));
+        expect(tx.personnelRole.findFirst).toHaveBeenCalledWith({
+          where: { id: 4, deletedAt: null, isSystemReserved: false },
+          select: { id: true },
+        });
+        expect(tx.lineUserRegistration.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it('AC-B6 — a soft-deleted option id is rejected with 400 (same query as reserved), no write', async () => {
+      lineUser.findUnique.mockResolvedValueOnce({
+        id: 'lu-1',
+        deletedAt: null,
+      });
+      lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
+      const tx = {
+        department: { findFirst: jest.fn().mockResolvedValue(null) },
+        personnelRole: { findFirst: jest.fn().mockResolvedValue({ id: 4 }) },
+        lineUserRegistration: { update: jest.fn() },
+      };
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+
+      await expect(
+        service.updateRegistrationByAdmin(
+          'lu-1',
+          ADMIN_EDIT_DTO,
+          SystemRole.ADMIN,
+        ),
+      ).rejects.toThrow(new BadRequestException(INVALID_DEPARTMENT));
+      expect(tx.lineUserRegistration.update).not.toHaveBeenCalled();
+    });
+
+    it('AC-B7 — a user with NO registration is a distinct 404 (LINE_USER_REGISTRATION_NOT_FOUND), never a 500', async () => {
+      lineUser.findUnique.mockResolvedValueOnce({
+        id: 'lu-1',
+        deletedAt: null,
+      });
+      lineUserRegistration.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.updateRegistrationByAdmin(
+          'lu-1',
+          ADMIN_EDIT_DTO,
+          SystemRole.ADMIN,
+        ),
+      ).rejects.toThrow(
+        new NotFoundException(LINE_USER_REGISTRATION_NOT_FOUND),
+      );
+      expect($transaction).not.toHaveBeenCalled();
+    });
+
+    it('AC-B8 — an unknown id is a 404 LINE_USER_NOT_FOUND for both roles, no registration read', async () => {
+      for (const role of [SystemRole.ADMIN, SystemRole.SUPER_ADMIN]) {
+        jest.clearAllMocks();
+        lineUser.findUnique.mockResolvedValueOnce(null);
+        await expect(
+          service.updateRegistrationByAdmin('gone', ADMIN_EDIT_DTO, role),
+        ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
+        expect(lineUserRegistration.findFirst).not.toHaveBeenCalled();
+      }
+    });
+
+    it('AC-B8 — a soft-deleted target is a 404 for ADMIN, byte-identical to unknown, no write', async () => {
+      lineUser.findUnique.mockResolvedValueOnce({
+        id: 'lu-1',
+        deletedAt: new Date(),
+      });
+
+      await expect(
+        service.updateRegistrationByAdmin(
+          'lu-1',
+          ADMIN_EDIT_DTO,
+          SystemRole.ADMIN,
+        ),
+      ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
+      // 404 wins before the registration gate — never leaks that the row exists but is deleted.
+      expect(lineUserRegistration.findFirst).not.toHaveBeenCalled();
+      expect($transaction).not.toHaveBeenCalled();
+    });
+
+    it('AC-B8 — SUPER_ADMIN MAY edit a soft-deleted user; persists, returns 200, no LINE side-effect', async () => {
+      const tx = primeSuccess(new Date());
+
+      const result = await service.updateRegistrationByAdmin(
+        'lu-1',
+        ADMIN_EDIT_DTO,
+        SystemRole.SUPER_ADMIN,
+      );
+
+      expect(tx.lineUserRegistration.update).toHaveBeenCalled();
+      expect(result.access).toBe(AppAccess.ALLOWED);
+      // No 502/500 path — a registration edit has no LINE side-effect to skip in the first place.
+      expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
+      expect(line.push).not.toHaveBeenCalled();
     });
   });
 });

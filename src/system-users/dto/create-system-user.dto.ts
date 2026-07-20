@@ -4,11 +4,13 @@ import { Transform } from 'class-transformer';
 import {
   IsEmail,
   IsEnum,
+  IsInt,
   IsOptional,
   IsString,
   IsUrl,
   Matches,
   MaxLength,
+  Min,
   MinLength,
 } from 'class-validator';
 
@@ -23,6 +25,11 @@ const normaliseEmail = ({ value }: { value: unknown }): unknown =>
  * `forbidNonWhitelisted: true` turns every attempt into a `400` (AC-35). A SUPER_ADMIN typing a
  * cuid could otherwise bind an operator's notification channel to a LINE account nobody has
  * proven ownership of; establishing that link needs LINE-side proof (LINK-LINE-1).
+ *
+ * `password` is absent by the same mechanism, and for a sharper reason: the server now ISSUES a
+ * temporary password (returned once, `mustChangePassword: true`). An admin-chosen password would be
+ * a SECOND credential path that bypasses the forced-reset gate entirely. Its absence from this DTO
+ * *is* the enforcement — `forbidNonWhitelisted` 400s any attempt to set one.
  */
 export class CreateSystemUserDto {
   @ApiProperty({ example: 'ada@easybook.local', maxLength: 254 })
@@ -30,12 +37,6 @@ export class CreateSystemUserDto {
   @IsEmail()
   @MaxLength(254)
   email!: string;
-
-  @ApiProperty({ minLength: 12, maxLength: 128, format: 'password' })
-  @IsString()
-  @MinLength(12)
-  @MaxLength(128)
-  password!: string;
 
   @ApiProperty({ example: 'Ada', maxLength: 120 })
   @Transform(trim)
@@ -58,27 +59,26 @@ export class CreateSystemUserDto {
 
   // ---- Educational-context profile. No employee/personnel ID field — ruled out by the PO. ----
 
+  // `@IsInt()` with NO `@Type(() => Number)`: the global ValidationPipe runs `transform: true` but
+  // NOT `enableImplicitConversion`, so a JSON `3` arrives as a number and `"3"` is correctly a 400.
+  // Adding `@Type` would silently accept strings and weaken the contract.
   @ApiProperty({
-    example: 'Teacher',
-    maxLength: 100,
-    description: 'Free text, e.g. Teacher / Admin Staff / Director.',
+    example: 3,
+    description:
+      'Department option id. Must reference an ACTIVE (non-soft-deleted) option — otherwise 400.',
   })
-  @Transform(trim)
-  @IsString()
-  @MinLength(1)
-  @MaxLength(100)
-  position!: string;
+  @IsInt()
+  @Min(1)
+  departmentId!: number;
 
   @ApiProperty({
-    example: 'Computer Science',
-    maxLength: 120,
-    description: 'Free text, e.g. academic department or group.',
+    example: 5,
+    description:
+      'PersonnelRole option id — the job title ("Position" in the UI). NOT `role`; grants zero privilege. Must reference an ACTIVE option — otherwise 400.',
   })
-  @Transform(trim)
-  @IsString()
-  @MinLength(1)
-  @MaxLength(120)
-  department!: string;
+  @IsInt()
+  @Min(1)
+  personnelRoleId!: number;
 
   // Deliberately NOT @IsPhoneNumber('TH'): libphonenumber rejects the office formats back-office
   // staff actually have (extensions, internal short numbers, foreign numbers). The field is

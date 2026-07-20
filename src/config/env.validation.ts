@@ -36,6 +36,97 @@ export const resolveSameSite = (rawValue: string | undefined): SameSite => {
     : 'lax';
 };
 
+/** The five R2 vars, in the order the `.env.example` block lists them. */
+export const R2_VARS = [
+  'R2_ACCOUNT_ID',
+  'R2_ACCESS_KEY_ID',
+  'R2_SECRET_ACCESS_KEY',
+  'R2_BUCKET',
+  'R2_PUBLIC_BASE_URL',
+] as const;
+
+/**
+ * Cloudflare R2 — staff avatar object storage.
+ *
+ * Exactly five vars. The region (`auto` — R2 accepts nothing else) and the S3 endpoint (derived as
+ * `https://<account id>.r2.cloudflarestorage.com`) are deliberately NOT env vars: a var whose only
+ * valid value is a constant is a misconfiguration vector, not a knob, and a separate endpoint var is
+ * one more way for endpoint and account id to disagree.
+ *
+ * Production-required; format-checked whenever present in ANY environment; plus an all-or-nothing
+ * cross-field rule. A half-configured box is worse than an unconfigured one — it boots, then fails at
+ * upload time with an opaque SDK error. All-or-nothing turns that into a loud, immediate deploy error.
+ *
+ * Dev/test: all five optional when NONE is set. The app boots and the avatar endpoint throws a
+ * request-time 500 with a clear log line — mirroring `LINE_LOGIN_CHANNEL_ID` exactly, so a developer
+ * not exercising avatars is not forced to provision a bucket and the test suites need no R2 config.
+ *
+ * Secrets are NEVER echoed here — not their value, not their length.
+ */
+function validateR2(raw: Record<string, unknown>, errors: string[]): void {
+  const present = R2_VARS.filter((name) => str(raw, name) !== undefined);
+  const isProduction = str(raw, 'NODE_ENV') === 'production';
+
+  if (isProduction) {
+    for (const name of R2_VARS) {
+      if (str(raw, name) === undefined) {
+        errors.push(`${name} is required in production.`);
+      }
+    }
+  } else if (present.length > 0 && present.length < R2_VARS.length) {
+    // All-or-nothing, enforced in EVERY environment. In production the loop above already named
+    // each missing var, so this would only duplicate the complaint.
+    const missing = R2_VARS.filter((name) => str(raw, name) === undefined);
+    errors.push(
+      `R2 is partially configured: ${missing.join(', ')} missing. Set all five R2_* vars or none.`,
+    );
+  }
+
+  // Format checks apply whenever the var is present, in any environment.
+  const accountId = str(raw, 'R2_ACCOUNT_ID');
+  if (accountId !== undefined && !/^[A-Za-z0-9_-]{8,64}$/.test(accountId)) {
+    // Loose on purpose: a hard 32-hex assertion would brick boot if Cloudflare ever widens the format.
+    errors.push(
+      'R2_ACCOUNT_ID must be 8-64 characters of [A-Za-z0-9_-] (the Cloudflare account id).',
+    );
+  }
+
+  const bucket = str(raw, 'R2_BUCKET');
+  if (
+    bucket !== undefined &&
+    !/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(bucket)
+  ) {
+    errors.push(
+      'R2_BUCKET must be a valid bucket name (lowercase letters, digits and hyphens; 3-63 chars).',
+    );
+  }
+
+  const publicBase = str(raw, 'R2_PUBLIC_BASE_URL');
+  if (publicBase !== undefined) {
+    let parsed: URL | undefined;
+    try {
+      parsed = new URL(publicBase);
+    } catch {
+      errors.push('R2_PUBLIC_BASE_URL must be a valid absolute URL.');
+    }
+    if (parsed) {
+      // This is what makes AC-B15 a BOOT-TIME guarantee rather than a runtime hope:
+      // profilePictureUrl is https-only and is rendered straight into an <img src> by the SPA.
+      if (parsed.protocol !== 'https:') {
+        errors.push('R2_PUBLIC_BASE_URL must use https.');
+      }
+      if (parsed.search || parsed.hash) {
+        errors.push(
+          'R2_PUBLIC_BASE_URL must not carry a query string or hash.',
+        );
+      }
+      if (publicBase.endsWith('/')) {
+        errors.push('R2_PUBLIC_BASE_URL must not end with a trailing slash.');
+      }
+    }
+  }
+}
+
 export function validateEnv(
   raw: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -129,6 +220,9 @@ export function validateEnv(
       errors.push('SESSION_TTL_SECONDS must be a positive integer.');
     }
   }
+
+  // 5. Cloudflare R2 (staff avatars) — production-required, format-checked, all-or-nothing.
+  validateR2(raw, errors);
 
   if (errors.length > 0) {
     throw new Error(
