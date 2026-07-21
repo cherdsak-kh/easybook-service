@@ -32,7 +32,10 @@
     "prepare": "node -e \"try{require('child_process').execSync('husky',{stdio:'inherit'})}catch(e){}\""
   },
   "lint-staged": {
-    "*.ts": "eslint --fix"
+    "*.ts": [
+      "eslint --fix",
+      "jest --findRelatedTests --passWithNoTests"
+    ]
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1088.0",
