@@ -22,11 +22,15 @@ enum RichMenuType {
 /// Whether a user may use the EasyBook app.
 /// `UNREGISTERED` is the "zero" state a fresh follower lands on (before submitting the
 /// registration form); it is deliberately the first value and the default on LineUser.
+/// `REJECTED` (appended 2026-07-25) = "reviewed and sent back — fix the registration and
+/// resubmit". Distinct from PENDING (fresh, un-reviewed) and BLOCKED (terminal, punitive).
+/// Reachable ONLY via the operator Reject action; carries a mandatory `LineUser.rejectionReason`.
 enum AppAccess {
   UNREGISTERED
   PENDING
   ALLOWED
   BLOCKED
+  REJECTED
 }
 
 /// A LINE user, created when they add the Official Account as a friend.
@@ -40,6 +44,14 @@ model LineUser {
   language      String?
   richMenuType  RichMenuType @default(TYPE_1)
   access        AppAccess    @default(UNREGISTERED)
+
+  /// Operator-authored revision reason, set on an admin Reject and pushed to the user on LINE.
+  /// INVARIANT: non-null IFF `access === REJECTED`. Cleared to null on EVERY transition to a
+  /// non-REJECTED state (approve, block, or a self-edit resubmit → PENDING). Nullable, no default
+  /// (null = "no active rejection"). Free text at the DB layer — the 500-char cap is a DTO input
+  /// control, not a column constraint. PDPA: may contain the user's PII; NEVER logged.
+  rejectionReason String?
+
   followedAt    DateTime     @default(now())
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt

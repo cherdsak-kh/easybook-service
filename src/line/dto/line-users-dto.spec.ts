@@ -96,6 +96,51 @@ describe('UpdateLineUserAccessDto (through the global ValidationPipe)', () => {
     const messages = await messagesOf({ access: AppAccess.ALLOWED, note: 'x' });
     expect(messages.join(' ')).toContain('property note should not exist');
   });
+
+  // ───────── reason (Reject) — DTO enforces type + max length; required-when-REJECTED is a service rule ─────────
+
+  it('accepts an absent reason with a valid access (reason is optional at the transport layer)', async () => {
+    await expect(validate({ access: AppAccess.ALLOWED })).resolves.toEqual({
+      access: AppAccess.ALLOWED,
+    });
+  });
+
+  it('trims a valid reason via @Transform (leading/trailing whitespace stripped)', async () => {
+    await expect(
+      validate({ access: AppAccess.REJECTED, reason: '  need to fix phone  ' }),
+    ).resolves.toMatchObject({
+      access: AppAccess.REJECTED,
+      reason: 'need to fix phone',
+    });
+  });
+
+  it('accepts a reason of exactly 500 chars but rejects 501 (boundary)', async () => {
+    await expect(
+      validate({ access: AppAccess.REJECTED, reason: 'a'.repeat(500) }),
+    ).resolves.toMatchObject({ reason: 'a'.repeat(500) });
+
+    const messages = await messagesOf({
+      access: AppAccess.REJECTED,
+      reason: 'a'.repeat(501),
+    });
+    expect(messages.join(' ')).toMatch(/reason/);
+  });
+
+  it('rejects a non-string reason (@IsString)', async () => {
+    const messages = await messagesOf({
+      access: AppAccess.REJECTED,
+      reason: 5,
+    });
+    expect(messages.join(' ')).toMatch(/reason/);
+  });
+
+  it('does NOT 400 a REJECTED body missing a reason — the required-when-REJECTED rule is a SERVICE concern', async () => {
+    // The DTO stays permissive (reason is optional at the transport boundary); the service enforces
+    // the mandatory-reason rule for REJECTED. So the pipe must accept a REJECTED body with no reason.
+    await expect(
+      validate({ access: AppAccess.REJECTED }),
+    ).resolves.toMatchObject({ access: AppAccess.REJECTED });
+  });
 });
 
 describe('CreateLineUserRegistrationDto (through the global ValidationPipe)', () => {

@@ -7,8 +7,8 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { Prisma, SystemRole } from '@prisma/client';
-import type { AppAccess, LineUser, RichMenuType } from '@prisma/client';
+import { AppAccess, Prisma, SystemRole } from '@prisma/client';
+import type { LineUser, RichMenuType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { canAdminSetAccess } from './line-access.policy';
 import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
@@ -23,6 +23,7 @@ import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registrati
 import { LineService } from './line.service';
 import {
   ALREADY_REGISTERED,
+  CANNOT_REJECT_UNREGISTERED,
   INVALID_DEPARTMENT,
   INVALID_PERSONNEL_ROLE,
   LINE_RICH_MENU_APPLY_FAILED,
@@ -30,6 +31,7 @@ import {
   LINE_USER_NOT_FOUND,
   LINE_USER_REGISTRATION_NOT_FOUND,
   REGISTRATION_NOT_EDITABLE,
+  REJECTION_REASON_REQUIRED,
   STAFF_ID_TAKEN,
 } from './line-users.errors';
 import { RICH_MENU_SPECS } from './rich-menu.constants';
@@ -64,6 +66,11 @@ export const ACCESS_NOTIFICATION_MESSAGES: Record<AppAccess, string | null> = {
     'ยินดีด้วย! บัญชีของคุณได้รับการอนุมัติการใช้งานเรียบร้อยแล้ว คุณสามารถกดปุ่มจองคิวที่เมนูด้านล่างเพื่อทำรายการได้ทันทีครับ 🎉',
   BLOCKED:
     'ขออภัย บัญชีการใช้งานของคุณถูกระงับสิทธิ์ชั่วคราวโดยผู้ดูแลระบบ หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่สถาบัน',
+  // The reject copy is built in `notifyRejection` (it interpolates the mandatory reason), NOT here —
+  // so this entry is `null` ("notifyAccessChange sends nothing for REJECTED"). Keeping the reject
+  // copy out of this record is deliberate: this record is register()'s single source for the PENDING
+  // ack and must not be overwritten or repurposed.
+  REJECTED: null,
 };
 
 /**
@@ -239,6 +246,35 @@ export class LineUserService {
   }
 
   /**
+   * Best-effort LINE push for a Reject (→REJECTED). NEVER throws (same fail-soft discipline as
+   * `notifyAccessChange`): a push failure is logged at `warn` and swallowed — the reject write already
+   * committed. The reject copy is built HERE, deliberately NOT added to `ACCESS_NOTIFICATION_MESSAGES`:
+   * that record is `register()`'s single source for the PENDING ack and must not be overwritten or the
+   * ack regresses. `reason` is always present (mandatory, guarded in `updateAccess`).
+   * PII: the reason is NEVER logged (log lines stay lineUserId=/access= only, matching notifyAccessChange).
+   *
+   * @param lineUserId the LINE-side `U…` identifier (`LineUser.lineUserId`), NOT the cuid `LineUser.id`.
+   */
+  private async notifyRejection(
+    lineUserId: string,
+    reason: string,
+  ): Promise<void> {
+    const text =
+      `ขออภัย การลงทะเบียนของคุณไม่ผ่านการอนุมัติ เนื่องจาก: ${reason} ` +
+      `กรุณาเปิดแอปพลิเคชันเพื่อแก้ไขข้อมูลใหม่อีกครั้ง`;
+    try {
+      await this.line.push(lineUserId, [{ type: 'text', text }]);
+    } catch (error) {
+      // PII discipline: never log the reason — only the LINE id + target access.
+      this.logger.warn(
+        `Best-effort reject push failed (status change already persisted). lineUserId=${lineUserId} access=REJECTED: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
    * The combined, non-deleted option lists for the registration form (SC-3.1). One read per table,
    * each `name ASC`. Ids + names only — no PII, no timestamps.
    *
@@ -372,21 +408,28 @@ export class LineUserService {
       // so a push failure can never roll back the committed registration/access change.
       await this.notifyAccessChange(lineUserId, access);
 
-      return this.toStatusDto(access, registration);
+      // A fresh registration is never REJECTED — no reason to surface.
+      return this.toStatusDto(access, registration, null);
     } catch (error) {
       throw this.mapRegistrationWriteError(error);
     }
   }
 
   /**
-   * A PENDING user's self-edit of their own registration (SC-3.3). Identity is the verified `sub`;
-   * there is no cross-user write.
+   * A user's self-edit of their own registration (SC-3.3). Identity is the verified `sub`; there is
+   * no cross-user write.
    *
-   * State gate (SC-B9): permitted ONLY while `access === 'PENDING'`. `ALLOWED`/`BLOCKED`/
-   * `UNREGISTERED` → `403` (authorization-by-state), deterministic with no partial write — distinct
-   * from register's duplicate-resource `409`. Options are re-validated non-deleted (`400`); a
-   * `staffId` collision with ANOTHER registration → `409` (re-submitting the caller's own value is a
-   * no-op). `access` stays `PENDING`, `richMenuType` stays `TYPE_1`, and there is NO LINE push (Q6).
+   * State gate (SC-B9): permitted ONLY while `access ∈ {PENDING, REJECTED}`. `ALLOWED`/`BLOCKED`/
+   * `UNREGISTERED`/no-row → `403` (authorization-by-state), deterministic with no partial write —
+   * distinct from register's duplicate-resource `409`. Options are re-validated non-deleted (`400`);
+   * a `staffId` collision with ANOTHER registration → `409` (re-submitting the caller's own value is
+   * a no-op). `richMenuType` stays `TYPE_1` (both PENDING and REJECTED derive TYPE_1).
+   *
+   * A REJECTED caller who resubmits RE-ENTERS review: in the SAME transaction the access flips
+   * `REJECTED → PENDING` and `rejectionReason` is cleared to null (invariant), and the existing
+   * PENDING ack push is sent AFTER the commit (fail-soft). A PENDING caller's edit is unchanged — no
+   * `LineUser` write, no push, `access` stays PENDING (Q6). Both paths return `access: PENDING`,
+   * `rejectionReason: null`.
    */
   async updateRegistration(
     lineUserId: string,
@@ -397,36 +440,64 @@ export class LineUserService {
       select: { id: true, access: true },
     });
 
-    // No row, or any non-PENDING state, is a 403 (authorization-by-state). A LIFF-first caller who
-    // never registered is UNREGISTERED → also 403 (nothing to edit), never a partial write.
-    if (!user || user.access !== 'PENDING') {
+    // No row, or any state other than PENDING/REJECTED, is a 403 (authorization-by-state). A
+    // LIFF-first caller who never registered is UNREGISTERED → also 403 (nothing to edit); an
+    // ALLOWED/BLOCKED caller cannot edit. A REJECTED caller MAY resubmit (re-enters review).
+    if (
+      !user ||
+      (user.access !== AppAccess.PENDING && user.access !== AppAccess.REJECTED)
+    ) {
       throw new ForbiddenException(REGISTRATION_NOT_EDITABLE);
     }
 
-    await this.assertActiveOptions(
-      this.prisma,
-      dto.departmentId,
-      dto.personnelRoleId,
-    );
+    const wasRejected = user.access === AppAccess.REJECTED;
 
     try {
-      const updated = await this.prisma.lineUserRegistration.update({
-        where: { lineUserId: user.id },
-        data: {
-          firstName: dto.firstName,
-          lastName: dto.lastName,
-          staffId: dto.staffId,
-          phone: dto.phone,
-          departmentId: dto.departmentId,
-          personnelRoleId: dto.personnelRoleId,
-        },
-        select: REGISTRATION_OWNER_SELECT,
+      // One transaction so a partial write can't leave `access: REJECTED` with an already-edited
+      // registration (or vice versa). Options are re-validated non-deleted/non-reserved (400) first,
+      // mirroring register()'s shape. A REJECTED resubmit ALSO flips access → PENDING and clears the
+      // reason in the SAME transaction (invariant); the PENDING-caller path performs no lineUser write.
+      const updated = await this.prisma.$transaction(async (tx) => {
+        await this.assertActiveOptions(
+          tx,
+          dto.departmentId,
+          dto.personnelRoleId,
+        );
+
+        const registration = await tx.lineUserRegistration.update({
+          where: { lineUserId: user.id },
+          data: {
+            firstName: dto.firstName,
+            lastName: dto.lastName,
+            staffId: dto.staffId,
+            phone: dto.phone,
+            departmentId: dto.departmentId,
+            personnelRoleId: dto.personnelRoleId,
+          },
+          select: REGISTRATION_OWNER_SELECT,
+        });
+
+        if (wasRejected) {
+          await tx.lineUser.update({
+            where: { id: user.id },
+            data: { access: AppAccess.PENDING, rejectionReason: null },
+          });
+        }
+
+        return registration;
       });
 
       this.logger.log(`LineUser registration edited. id=${user.id}`);
 
-      // access stays PENDING, richMenuType untouched, no push (Q6).
-      return this.toStatusDto('PENDING', updated);
+      // A REJECTED resubmit re-enters review → send the existing PENDING ack, AFTER the transaction
+      // commits (fail-soft) so a push failure can't roll back the committed resubmit. A PENDING edit
+      // sends NO push (Q6). Pushed to the caller's verified U… id (the method param), never the cuid.
+      if (wasRejected) {
+        await this.notifyAccessChange(lineUserId, AppAccess.PENDING);
+      }
+
+      // Both paths land on PENDING with the reason cleared (REJECTED resubmit) or already null (edit).
+      return this.toStatusDto(AppAccess.PENDING, updated, null);
     } catch (error) {
       throw this.mapRegistrationWriteError(error);
     }
@@ -443,7 +514,9 @@ export class LineUserService {
       where: { lineUserId: user.id, deletedAt: null },
       select: REGISTRATION_OWNER_SELECT,
     });
-    return this.toStatusDto(user.access, registration);
+    // `rejectionReason` is non-null only when access === REJECTED (invariant) — pass it straight
+    // through so the LIFF RejectedScreen can render it.
+    return this.toStatusDto(user.access, registration, user.rejectionReason);
   }
 
   /**
@@ -512,11 +585,21 @@ export class LineUserService {
    * For a SOFT-DELETED user (only reachable by SUPER_ADMIN forcing an unfollowed account): the LINE
    * side is unreachable, so BOTH side-effects (menu apply + push) are SKIPPED — persist the DB row and
    * return 200, never a 502/500, idempotent on re-run.
+   *
+   * Reject (`access === REJECTED`, carrying `reason`): after the 404/403 precedence, TWO business
+   * guards fire for BOTH roles (they are invariant/business rules, so the SUPER_ADMIN policy bypass
+   * must NOT skip them) — (1) rejecting from UNREGISTERED is a 400 (nothing to reject), (2) a
+   * missing/blank reason is a 400. Ordering is deliberate: for ADMIN an illegal `→REJECTED` from
+   * UNREGISTERED is a 403 first (the policy returns false); for SUPER_ADMIN (which bypasses the 403)
+   * the same case is a 400 here. On success the write persists the trimmed `reason` and the reject
+   * push (`notifyRejection`) is sent instead of the ALLOWED/BLOCKED copy. The write ALSO enforces the
+   * invariant: any non-REJECTED target clears `rejectionReason` to null.
    */
   async updateAccess(
     id: string,
     access: AppAccess,
     role: SystemRole,
+    reason?: string,
   ): Promise<LineUserResponseDto> {
     const row = await this.prisma.lineUser.findUnique({
       where: { id },
@@ -536,10 +619,29 @@ export class LineUserService {
       throw new ForbiddenException(LINE_USER_ACCESS_TRANSITION_FORBIDDEN);
     }
 
+    // 4. Reject business guards — fire for BOTH roles (the SUPER_ADMIN policy bypass must NOT skip
+    // these) and BEFORE any write/push. UNREGISTERED-check first (nonsensical regardless of reason),
+    // then the mandatory-reason check. `reason` was already trimmed by the DTO @Transform; here we
+    // only test emptiness — do NOT re-trim (single normalization site).
+    if (access === AppAccess.REJECTED) {
+      if (row.access === AppAccess.UNREGISTERED) {
+        throw new BadRequestException(CANNOT_REJECT_UNREGISTERED);
+      }
+      if (!reason || reason.length === 0) {
+        throw new BadRequestException(REJECTION_REASON_REQUIRED);
+      }
+    }
+
     const richMenuType = accessToRichMenuType(access);
     const updated = await this.prisma.lineUser.update({
       where: { id: row.id },
-      data: { access, richMenuType },
+      data: {
+        access,
+        richMenuType,
+        // Invariant: set the guarded non-empty reason on REJECTED, clear it on every other target.
+        // `reason!` is safe — the guard above guarantees it is non-empty when access === REJECTED.
+        rejectionReason: access === AppAccess.REJECTED ? reason! : null,
+      },
       select: LINE_USER_PUBLIC_FIELDS,
     });
 
@@ -574,8 +676,14 @@ export class LineUserService {
 
     // Best-effort notification, only after BOTH the DB write and the rich-menu apply succeeded.
     // Pushed to the LINE-side U… id (updated.lineUserId), never the cuid. A push failure here does
-    // not undo the access change or the linked menu, and must not fail the request.
-    await this.notifyAccessChange(updated.lineUserId, access);
+    // not undo the access change or the linked menu, and must not fail the request. A Reject uses the
+    // separate `notifyRejection` builder (it interpolates the mandatory reason); every other target
+    // uses the shared `ACCESS_NOTIFICATION_MESSAGES` copy via `notifyAccessChange`.
+    if (access === AppAccess.REJECTED) {
+      await this.notifyRejection(updated.lineUserId, reason!);
+    } else {
+      await this.notifyAccessChange(updated.lineUserId, access);
+    }
 
     return this.toDto(updated);
   }
@@ -721,12 +829,14 @@ export class LineUserService {
   private toStatusDto(
     access: AppAccess,
     registration: OwnerRegistration | null,
+    rejectionReason: string | null,
   ): LineUserStatusResponseDto {
     return {
       access,
       registration: registration
         ? this.toRegistrationResponseDto(registration)
         : null,
+      rejectionReason,
     };
   }
 
