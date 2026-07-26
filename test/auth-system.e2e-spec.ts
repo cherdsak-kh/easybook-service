@@ -370,6 +370,12 @@ describe('Auth — /auth/system (e2e)', () => {
       expect(Object.keys(res.body as object).sort()).toEqual(
         [
           'createdAt',
+          // Audit provenance — a nested { id, firstName, lastName } or null. Present for STAFF too:
+          // the Profile page hides the Audit Trail card from them, but the BODY is the contract and
+          // is uniform across roles. Making the select role-conditional would put a role branch
+          // into SessionGuard's select, which is a far worse trade.
+          'createdBy',
+          'updatedAt',
           'department', // now an embedded { id, name }, not free text
           'email',
           'firstName',
@@ -385,6 +391,23 @@ describe('Auth — /auth/system (e2e)', () => {
           'role',
         ].sort(),
       );
+
+      const body = res.body as {
+        createdBy: Record<string, unknown> | null;
+        updatedAt: string;
+      };
+      // `createdBy` is null ONLY for the seeded first SUPER_ADMIN; otherwise it is exactly three
+      // keys — no `email` (a phishing surface) and no `role` (reconnaissance).
+      if (body.createdBy !== null) {
+        expect(Object.keys(body.createdBy).sort()).toEqual([
+          'firstName',
+          'id',
+          'lastName',
+        ]);
+      }
+      // `updatedAt` is NOT NULL in the schema and Prisma populates it on create as well as update.
+      expect(typeof body.updatedAt).toBe('string');
+      expect(new Date(body.updatedAt).toISOString()).toBe(body.updatedAt);
     });
 
     it('AC-B10 — /me exposes mustChangePassword, and embeds both options as { id, name }', async () => {

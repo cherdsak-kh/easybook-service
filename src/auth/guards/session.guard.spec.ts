@@ -29,6 +29,10 @@ const dbRow = {
   lastLoginAt: null,
   lineUserId: null,
   createdAt: new Date('2026-07-01T00:00:00.000Z'),
+  // Both keys ride along in PUBLIC_FIELDS, so the guard selects them and they must be present here
+  // for the AC-32 key-equality assertion below to stay meaningful rather than start failing.
+  createdBy: { id: 'sa-0', firstName: 'Seed', lastName: 'Admin' },
+  updatedAt: new Date('2026-07-02T00:00:00.000Z'),
   deletedAt: null,
 };
 
@@ -113,6 +117,15 @@ describe('SessionGuard', () => {
       Object.keys(PUBLIC_FIELDS).sort(),
     );
     expect('deletedAt' in req.systemUser!).toBe(false);
+  });
+
+  it('the nested createdBy the guard attaches carries no deletedAt either (AC-32)', () => {
+    // `deletedAt` is destructured off the OUTER row only. The creator select is what keeps it from
+    // sneaking back in one level down and reaching `GET /auth/system/me`'s body.
+    expect(Object.keys(PUBLIC_FIELDS.createdBy.select)).not.toContain(
+      'deletedAt',
+    );
+    expect(Object.keys(PUBLIC_FIELDS.createdBy.select)).not.toContain('email');
   });
 
   it.each([

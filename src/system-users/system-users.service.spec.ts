@@ -39,6 +39,10 @@ const row = {
   lastLoginAt: null,
   lineUserId: null,
   createdAt: new Date('2026-07-01T00:00:00.000Z'),
+  // `PUBLIC_FIELDS` resolves the creator through the FK with NO `deletedAt` filter (DD-4), so the
+  // fixture is a plain nested object. Without `updatedAt`, `toSystemUserDto` would `TypeError`.
+  createdBy: { id: 'sa-0', firstName: 'Seed', lastName: 'Admin' },
+  updatedAt: new Date('2026-07-02T00:00:00.000Z'),
 };
 
 interface TxOptions {
@@ -516,6 +520,103 @@ describe('SystemUsersService', () => {
         service.update(ADMIN_ACTOR, 'ad-2', { firstName: 'X' }),
       ).rejects.toThrow(ForbiddenException);
       expect(txUpdate).not.toHaveBeenCalled();
+    });
+
+    // ─── SELF-PROFILE-2: an ADMIN self-patch now REACHES assertOptionsAssignable ───
+    //
+    // Before the canPatch amendment the 403 fired first, so this whole path was unreachable for an
+    // ADMIN on their own row. It is reachable for the first time, and the existence-oracle rule
+    // must hold on it exactly as it does on a STAFF target.
+
+    describe('an ADMIN patching their OWN row (SELF-PROFILE-2)', () => {
+      beforeEach(() => {
+        // The actor IS the target: same id, and their row is (necessarily) an ADMIN.
+        txFindFirst.mockResolvedValue({
+          id: ADMIN_ACTOR.id,
+          role: SystemRole.ADMIN,
+        });
+      });
+
+      it('T10 — a system-reserved departmentId is a 400 identical to an unknown id, never a 403', async () => {
+        txDepartmentFindFirst.mockResolvedValue(null); // reserved and unknown both miss this WHERE
+
+        const error = await captureHttpError(
+          service.update(ADMIN_ACTOR, ADMIN_ACTOR.id, { departmentId: 99 }),
+        );
+
+        expect(error).toEqual({ status: 400, message: INVALID_DEPARTMENT });
+        expect(error.status).not.toBe(403);
+        // The predicate is still computed from the ACTOR's role — self-targeting grants nothing.
+        expect(txDepartmentFindFirst).toHaveBeenCalledWith({
+          where: { id: 99, deletedAt: null, isSystemReserved: false },
+          select: { id: true },
+        });
+        expect(txUpdate).not.toHaveBeenCalled();
+      });
+
+      it('T10 — that 400 is BYTE-IDENTICAL to the one for a nonexistent departmentId', async () => {
+        txDepartmentFindFirst.mockResolvedValue(null);
+
+        const reserved = await captureHttpError(
+          service.update(ADMIN_ACTOR, ADMIN_ACTOR.id, { departmentId: 99 }),
+        );
+        const unknown = await captureHttpError(
+          service.update(ADMIN_ACTOR, ADMIN_ACTOR.id, { departmentId: 12345 }),
+        );
+
+        expect(reserved).toEqual(unknown);
+      });
+
+      it('T11 — a system-reserved personnelRoleId is likewise a 400, never a 403', async () => {
+        txDepartmentFindFirst.mockResolvedValue({ id: 7 });
+        txPersonnelRoleFindFirst.mockResolvedValue(null);
+
+        const error = await captureHttpError(
+          service.update(ADMIN_ACTOR, ADMIN_ACTOR.id, { personnelRoleId: 99 }),
+        );
+
+        expect(error).toEqual({ status: 400, message: INVALID_PERSONNEL_ROLE });
+        expect(error.status).not.toBe(403);
+        expect(txPersonnelRoleFindFirst).toHaveBeenCalledWith({
+          where: { id: 99, deletedAt: null, isSystemReserved: false },
+          select: { id: true },
+        });
+        expect(txUpdate).not.toHaveBeenCalled();
+      });
+
+      it('T12 — an ACTIVE, non-reserved departmentId is written, selected through PUBLIC_FIELDS', async () => {
+        txDepartmentFindFirst.mockResolvedValue({ id: 7 });
+
+        await service.update(ADMIN_ACTOR, ADMIN_ACTOR.id, { departmentId: 7 });
+
+        const { where, data, select } = writeArgsOf(txUpdate);
+        expect(where).toEqual({ id: ADMIN_ACTOR.id });
+        expect(data.departmentId).toBe(7);
+        expect(select).toBe(PUBLIC_FIELDS);
+      });
+
+      it('T12 — a self-patch cannot touch the invariant: default isolation, no count', async () => {
+        // Step 5 makes `role`/`isActive` unreachable on a self-target, so `touchesInvariant` is
+        // provably false here and Serializable would be pure cost.
+        txPersonnelRoleFindFirst.mockResolvedValue({ id: 9 });
+
+        await service.update(ADMIN_ACTOR, ADMIN_ACTOR.id, {
+          personnelRoleId: 9,
+        });
+
+        expect(txOptionsOf()).toBeUndefined();
+        expect(txCount).not.toHaveBeenCalled();
+      });
+
+      it('still 403s the same ADMIN on a DIFFERENT ADMIN row, before any option lookup', async () => {
+        txFindFirst.mockResolvedValue({ id: 'ad-2', role: SystemRole.ADMIN });
+
+        await expect(
+          service.update(ADMIN_ACTOR, 'ad-2', { departmentId: 7 }),
+        ).rejects.toThrow(ForbiddenException);
+        expect(txDepartmentFindFirst).not.toHaveBeenCalled();
+        expect(txUpdate).not.toHaveBeenCalled();
+      });
     });
 
     it('builds `data` field by field — exactly the eight DTO fields, never a spread (DD-13, AC-60)', async () => {

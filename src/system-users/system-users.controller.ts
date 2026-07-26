@@ -169,7 +169,7 @@ export class SystemUsersController {
   @ApiOperation({
     summary: 'Update a back-office user.',
     description:
-      'Never the password and never the email. `role` is SUPER_ADMIN-write-only and is rejected on key presence, so an ADMIN sending any valid role value gets 403. Nobody may change their own `role` or `isActive`. An empty body is a 400.',
+      'Never the password and never the email. `role` is SUPER_ADMIN-write-only and is rejected on key presence, so an ADMIN sending any valid role value gets 403. Nobody may change their own `role` or `isActive`. An ADMIN may patch their OWN row (department, position and profile fields); their own `role` and `isActive` remain 403, as for everyone, and a different ADMIN or a SUPER_ADMIN is still 403. An unknown OR system-reserved `departmentId`/`personnelRoleId` is the same 400 in both cases — never a 403. An empty body is a 400.',
   })
   @ApiHeader({ name: 'x-csrf-token', required: true })
   @ApiOkResponse({ description: 'Updated.', type: SystemUserResponseDto })

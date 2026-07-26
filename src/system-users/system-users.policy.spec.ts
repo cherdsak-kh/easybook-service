@@ -218,14 +218,125 @@ describe('system-users.policy', () => {
       ).toEqual({ allowed: true });
     });
 
-    it('an ADMIN may NOT patch their own profile — their target is an ADMIN (SELF-PROFILE-1)', () => {
+    // INVERTED on 2026-07-26 (SELF-PROFILE-2, 02_design_log.md §1.8). This test previously asserted
+    // `{ allowed: false, reason: ADMIN_MAY_ONLY_MODIFY_STAFF }` under the name "an ADMIN may NOT
+    // patch their own profile — their target is an ADMIN (SELF-PROFILE-1)". That 403 was collateral:
+    // the ADMIN rule exists to stop ADMIN -> ADMIN LATERAL edits, and catching the actor's own row
+    // was never its purpose. The PO approved the exception, which also removes an asymmetry with
+    // SUPER_ADMIN (whose self-patch has always been allowed — see the test directly above).
+    it('an ADMIN MAY patch their own profile-only fields (T1, SELF-PROFILE-2)', () => {
       expect(
         canPatch(
           actor(SystemRole.ADMIN, SELF),
           target(SystemRole.ADMIN, SELF),
           PROFILE_ONLY,
         ),
+      ).toEqual({ allowed: true });
+    });
+
+    it('T2 — an ADMIN patching their OWN role is still 403, for every enum value', () => {
+      for (const value of ROLES) {
+        expect(
+          canPatch(
+            actor(SystemRole.ADMIN, SELF),
+            target(SystemRole.ADMIN, SELF),
+            {
+              role: value,
+            },
+          ),
+        ).toEqual({ allowed: false, reason: CANNOT_CHANGE_OWN_ROLE });
+      }
+    });
+
+    it('T3 — an ADMIN patching their OWN isActive is still 403, true or false', () => {
+      for (const value of [true, false]) {
+        expect(
+          canPatch(
+            actor(SystemRole.ADMIN, SELF),
+            target(SystemRole.ADMIN, SELF),
+            {
+              isActive: value,
+            },
+          ),
+        ).toEqual({
+          allowed: false,
+          reason: CANNOT_CHANGE_OWN_ACTIVE_STATUS,
+        });
+      }
+    });
+
+    it('T9 — role is checked before isActive on an ADMIN self-patch carrying both (step 5 ordering)', () => {
+      // Pins that the exception did NOT move the self-mutation rules: step 5 still returns first,
+      // so step 6's new disjunct is unreachable for a patch carrying either key, and the reason
+      // string the frontend/e2e assert on is unchanged.
+      expect(
+        canPatch(
+          actor(SystemRole.ADMIN, SELF),
+          target(SystemRole.ADMIN, SELF),
+          {
+            role: SystemRole.SUPER_ADMIN,
+            isActive: false,
+          },
+        ),
+      ).toEqual({ allowed: false, reason: CANNOT_CHANGE_OWN_ROLE });
+    });
+
+    // ─── THE invariant a future refactor is most likely to break: no ADMIN -> ADMIN widening ───
+
+    it('T4 — an ADMIN may NOT patch a DIFFERENT ADMIN: the disjunct is id equality, not role equality', () => {
+      expect(
+        canPatch(
+          actor(SystemRole.ADMIN, 'a'),
+          target(SystemRole.ADMIN, 'b'),
+          PROFILE_ONLY,
+        ),
       ).toEqual({ allowed: false, reason: ADMIN_MAY_ONLY_MODIFY_STAFF });
+    });
+
+    it('T5 — an ADMIN may NOT patch a SUPER_ADMIN, self-exception or not', () => {
+      expect(
+        canPatch(
+          actor(SystemRole.ADMIN, 'a'),
+          target(SystemRole.SUPER_ADMIN, 'b'),
+          PROFILE_ONLY,
+        ),
+      ).toEqual({ allowed: false, reason: ADMIN_MAY_ONLY_MODIFY_STAFF });
+    });
+
+    it('T6 — regression: an ADMIN may still patch a STAFF target, isActive included', () => {
+      for (const patch of [PROFILE_ONLY, { isActive: false }]) {
+        expect(
+          canPatch(
+            actor(SystemRole.ADMIN, 'a'),
+            target(SystemRole.STAFF, 'b'),
+            patch,
+          ),
+        ).toEqual({ allowed: true });
+      }
+    });
+
+    it('T7 — regression: a SUPER_ADMIN self-patch is unchanged by the ADMIN exception', () => {
+      expect(
+        canPatch(
+          actor(SystemRole.SUPER_ADMIN, SELF),
+          target(SystemRole.SUPER_ADMIN, SELF),
+          PROFILE_ONLY,
+        ),
+      ).toEqual({ allowed: true });
+    });
+
+    it('T8 — a STAFF actor on their OWN id is still INSUFFICIENT_ROLE (the default: arm keeps its net)', () => {
+      // The whole reason the exception is scoped INSIDE `case ADMIN` rather than hoisted above the
+      // switch. If it were hoisted, a future @Roles(...) widening to STAFF would silently grant
+      // STAFF self-assignment of departmentId/personnelRoleId, and the defence-in-depth arm that
+      // exists to catch that widening would never run.
+      expect(
+        canPatch(
+          actor(SystemRole.STAFF, SELF),
+          target(SystemRole.STAFF, SELF),
+          PROFILE_ONLY,
+        ),
+      ).toEqual({ allowed: false, reason: INSUFFICIENT_ROLE });
     });
 
     it('"own row" means equal ids — a same-role different-id target is not self', () => {

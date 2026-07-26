@@ -223,6 +223,61 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       expect(JSON.stringify(deleted.body)).not.toContain('deletedAt');
     });
 
+    it('T19 — a SOFT-DELETED creator still resolves on GET /:id: createdById is HISTORY (DD-4)', async () => {
+      // The one test that would actually catch the failure mode this design warns about — resolving
+      // the creator with a second `findFirst({ id, deletedAt: null })`, which is the correct idiom
+      // everywhere else in this service and is WRONG here. The relation traversal must follow the
+      // FK unconditionally, so a deleted creator's name survives on every row they created.
+      const creator = await login(SUPER_2);
+      const email = `${PREFIX}has-creator@easybook.local`;
+      const created = await creator.agent
+        .post(url('/system-users'))
+        .set('x-csrf-token', creator.token)
+        .send({
+          email,
+          firstName: 'Has',
+          lastName: 'Creator',
+          ...(await ensureE2eOptions(prisma)),
+        })
+        .expect(201);
+      const createdId = (created.body as { id: string }).id;
+      expect((created.body as { createdBy: { id: string } }).createdBy.id).toBe(
+        ids[SUPER_2],
+      );
+
+      const sa = await login(SUPER);
+      await sa.agent
+        .delete(url(`/system-users/${ids[SUPER_2]}`))
+        .set('x-csrf-token', sa.token)
+        .expect(204);
+
+      const res = await sa.agent
+        .get(url(`/system-users/${createdId}`))
+        .expect(200);
+      expect((res.body as { createdBy: unknown }).createdBy).toEqual({
+        id: ids[SUPER_2],
+        firstName: 'E2E',
+        lastName: 'Super Two',
+      });
+      // The deleted creator's own row is gone from every identity read, yet its name still resolves
+      // as history above. Those two facts must hold simultaneously.
+      await sa.agent.get(url(`/system-users/${ids[SUPER_2]}`)).expect(404);
+      expect(JSON.stringify(res.body)).not.toContain('deletedAt');
+    });
+
+    it('T19 — createdBy is null for a row seeded outside the API (the first SUPER_ADMIN case)', async () => {
+      // The e2e fixtures are inserted directly, so `createdById` is null — the same shape as the
+      // seeded first SUPER_ADMIN, which is exactly why the DTO field is nullable.
+      const { agent } = await login(SUPER);
+      const res = await agent
+        .get(url(`/system-users/${ids[STAFF]}`))
+        .expect(200);
+      expect((res.body as { createdBy: unknown }).createdBy).toBeNull();
+      expect(typeof (res.body as { updatedAt: unknown }).updatedAt).toBe(
+        'string',
+      );
+    });
+
     it('AC-40 — a soft-deleted user disappears from data and from meta.total', async () => {
       const sa = await login(SUPER);
       const before = (
@@ -377,13 +432,81 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       }
     });
 
-    it('AC-43 — an ADMIN patching themself → 403 (their own target is an ADMIN)', async () => {
+    // INVERTED on 2026-07-26 (SELF-PROFILE-2, 02_design_log.md §1). This previously asserted 403
+    // under the name 'AC-43 — an ADMIN patching themself → 403 (their own target is an ADMIN)'.
+    // NOTE for whoever edits the fixtures: PATCH /system-users/:id is NOT exempt from the
+    // forced-reset gate, so `mustChangePassword: false` on the seed (see `seed()`) is what keeps
+    // these from being 403s for the wrong reason.
+    it('E1 — an ADMIN patches their OWN row → 200, and the new department is reflected', async () => {
+      const { agent, token } = await login(ADMIN);
+      const { departmentId } = await ensureE2eOptions(prisma);
+
+      const res = await agent
+        .patch(url(`/system-users/${ids[ADMIN]}`))
+        .set('x-csrf-token', token)
+        .send({ departmentId })
+        .expect(200);
+
+      expect((res.body as { department: { id: number } }).department.id).toBe(
+        departmentId,
+      );
+    });
+
+    it('E1 — that self-patch also covers the ordinary profile fields', async () => {
       const { agent, token } = await login(ADMIN);
       await agent
         .patch(url(`/system-users/${ids[ADMIN]}`))
         .set('x-csrf-token', token)
         .send({ firstName: 'Self Rename' })
+        .expect(200)
+        .expect((res) =>
+          expect(res.body).toMatchObject({ firstName: 'Self Rename' }),
+        );
+    });
+
+    it('E2 — an ADMIN patching their OWN role or isActive is STILL 403, with the self reasons', async () => {
+      const { agent, token } = await login(ADMIN);
+      const self = url(`/system-users/${ids[ADMIN]}`);
+
+      const active = await agent
+        .patch(self)
+        .set('x-csrf-token', token)
+        .send({ isActive: false })
         .expect(403);
+      expect((active.body as { message: string }).message).toBe(
+        'You cannot change your own active status.',
+      );
+
+      // Step 5 fires before the ADMIN branch, so the reason is the SELF one — not
+      // 'An ADMIN may only modify STAFF users.' The frontend and this suite both assert it.
+      const role = await agent
+        .patch(self)
+        .set('x-csrf-token', token)
+        .send({ role: SystemRole.SUPER_ADMIN })
+        .expect(403);
+      expect((role.body as { message: string }).message).toBe(
+        'You cannot change your own role.',
+      );
+
+      const row = await prisma.systemUser.findUnique({
+        where: { id: ids[ADMIN] },
+        select: { role: true, isActive: true },
+      });
+      expect(row).toEqual({ role: SystemRole.ADMIN, isActive: true });
+    });
+
+    it('E3 — the self-exception is id equality: an ADMIN patching ANOTHER ADMIN is still 403', async () => {
+      const { agent, token } = await login(ADMIN);
+      const { departmentId } = await ensureE2eOptions(prisma);
+
+      const res = await agent
+        .patch(url(`/system-users/${ids[ADMIN_2]}`))
+        .set('x-csrf-token', token)
+        .send({ departmentId })
+        .expect(403);
+      expect((res.body as { message: string }).message).toBe(
+        'An ADMIN may only modify STAFF users.',
+      );
     });
 
     it('AC-44 — an ADMIN sending any valid role value → 403, including a no-op role on a STAFF target', async () => {

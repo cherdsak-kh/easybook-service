@@ -1,5 +1,6 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiExtraModels, ApiProperty } from '@nestjs/swagger';
 import { SystemRole } from '@prisma/client';
+import { SystemUserCreatorDto } from './system-user-creator.dto';
 import { SystemUserOptionDto } from './system-user-option.dto';
 
 /**
@@ -8,6 +9,10 @@ import { SystemUserOptionDto } from './system-user-option.dto';
  * Neither the password digest nor `deletedAt` appears here, in any other DTO, in any `select`
  * that reaches a response, or in any log line (AC-5, AC-32).
  */
+// `@ApiExtraModels` pins `SystemUserCreatorDto` into the schema graph explicitly: a class reached
+// only through a NULLABLE property can otherwise drop out of `/docs-json`, and the frontend
+// generates `api-types.ts` from that document.
+@ApiExtraModels(SystemUserCreatorDto)
 export class SystemUserResponseDto {
   @ApiProperty({ example: 'clx1a2b3c4d5e6f7g8h9i0j1' })
   id!: string;
@@ -81,4 +86,25 @@ export class SystemUserResponseDto {
 
   @ApiProperty({ example: '2026-07-08T10:00:00.000Z' })
   createdAt!: string;
+
+  @ApiProperty({
+    type: SystemUserCreatorDto,
+    nullable: true,
+    readOnly: true,
+    description:
+      'Who created this account (audit provenance). Resolved WITHOUT a `deletedAt` filter, so a soft-deleted creator still resolves, forever. Null only for the seeded first SUPER_ADMIN. Carries no email and no role, deliberately.',
+  })
+  createdBy!: SystemUserCreatorDto | null;
+
+  // `format: date-time` is spelled out here per the design's contract delta. `createdAt` and
+  // `lastLoginAt` deliberately keep their existing annotations: this change is additive only, and
+  // editing an already-published property is out of its scope.
+  @ApiProperty({
+    type: String,
+    format: 'date-time',
+    readOnly: true,
+    example: '2026-07-26T20:42:00.000Z',
+    description: 'Last write to this row, in ISO 8601. Never null.',
+  })
+  updatedAt!: string;
 }
