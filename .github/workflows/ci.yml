@@ -51,7 +51,22 @@ jobs:
         # High/critical vulnerabilities fail CI outright. Do NOT change this to `audit fix
         # --force` in this workflow — that silently pulls in breaking major-version bumps.
         # A real finding here is a devops/backend-dev decision, not something CI auto-resolves.
-        run: npm audit --audit-level=high
+        #
+        # `--omit=dev` scopes the gate to the dependencies that actually SHIP. The Dockerfile's
+        # `runtime` target runs `npm prune --omit=dev` and copies only the pruned node_modules,
+        # so a devDependency-only advisory is not present in any deployed artifact — it can only
+        # ever affect a CI runner or a developer's machine at build/test time.
+        #
+        # Added 2026-07-26 for GHSA-mh99-v99m-4gvg (brace-expansion DoS). That advisory covers
+        # `<=5.0.7`; the only patched release, 5.0.8, changed its CommonJS export from a bare
+        # function to `{ expand, ... }`, which breaks `minimatch@3.x` (`var expand =
+        # require('brace-expansion')` → `TypeError: expand is not a function`). minimatch@3 is
+        # required by eslint, @eslint/eslintrc, @eslint/config-array, @nestjs/cli and glob@7, and
+        # forcing minimatch to 10.x breaks glob@7 the same way. So NO override can resolve it —
+        # verified with `npm ls brace-expansion --omit=dev --all` returning empty (zero
+        # production exposure). Revisit once eslint/glob move off the vulnerable line, and drop
+        # this flag if the toolchain ever pulls a fixed brace-expansion on its own.
+        run: npm audit --audit-level=high --omit=dev
 
   build-and-push:
     name: Build & push image to GHCR (SHA tag)
