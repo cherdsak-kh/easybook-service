@@ -88,12 +88,17 @@ export class LineUsersController {
   @Patch(':id')
   @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN)
   @ApiOperation({
-    summary: 'Approve or block a LINE user (update `access`).',
+    summary: 'Approve, block, or reject a LINE user (update `access`).',
     description:
-      'Sets `access` (Approve → ALLOWED, Block → BLOCKED). Returns the updated row. ADMIN is bound by the transition matrix (may only reach ALLOWED/BLOCKED, and not from UNREGISTERED); SUPER_ADMIN may set any state and may target soft-deleted rows. An empty body, a bad enum value, or any extra key is a 400.',
+      'Sets `access` (Approve → ALLOWED, Block → BLOCKED, Reject → REJECTED). Returns the updated row. ADMIN is bound by the transition matrix (may only reach ALLOWED/BLOCKED/REJECTED, and not from UNREGISTERED); SUPER_ADMIN may set any state and may target soft-deleted rows. Rejecting REQUIRES a non-empty `reason` (pushed to the user and shown in the LIFF app): a missing/blank reason, or a reject from UNREGISTERED (SUPER_ADMIN reach), is a 400. An empty body, a bad enum value, an over-500-char `reason`, or any extra key is a 400.',
   })
   @ApiHeader({ name: 'x-csrf-token', required: true })
   @ApiOkResponse({ description: 'Updated.', type: LineUserResponseDto })
+  @ApiBadRequestResponse({
+    description:
+      'An empty body, a bad enum value, a non-string or over-500-char `reason`, an extra key; a REJECTED request with a missing/blank `reason`; or a REJECTED request from UNREGISTERED (SUPER_ADMIN reach).',
+    type: ErrorResponseDto,
+  })
   @ApiUnauthorizedResponse({
     description: 'No session.',
     type: ErrorResponseDto,
@@ -117,7 +122,7 @@ export class LineUsersController {
     @Body() dto: UpdateLineUserAccessDto,
     @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<LineUserResponseDto> {
-    return this.users.updateAccess(id, dto.access, user.role);
+    return this.users.updateAccess(id, dto.access, user.role, dto.reason);
   }
 
   // Two path segments (`:id/registration`) — cannot collide with the single-segment admin `:id` or

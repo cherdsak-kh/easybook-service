@@ -60,7 +60,7 @@ describe('LineUsersController', () => {
   });
 
   describe('PATCH /line-users/:id', () => {
-    it('passes the id, the DTO `access`, and the actor role to the service and returns the updated row', async () => {
+    it('passes the id, the DTO `access`, the actor role, and `reason` to the service and returns the updated row', async () => {
       const dto = { access: AppAccess.ALLOWED };
       const updated = { id: 'lu-1', access: AppAccess.ALLOWED };
       users.updateAccess.mockResolvedValue(updated);
@@ -72,12 +72,28 @@ describe('LineUsersController', () => {
       );
 
       // The actor's session role (not any body field) governs the transition matrix in the service.
+      // The 4th arg is `dto.reason` — undefined here (no reject reason on an Approve).
       expect(users.updateAccess).toHaveBeenCalledWith(
         'lu-1',
         AppAccess.ALLOWED,
         SystemRole.ADMIN,
+        undefined,
       );
       expect(result).toBe(updated);
+    });
+
+    it('forwards the reject `reason` as the 4th arg on a REJECTED request', async () => {
+      const dto = { access: AppAccess.REJECTED, reason: 'phone is wrong' };
+      users.updateAccess.mockResolvedValue({ id: 'lu-1' });
+
+      await controller.updateAccess('lu-1', dto, actor(SystemRole.ADMIN));
+
+      expect(users.updateAccess).toHaveBeenCalledWith(
+        'lu-1',
+        AppAccess.REJECTED,
+        SystemRole.ADMIN,
+        'phone is wrong',
+      );
     });
 
     it('forwards SUPER_ADMIN as the role', async () => {
@@ -91,6 +107,7 @@ describe('LineUsersController', () => {
         'lu-1',
         AppAccess.UNREGISTERED,
         SystemRole.SUPER_ADMIN,
+        undefined,
       );
     });
 

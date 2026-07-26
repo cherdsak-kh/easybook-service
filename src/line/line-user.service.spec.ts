@@ -14,18 +14,21 @@ import { CreateLineUserRegistrationDto } from './dto/create-line-user-registrati
 import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
 import { LineService } from './line.service';
 import {
+  ACCESS_NOTIFICATION_MESSAGES,
   accessToRichMenuType,
   LINE_USER_PUBLIC_FIELDS,
   LineUserService,
 } from './line-user.service';
 import {
   ALREADY_REGISTERED,
+  CANNOT_REJECT_UNREGISTERED,
   INVALID_DEPARTMENT,
   INVALID_PERSONNEL_ROLE,
   LINE_USER_ACCESS_TRANSITION_FORBIDDEN,
   LINE_USER_NOT_FOUND,
   LINE_USER_REGISTRATION_NOT_FOUND,
   REGISTRATION_NOT_EDITABLE,
+  REJECTION_REASON_REQUIRED,
   STAFF_ID_TAKEN,
 } from './line-users.errors';
 
@@ -103,6 +106,11 @@ describe('LineUserService', () => {
     'ขออภัย บัญชีการใช้งานของคุณถูกระงับสิทธิ์ชั่วคราวโดยผู้ดูแลระบบ หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่สถาบัน';
   const PENDING_MSG =
     'ระบบได้รับข้อมูลการลงทะเบียนของคุณแล้ว เจ้าหน้าที่กำลังดำเนินการตรวจสอบข้อมูลกรุณารอสักครู่ครับ ⏳';
+
+  // The exact reject copy built by `notifyRejection` ({reason} interpolated).
+  const rejectMsg = (reason: string) =>
+    `ขออภัย การลงทะเบียนของคุณไม่ผ่านการอนุมัติ เนื่องจาก: ${reason} ` +
+    `กรุณาเปิดแอปพลิเคชันเพื่อแก้ไขข้อมูลใหม่อีกครั้ง`;
 
   const publicRow = {
     id: 'lu-1',
@@ -508,12 +516,21 @@ describe('LineUserService', () => {
     });
   });
 
-  // ───────────────────────── updateRegistration (PENDING self-edit) ─────────────────────────
+  // ───────────────────────── updateRegistration (PENDING/REJECTED self-edit) ─────────────────────────
 
   describe('updateRegistration', () => {
     const EDIT_DTO: UpdateLineUserRegistrationDto = { ...VALID_DTO };
 
+    // The self-edit now wraps assertActiveOptions + the registration update (+ the REJECTED→PENDING
+    // access flip) in one $transaction. The tx client IS the same set of delegate mocks, so all
+    // existing per-delegate assertions still hold.
+    const primeTx = () =>
+      $transaction.mockImplementation((cb: (client: unknown) => unknown) =>
+        cb({ lineUser, lineUserRegistration, department, personnelRole }),
+      );
+
     it('updates all fields for a PENDING caller, keeps PENDING, and sends NO push (SC-B8)', async () => {
+      primeTx();
       lineUser.findFirst.mockResolvedValue({
         id: 'lu-1',
         access: AppAccess.PENDING,
@@ -538,17 +555,78 @@ describe('LineUserService', () => {
         }),
       );
       expect(result.access).toBe(AppAccess.PENDING);
+      expect(result.rejectionReason).toBeNull();
       expect(result.registration).toMatchObject({
         staffId: '6412345678',
         department: 'Computer Science',
         personnelRole: 'Teacher',
       });
-      // No LINE push on a field-edit (Q6).
+      // A PENDING edit performs NO LineUser access write and NO push (Q6).
+      expect(lineUser.update).not.toHaveBeenCalled();
       expect(line.push).not.toHaveBeenCalled();
     });
 
+    it('a REJECTED caller resubmits: registration updated, access → PENDING, reason cleared, PENDING ack sent (AC-7)', async () => {
+      primeTx();
+      line.push.mockResolvedValue(undefined);
+      lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.REJECTED,
+      });
+      department.findFirst.mockResolvedValue({ id: 1 });
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
+      lineUserRegistration.update.mockResolvedValue(OWNER_REGISTRATION_ROW);
+      lineUser.update.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+      });
+
+      const result = await service.updateRegistration('U123', EDIT_DTO);
+
+      expect(lineUserRegistration.update).toHaveBeenCalled();
+      // access flipped REJECTED → PENDING and rejectionReason cleared, in the same flow.
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        data: { access: AppAccess.PENDING, rejectionReason: null },
+      });
+      // Returns the status DTO with PENDING + null reason (invariant holds after leaving REJECTED).
+      expect(result.access).toBe(AppAccess.PENDING);
+      expect(result.rejectionReason).toBeNull();
+      // The existing PENDING ack is pushed to the caller's verified U… id (not the cuid).
+      expect(line.push).toHaveBeenCalledWith('U123', [
+        { type: 'text', text: PENDING_MSG },
+      ]);
+    });
+
+    it('a REJECTED resubmit is fail-soft: still 200/PENDING when the PENDING ack push rejects (AC-7/AC-6)', async () => {
+      primeTx();
+      lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.REJECTED,
+      });
+      department.findFirst.mockResolvedValue({ id: 1 });
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
+      lineUserRegistration.update.mockResolvedValue(OWNER_REGISTRATION_ROW);
+      lineUser.update.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+      });
+      line.push.mockRejectedValue(new Error('user blocked the bot'));
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+
+      const result = await service.updateRegistration('U123', EDIT_DTO);
+
+      // The resubmit committed (access → PENDING) despite the push failure.
+      expect(result.access).toBe(AppAccess.PENDING);
+      expect(result.rejectionReason).toBeNull();
+      expect(lineUser.update).toHaveBeenCalled();
+      expect(warn).toHaveBeenCalled();
+    });
+
     it.each([AppAccess.ALLOWED, AppAccess.BLOCKED, AppAccess.UNREGISTERED])(
-      '403s a non-PENDING caller (%s) with no write (SC-B9)',
+      '403s a non-editable caller (%s) with no write (SC-B9) — REJECTED is NO LONGER in this set',
       async (access) => {
         lineUser.findFirst.mockResolvedValue({ id: 'lu-1', access });
 
@@ -558,6 +636,26 @@ describe('LineUserService', () => {
         expect(lineUserRegistration.update).not.toHaveBeenCalled();
       },
     );
+
+    it('does NOT 403 a REJECTED caller — REJECTED is now an editable (resubmit) state', async () => {
+      primeTx();
+      line.push.mockResolvedValue(undefined);
+      lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.REJECTED,
+      });
+      department.findFirst.mockResolvedValue({ id: 1 });
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
+      lineUserRegistration.update.mockResolvedValue(OWNER_REGISTRATION_ROW);
+      lineUser.update.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+      });
+
+      await expect(
+        service.updateRegistration('U123', EDIT_DTO),
+      ).resolves.toMatchObject({ access: AppAccess.PENDING });
+    });
 
     it('403s when the caller has no active LineUser row (SC-B9)', async () => {
       lineUser.findFirst.mockResolvedValue(null);
@@ -569,6 +667,7 @@ describe('LineUserService', () => {
     });
 
     it('rejects a deleted/unknown option id with 400 and no write (SC-B10)', async () => {
+      primeTx();
       lineUser.findFirst.mockResolvedValue({
         id: 'lu-1',
         access: AppAccess.PENDING,
@@ -583,6 +682,7 @@ describe('LineUserService', () => {
     });
 
     it('AC-B7 — PATCH /registration also filters reserved options out of the assignability check', async () => {
+      primeTx();
       lineUser.findFirst.mockResolvedValue({
         id: 'lu-1',
         access: AppAccess.PENDING,
@@ -604,6 +704,7 @@ describe('LineUserService', () => {
     });
 
     it('maps a P2002 on staffId (another registration) to 409 STAFF_ID_TAKEN (SC-B10)', async () => {
+      primeTx();
       lineUser.findFirst.mockResolvedValue({
         id: 'lu-1',
         access: AppAccess.PENDING,
@@ -627,10 +728,11 @@ describe('LineUserService', () => {
   // ───────────────────────── getStatus ─────────────────────────
 
   describe('getStatus', () => {
-    it('returns access + registration (with resolved option names) for an existing user', async () => {
+    it('returns access + registration (with resolved option names) + null reason for a PENDING user', async () => {
       lineUser.findFirst.mockResolvedValue({
         id: 'lu-1',
         access: AppAccess.PENDING,
+        rejectionReason: null,
       });
       lineUserRegistration.findFirst.mockResolvedValue(OWNER_REGISTRATION_ROW);
 
@@ -642,16 +744,32 @@ describe('LineUserService', () => {
         }),
       );
       expect(result.access).toBe(AppAccess.PENDING);
+      expect(result.rejectionReason).toBeNull();
       expect(result.registration?.staffId).toBe('6412345678');
       expect(result.registration?.department).toBe('Computer Science');
       expect(result.registration?.personnelRole).toBe('Teacher');
     });
 
-    it('gives a LIFF-first caller a fresh UNREGISTERED state + null registration', async () => {
+    it('surfaces access REJECTED + the stored rejectionReason (feeds the LIFF RejectedScreen)', async () => {
+      lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.REJECTED,
+        rejectionReason: 'เบอร์โทรศัพท์ไม่ถูกต้อง',
+      });
+      lineUserRegistration.findFirst.mockResolvedValue(OWNER_REGISTRATION_ROW);
+
+      const result = await service.getStatus('U123');
+
+      expect(result.access).toBe(AppAccess.REJECTED);
+      expect(result.rejectionReason).toBe('เบอร์โทรศัพท์ไม่ถูกต้อง');
+    });
+
+    it('gives a LIFF-first caller a fresh UNREGISTERED state + null registration + null reason', async () => {
       lineUser.findFirst.mockResolvedValue(null);
       lineUser.create.mockResolvedValue({
         id: 'lu-new',
         access: AppAccess.UNREGISTERED,
+        rejectionReason: null,
       });
       lineUserRegistration.findFirst.mockResolvedValue(null);
 
@@ -659,6 +777,7 @@ describe('LineUserService', () => {
 
       expect(result.access).toBe(AppAccess.UNREGISTERED);
       expect(result.registration).toBeNull();
+      expect(result.rejectionReason).toBeNull();
     });
   });
 
@@ -849,9 +968,14 @@ describe('LineUserService', () => {
         where: { id: 'lu-1' },
         select: { id: true, access: true, deletedAt: true },
       });
+      // A non-REJECTED target ALWAYS writes rejectionReason: null (invariant — clears any prior reason).
       expect(lineUser.update).toHaveBeenCalledWith({
         where: { id: 'lu-1' },
-        data: { access: AppAccess.ALLOWED, richMenuType: 'TYPE_2' },
+        data: {
+          access: AppAccess.ALLOWED,
+          richMenuType: 'TYPE_2',
+          rejectionReason: null,
+        },
         select: LINE_USER_PUBLIC_FIELDS,
       });
       expect(line.findRichMenuId).toHaveBeenCalledWith({
@@ -881,7 +1005,11 @@ describe('LineUserService', () => {
 
       expect(lineUser.update).toHaveBeenCalledWith({
         where: { id: 'lu-1' },
-        data: { access: AppAccess.BLOCKED, richMenuType: 'TYPE_1' },
+        data: {
+          access: AppAccess.BLOCKED,
+          richMenuType: 'TYPE_1',
+          rejectionReason: null,
+        },
         select: LINE_USER_PUBLIC_FIELDS,
       });
       expect(line.findRichMenuId).toHaveBeenCalledWith({
@@ -979,7 +1107,11 @@ describe('LineUserService', () => {
       // The DB write happened BEFORE the failing LINE call — source of truth is correct.
       expect(lineUser.update).toHaveBeenCalledWith({
         where: { id: 'lu-1' },
-        data: { access: AppAccess.ALLOWED, richMenuType: 'TYPE_2' },
+        data: {
+          access: AppAccess.ALLOWED,
+          richMenuType: 'TYPE_2',
+          rejectionReason: null,
+        },
         select: LINE_USER_PUBLIC_FIELDS,
       });
     });
@@ -1050,7 +1182,11 @@ describe('LineUserService', () => {
         expect(result.access).toBe(to);
         expect(lineUser.update).toHaveBeenCalledWith({
           where: { id: 'lu-1' },
-          data: { access: to, richMenuType: accessToRichMenuType(to) },
+          data: {
+            access: to,
+            richMenuType: accessToRichMenuType(to),
+            rejectionReason: null,
+          },
           select: LINE_USER_PUBLIC_FIELDS,
         });
         expect(line.linkRichMenuToUser).toHaveBeenCalled();
@@ -1168,7 +1304,11 @@ describe('LineUserService', () => {
       // DB persisted with the derived rich menu (source of truth), no LINE side-effects, no 502/500.
       expect(lineUser.update).toHaveBeenCalledWith({
         where: { id: 'lu-1' },
-        data: { access: AppAccess.ALLOWED, richMenuType: 'TYPE_2' },
+        data: {
+          access: AppAccess.ALLOWED,
+          richMenuType: 'TYPE_2',
+          rejectionReason: null,
+        },
         select: LINE_USER_PUBLIC_FIELDS,
       });
       expect(result.access).toBe(AppAccess.ALLOWED);
@@ -1201,6 +1341,195 @@ describe('LineUserService', () => {
       expect(second.access).toBe(AppAccess.ALLOWED);
       expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
       expect(line.push).not.toHaveBeenCalled();
+    });
+
+    // ───────── Reject (→REJECTED, mandatory reason) — design §4, AC4/AC5/AC6 ─────────
+
+    it('AC4/AC5 — ADMIN rejects a reachable PENDING user: persists the reason + TYPE_1, fires ONE reject push, 200', async () => {
+      primeRead(AppAccess.PENDING);
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.REJECTED,
+        richMenuType: 'TYPE_1',
+      });
+      line.findRichMenuId.mockResolvedValue('rm-type1');
+
+      const result = await service.updateAccess(
+        'lu-1',
+        AppAccess.REJECTED,
+        SystemRole.ADMIN,
+        'phone is wrong',
+      );
+
+      // The write persists the trimmed reason and derives TYPE_1 (invariant: reason set on REJECTED).
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        data: {
+          access: AppAccess.REJECTED,
+          richMenuType: 'TYPE_1',
+          rejectionReason: 'phone is wrong',
+        },
+        select: LINE_USER_PUBLIC_FIELDS,
+      });
+      expect(result.access).toBe(AppAccess.REJECTED);
+      // Exactly ONE push, using the reject template (with `เนื่องจาก: <reason>`) — NOT the PENDING copy.
+      expect(line.push).toHaveBeenCalledTimes(1);
+      expect(line.push).toHaveBeenCalledWith('U123', [
+        { type: 'text', text: rejectMsg('phone is wrong') },
+      ]);
+      const pushed = (
+        line.push.mock.calls[0] as [string, { text: string }[]]
+      )[1][0].text;
+      expect(pushed).toContain('เนื่องจาก: phone is wrong');
+      expect(pushed).not.toBe(PENDING_MSG);
+    });
+
+    it.each([
+      ['a blank reason', ''],
+      ['a missing reason', undefined],
+    ])(
+      'AC4 — ADMIN →REJECTED with %s is a 400 REJECTION_REASON_REQUIRED, no write, no push',
+      async (_label, reason) => {
+        primeRead(AppAccess.PENDING);
+
+        await expect(
+          service.updateAccess(
+            'lu-1',
+            AppAccess.REJECTED,
+            SystemRole.ADMIN,
+            reason,
+          ),
+        ).rejects.toThrow(new BadRequestException(REJECTION_REASON_REQUIRED));
+        expect(lineUser.update).not.toHaveBeenCalled();
+        expect(line.push).not.toHaveBeenCalled();
+      },
+    );
+
+    it('AC3/AC4 — UNREGISTERED→REJECTED is a 403 for ADMIN (policy) and a 400 for SUPER_ADMIN (guard), no write, no push', async () => {
+      // ADMIN: the policy forbids →REJECTED from UNREGISTERED → 403 before the reject guards.
+      primeRead(AppAccess.UNREGISTERED);
+      await expect(
+        service.updateAccess(
+          'lu-1',
+          AppAccess.REJECTED,
+          SystemRole.ADMIN,
+          'whatever',
+        ),
+      ).rejects.toThrow(
+        new ForbiddenException(LINE_USER_ACCESS_TRANSITION_FORBIDDEN),
+      );
+
+      // SUPER_ADMIN bypasses the policy but is still caught by the business guard → 400.
+      jest.clearAllMocks();
+      line.findRichMenuId.mockResolvedValue('rm-default');
+      line.linkRichMenuToUser.mockResolvedValue(undefined);
+      line.push.mockResolvedValue(undefined);
+      primeRead(AppAccess.UNREGISTERED);
+      await expect(
+        service.updateAccess(
+          'lu-1',
+          AppAccess.REJECTED,
+          SystemRole.SUPER_ADMIN,
+          'whatever',
+        ),
+      ).rejects.toThrow(new BadRequestException(CANNOT_REJECT_UNREGISTERED));
+
+      expect(lineUser.update).not.toHaveBeenCalled();
+      expect(line.push).not.toHaveBeenCalled();
+    });
+
+    it.each([AppAccess.ALLOWED, AppAccess.BLOCKED])(
+      'AC2 — approving/blocking a formerly-REJECTED user (→%s) CLEARS the reason (rejectionReason: null)',
+      async (to) => {
+        primeRead(AppAccess.REJECTED);
+        lineUser.update.mockResolvedValue({
+          ...publicRow,
+          access: to,
+          richMenuType: accessToRichMenuType(to),
+        });
+        line.findRichMenuId.mockResolvedValue('rm-x');
+
+        await service.updateAccess('lu-1', to, SystemRole.ADMIN);
+
+        // The write clears the prior rejection — the invariant's non-REJECTED branch.
+        expect(lineUser.update).toHaveBeenCalledWith({
+          where: { id: 'lu-1' },
+          data: {
+            access: to,
+            richMenuType: accessToRichMenuType(to),
+            rejectionReason: null,
+          },
+          select: LINE_USER_PUBLIC_FIELDS,
+        });
+        // The existing ALLOWED/BLOCKED copy is used (NOT the reject copy).
+        const expected = to === AppAccess.ALLOWED ? ALLOWED_MSG : BLOCKED_MSG;
+        expect(line.push).toHaveBeenCalledWith('U123', [
+          { type: 'text', text: expected },
+        ]);
+      },
+    );
+
+    it('AC6 — a reject push failure is swallowed (fail-soft): still 200 with the write intact', async () => {
+      primeRead(AppAccess.BLOCKED);
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.REJECTED,
+        richMenuType: 'TYPE_1',
+      });
+      line.findRichMenuId.mockResolvedValue('rm-type1');
+      line.push.mockRejectedValue(new Error('user blocked the bot'));
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+
+      const result = await service.updateAccess(
+        'lu-1',
+        AppAccess.REJECTED,
+        SystemRole.ADMIN,
+        'incomplete documents',
+      );
+
+      expect(result.access).toBe(AppAccess.REJECTED);
+      expect(lineUser.update).toHaveBeenCalled();
+      expect(warn).toHaveBeenCalled();
+    });
+
+    it('AC6 — SUPER_ADMIN forcing REJECTED on a soft-deleted user persists the reason, skips menu + push, 200', async () => {
+      primeRead(AppAccess.BLOCKED, new Date());
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.REJECTED,
+        richMenuType: 'TYPE_1',
+      });
+
+      const result = await service.updateAccess(
+        'lu-1',
+        AppAccess.REJECTED,
+        SystemRole.SUPER_ADMIN,
+        'account under review',
+      );
+
+      // DB persisted with the reason; the LINE side is unreachable so BOTH side-effects are skipped.
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        data: {
+          access: AppAccess.REJECTED,
+          richMenuType: 'TYPE_1',
+          rejectionReason: 'account under review',
+        },
+        select: LINE_USER_PUBLIC_FIELDS,
+      });
+      expect(result.access).toBe(AppAccess.REJECTED);
+      expect(line.findRichMenuId).not.toHaveBeenCalled();
+      expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
+      expect(line.push).not.toHaveBeenCalled();
+    });
+
+    it('AC5 — the reject copy lives in notifyRejection: ACCESS_NOTIFICATION_MESSAGES.PENDING is unchanged and .REJECTED is null', () => {
+      // Guards against someone moving the reject copy into the shared record (which would regress
+      // register()'s PENDING ack) or overwriting the PENDING entry.
+      expect(ACCESS_NOTIFICATION_MESSAGES.PENDING).toBe(PENDING_MSG);
+      expect(ACCESS_NOTIFICATION_MESSAGES.REJECTED).toBeNull();
     });
   });
 

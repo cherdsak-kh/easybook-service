@@ -125,13 +125,13 @@ green checkmark on a broken deploy. Possible states the server can be left in, a
 | `docker login` (GHCR) fails | Old app container still running untouched | See §3 above | Rotate `GHCR_PULL_TOKEN`, re-run. |
 | `docker pull` of the migrator image fails | Old app container still running untouched | Check network/GHCR status, retry | Re-run once the pull succeeds. |
 | Migration container exits non-zero | **Schema may be PARTIALLY migrated** (Postgres DDL inside one migration file is transactional per-migration by default, but a multi-migration batch can leave earlier ones applied and a later one failed) — app **not yet redeployed**, old app container still running against the OLD schema it expects | `docker run --rm --network easybook-network <migrator image> npx prisma migrate status` (or inspect `_prisma_migrations` table directly) | Never redeploy an old image to "roll back" (see `docs/migration-safety-policy.md`). Write a new forward migration that completes/corrects the schema, re-run the migrate step, THEN re-run the app deploy step. |
-| `docker-compose up -d` fails | Schema is migrated; app container may be stopped/absent — **possible downtime window** | `docker ps`, `docker-compose -f docker-compose.staging.yml ps` | Fix whatever `up -d` reported (image pull, resource limit, port conflict) and re-run `up -d`; the migration step does not need to re-run since it already succeeded and is idempotent to re-invoke anyway (`prisma migrate deploy` is a no-op on an up-to-date schema). |
+| `docker compose up -d` fails | Schema is migrated; app container may be stopped/absent — **possible downtime window** | `docker ps`, `docker compose -f docker-compose.staging.yml ps` | Fix whatever `up -d` reported (image pull, resource limit, port conflict) and re-run `up -d`; the migration step does not need to re-run since it already succeeded and is idempotent to re-invoke anyway (`prisma migrate deploy` is a no-op on an up-to-date schema). |
 | Post-deploy `/api/v1/health` poll times out | New app container is up but not passing readiness (DB/Redis unreachable, boot error) — traffic may be flowing to an unready container if nothing else gates it | `docker logs easybook-service`, hit `curl -s localhost:3300/api/v1/health` on the server directly | Check `docker logs` for the actual boot/readiness error (commonly: Infisical token/project misconfigured, or Postgres/Redis network issue) before assuming code regression. |
 
 ## 5. Image retention / disk hygiene
 
-- **Server-side:** `cd.yml`'s deploy step ends with `docker image prune -f --filter "label!=keep"`
-  scoped to dangling images only (safe — never removes an image with a running container attached,
+- **Server-side:** `cd.yml`'s deploy step ends with `docker image prune -f`,
+  which only removes dangling images (safe — never removes an image with a running container attached,
   and does not touch the just-deployed or previous tag since both are referenced by a container or
   a `docker pull`-ed, non-dangling tag). It intentionally does **not** run `docker image prune -a`,
   which would happily delete the immediate rollback candidate.

@@ -52,9 +52,27 @@ export const INVALID_PERSONNEL_ROLE =
   'The selected personnel role is not available.';
 
 /**
- * The PENDING-only self-edit gate (SC-3.3/SC-B9). An authorization-by-state rejection (403),
- * distinct from register's duplicate-resource `409`: only a caller whose `access` is strictly
- * `PENDING` may edit their registration. Deterministic, with no partial write.
+ * The self-edit gate (SC-3.3/SC-B9). An authorization-by-state rejection (403), distinct from
+ * register's duplicate-resource `409`: only a caller whose `access` is `PENDING` OR `REJECTED` may
+ * edit their registration (a REJECTED caller resubmits to re-enter review). Deterministic, with no
+ * partial write.
  */
 export const REGISTRATION_NOT_EDITABLE =
-  'Your registration can only be edited while it is pending review.';
+  'Your registration can only be edited while it is pending review or has been sent back for revision.';
+
+/**
+ * A `PATCH /line-users/:id` to REJECTED omitted the mandatory reason (missing or blank after trim).
+ * A reject MUST carry an operator-authored reason (it is pushed to the user and shown in the LIFF
+ * app), so this is a hard 400 — enforced in the service for BOTH roles, no write, no push. (The DTO
+ * keeps `reason` optional because it is meaningless for ALLOWED/BLOCKED; the business rule is here.)
+ */
+export const REJECTION_REASON_REQUIRED =
+  'A reason is required when sending a registration back for revision.';
+
+/**
+ * A `PATCH /line-users/:id` attempted REJECTED from UNREGISTERED — nothing was ever submitted to
+ * reject, and it would strand a rejectionReason on a user with no registration. A 400 for BOTH roles
+ * (SUPER_ADMIN included), enforced in the service INDEPENDENTLY of the SUPER_ADMIN policy bypass.
+ */
+export const CANNOT_REJECT_UNREGISTERED =
+  'A user who has not registered cannot be sent back for revision.';
