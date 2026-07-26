@@ -117,6 +117,7 @@
     "multer": "^2.2.0",
     "@nestjs/swagger": {
       "js-yaml": "^4.3.0"
-    }
+    },
+    "fast-uri": "^3.1.4"
   }
 }
