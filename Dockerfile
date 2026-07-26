@@ -48,11 +48,13 @@ COPY . .
 # types — there is no `postinstall` hook in package.json, so skipping this would break
 # compilation, not just runtime. `npm prune --omit=dev` then removes devDependencies, including
 # the `prisma` CLI package itself, and may strip the generated `.prisma` client artifacts along
-# with it. A second `prisma generate` runs LAST, after the prune, via `npx` pinned to the exact
-# version already used to build @prisma/client (read from package.json — the prune does not
-# remove the `@prisma/client` runtime dependency itself, only its generated internals) — this
-# regenerates the client directly into the already-pruned `node_modules`, so it is the final
-# write and nothing afterward can remove it again.
+# with it. A second `prisma generate` runs LAST, after the prune, via `npx` pinned to the EXACT
+# installed CLI version — read from `node_modules/prisma/package.json` BEFORE the prune deletes
+# that package, not from the `^7.8.0`-style semver RANGE in package.json's devDependencies (that
+# range could resolve to a newer 7.x at build time than the `@prisma/client` version actually
+# pruned into the image, and Prisma requires CLI/client version parity) — this regenerates the
+# client directly into the already-pruned `node_modules`, so it is the final write and nothing
+# afterward can remove it again.
 #
 # Prisma 7 eagerly resolves `prisma.config.ts`, which reads DATABASE_URL, and throws
 # PrismaConfigEnvError if it's unset — even though `prisma generate` never contacts a database
@@ -64,8 +66,8 @@ COPY . .
 ENV DATABASE_URL="postgresql://ci:ci@localhost:5432/ci?schema=public"
 RUN npx prisma generate \
     && npm run build \
+    && PRISMA_VERSION=$(node -p "require('./node_modules/prisma/package.json').version") \
     && npm prune --omit=dev \
-    && PRISMA_VERSION=$(node -p "require('./package.json').devDependencies.prisma") \
     && npx --yes prisma@${PRISMA_VERSION} generate
 
 # ---------------------------------------------------------------------------
