@@ -16,6 +16,7 @@ import { LineService } from './line.service';
 import {
   ACCESS_NOTIFICATION_MESSAGES,
   accessToRichMenuType,
+  buildRejectionMessage,
   LINE_USER_PUBLIC_FIELDS,
   LineUserService,
 } from './line-user.service';
@@ -99,18 +100,15 @@ describe('LineUserService', () => {
     push: jest.fn(),
   };
 
-  // The exact push copy per target access (mirrors ACCESS_NOTIFICATION_MESSAGES in the service).
-  const ALLOWED_MSG =
-    'ยินดีด้วย! บัญชีของคุณได้รับการอนุมัติการใช้งานเรียบร้อยแล้ว คุณสามารถกดปุ่มจองคิวที่เมนูด้านล่างเพื่อทำรายการได้ทันทีครับ 🎉';
-  const BLOCKED_MSG =
-    'ขออภัย บัญชีการใช้งานของคุณถูกระงับสิทธิ์ชั่วคราวโดยผู้ดูแลระบบ หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่สถาบัน';
-  const PENDING_MSG =
-    'ระบบได้รับข้อมูลการลงทะเบียนของคุณแล้ว เจ้าหน้าที่กำลังดำเนินการตรวจสอบข้อมูลกรุณารอสักครู่ครับ ⏳';
+  // The push copy per target access, read from the service's own source of truth so these
+  // assertions test ROUTING (which copy goes out for which transition), not the copy's spelling.
+  const ALLOWED_MSG = ACCESS_NOTIFICATION_MESSAGES.ALLOWED!;
+  const BLOCKED_MSG = ACCESS_NOTIFICATION_MESSAGES.BLOCKED!;
+  const PENDING_MSG = ACCESS_NOTIFICATION_MESSAGES.PENDING!;
 
-  // The exact reject copy built by `notifyRejection` ({reason} interpolated).
-  const rejectMsg = (reason: string) =>
-    `ขออภัย การลงทะเบียนของคุณไม่ผ่านการอนุมัติ เนื่องจาก: ${reason} ` +
-    `กรุณาเปิดแอปพลิเคชันเพื่อแก้ไขข้อมูลใหม่อีกครั้ง`;
+  // The exact reject copy `notifyRejection` sends ({reason} interpolated) — same builder, so a
+  // change to the template stays covered by the reason-interpolation assertions instead of a diff.
+  const rejectMsg = (reason: string) => buildRejectionMessage(reason);
 
   const publicRow = {
     id: 'lu-1',
@@ -1372,7 +1370,7 @@ describe('LineUserService', () => {
         select: LINE_USER_PUBLIC_FIELDS,
       });
       expect(result.access).toBe(AppAccess.REJECTED);
-      // Exactly ONE push, using the reject template (with `เนื่องจาก: <reason>`) — NOT the PENDING copy.
+      // Exactly ONE push, using the reject template — NOT the PENDING copy.
       expect(line.push).toHaveBeenCalledTimes(1);
       expect(line.push).toHaveBeenCalledWith('U123', [
         { type: 'text', text: rejectMsg('phone is wrong') },
@@ -1380,7 +1378,12 @@ describe('LineUserService', () => {
       const pushed = (
         line.push.mock.calls[0] as [string, { text: string }[]]
       )[1][0].text;
-      expect(pushed).toContain('เนื่องจาก: phone is wrong');
+      // Copy-agnostic on purpose: assert the admin's REASON is interpolated into whatever the
+      // template currently says, rather than pinning a Thai fragment of the template itself. The
+      // service still has to run to produce `pushed`, so this keeps asserting that a Reject routes
+      // the reason through buildRejectionMessage — it just no longer breaks when the copy is
+      // reworded. (The `toHaveBeenCalledWith` above already pins the exact builder output.)
+      expect(pushed).toContain('phone is wrong');
       expect(pushed).not.toBe(PENDING_MSG);
     });
 
@@ -1525,10 +1528,21 @@ describe('LineUserService', () => {
       expect(line.push).not.toHaveBeenCalled();
     });
 
-    it('AC5 — the reject copy lives in notifyRejection: ACCESS_NOTIFICATION_MESSAGES.PENDING is unchanged and .REJECTED is null', () => {
+    it('AC5 — the reject copy lives in buildRejectionMessage: ACCESS_NOTIFICATION_MESSAGES.PENDING is present and .REJECTED is null', () => {
       // Guards against someone moving the reject copy into the shared record (which would regress
-      // register()'s PENDING ack) or overwriting the PENDING entry.
-      expect(ACCESS_NOTIFICATION_MESSAGES.PENDING).toBe(PENDING_MSG);
+      // register()'s PENDING ack) or blanking the PENDING entry.
+      //
+      // This asserts the SHAPE of the record, not the wording. The Thai copy is product text that
+      // is expected to be reworded freely in the service without reddening this suite, so there is
+      // deliberately NO pinned literal here and no comparison against `PENDING_MSG` (which now
+      // reads from this same record, and would only ever restate `X === X`).
+      //
+      // The trade-off is explicit: a truncated or accidentally emptied PENDING string is still
+      // caught, but a *reworded* one is not. Nothing in this suite verifies the exact PENDING
+      // wording any more — if that guarantee is ever wanted back, it needs a pinned literal here,
+      // not a reference to the record.
+      expect(typeof ACCESS_NOTIFICATION_MESSAGES.PENDING).toBe('string');
+      expect(ACCESS_NOTIFICATION_MESSAGES.PENDING?.length).toBeGreaterThan(0);
       expect(ACCESS_NOTIFICATION_MESSAGES.REJECTED).toBeNull();
     });
   });

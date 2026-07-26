@@ -61,17 +61,25 @@ export const accessToRichMenuType = (access: AppAccess): RichMenuType =>
 export const ACCESS_NOTIFICATION_MESSAGES: Record<AppAccess, string | null> = {
   UNREGISTERED: null,
   PENDING:
-    'ระบบได้รับข้อมูลการลงทะเบียนของคุณแล้ว เจ้าหน้าที่กำลังดำเนินการตรวจสอบข้อมูลกรุณารอสักครู่ครับ ⏳',
+    'ระบบได้รับข้อมูลการลงทะเบียนของคุณแล้ว เจ้าหน้าที่กำลังดำเนินการตรวจสอบข้อมูล กรุณารอสักครู่ ⏳',
   ALLOWED:
-    'ยินดีด้วย! บัญชีของคุณได้รับการอนุมัติการใช้งานเรียบร้อยแล้ว คุณสามารถกดปุ่มจองคิวที่เมนูด้านล่างเพื่อทำรายการได้ทันทีครับ 🎉',
+    'ยินดีด้วย! บัญชีของคุณได้รับการอนุมัติการใช้งานเรียบร้อยแล้ว คุณสามารถกดที่เมนูด้านล่างเพื่อใช้งานระบบได้ทันที 🎉',
   BLOCKED:
-    'ขออภัย บัญชีการใช้งานของคุณถูกระงับสิทธิ์ชั่วคราวโดยผู้ดูแลระบบ หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่สถาบัน',
-  // The reject copy is built in `notifyRejection` (it interpolates the mandatory reason), NOT here —
-  // so this entry is `null` ("notifyAccessChange sends nothing for REJECTED"). Keeping the reject
-  // copy out of this record is deliberate: this record is register()'s single source for the PENDING
-  // ack and must not be overwritten or repurposed.
+    'ขออภัย บัญชีการใช้งานของคุณถูกระงับสิทธิ์ชั่วคราว หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่',
+  // The reject copy is built by `buildRejectionMessage` below (it interpolates the mandatory
+  // reason), NOT here — so this entry is `null` ("notifyAccessChange sends nothing for REJECTED").
+  // Keeping the reject copy out of this record is deliberate: this record is register()'s single
+  // source for the PENDING ack and must not be overwritten or repurposed.
   REJECTED: null,
 };
+
+/**
+ * THE one definition of the Reject push copy. It cannot live in `ACCESS_NOTIFICATION_MESSAGES`
+ * (a static `Record`) because it interpolates the mandatory rejection reason — hence a builder,
+ * kept adjacent to that record so both copy sources sit together.
+ */
+export const buildRejectionMessage = (reason: string): string =>
+  `ขออภัย การลงทะเบียนของคุณไม่ผ่านการอนุมัติ เนื่องจาก: ${reason} กรุณาเปิดแอปพลิเคชันเพื่อแก้ไขข้อมูลใหม่อีกครั้ง`;
 
 /**
  * THE one definition of "a publicly visible LineUser" — exactly the `LineUserResponseDto` fields.
@@ -248,9 +256,10 @@ export class LineUserService {
   /**
    * Best-effort LINE push for a Reject (→REJECTED). NEVER throws (same fail-soft discipline as
    * `notifyAccessChange`): a push failure is logged at `warn` and swallowed — the reject write already
-   * committed. The reject copy is built HERE, deliberately NOT added to `ACCESS_NOTIFICATION_MESSAGES`:
-   * that record is `register()`'s single source for the PENDING ack and must not be overwritten or the
-   * ack regresses. `reason` is always present (mandatory, guarded in `updateAccess`).
+   * committed. The reject copy comes from `buildRejectionMessage`, deliberately NOT added to
+   * `ACCESS_NOTIFICATION_MESSAGES`: that record is `register()`'s single source for the PENDING ack and
+   * must not be overwritten or the ack regresses. `reason` is always present (mandatory, guarded in
+   * `updateAccess`).
    * PII: the reason is NEVER logged (log lines stay lineUserId=/access= only, matching notifyAccessChange).
    *
    * @param lineUserId the LINE-side `U…` identifier (`LineUser.lineUserId`), NOT the cuid `LineUser.id`.
@@ -259,9 +268,7 @@ export class LineUserService {
     lineUserId: string,
     reason: string,
   ): Promise<void> {
-    const text =
-      `ขออภัย การลงทะเบียนของคุณไม่ผ่านการอนุมัติ เนื่องจาก: ${reason} ` +
-      `กรุณาเปิดแอปพลิเคชันเพื่อแก้ไขข้อมูลใหม่อีกครั้ง`;
+    const text = buildRejectionMessage(reason);
     try {
       await this.line.push(lineUserId, [{ type: 'text', text }]);
     } catch (error) {
@@ -677,8 +684,9 @@ export class LineUserService {
     // Best-effort notification, only after BOTH the DB write and the rich-menu apply succeeded.
     // Pushed to the LINE-side U… id (updated.lineUserId), never the cuid. A push failure here does
     // not undo the access change or the linked menu, and must not fail the request. A Reject uses the
-    // separate `notifyRejection` builder (it interpolates the mandatory reason); every other target
-    // uses the shared `ACCESS_NOTIFICATION_MESSAGES` copy via `notifyAccessChange`.
+    // separate `notifyRejection` path, whose copy comes from `buildRejectionMessage` (it interpolates
+    // the mandatory reason); every other target uses the shared `ACCESS_NOTIFICATION_MESSAGES` copy
+    // via `notifyAccessChange`.
     if (access === AppAccess.REJECTED) {
       await this.notifyRejection(updated.lineUserId, reason!);
     } else {
