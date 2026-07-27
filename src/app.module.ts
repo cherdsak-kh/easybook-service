@@ -19,6 +19,7 @@ import { HealthModule } from './health/health.module';
 import { LineModule } from './line/line.module';
 import { OptionsModule } from './options/options.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { RealtimeModule } from './realtime/realtime.module';
 import { RedisThrottlerStorage } from './redis/redis-throttler.storage';
 import { REDIS_CLIENT } from './redis/redis.constants';
 import { RedisModule } from './redis/redis.module';
@@ -72,6 +73,7 @@ const throttlerModule: DynamicModule = {
     CsrfModule,
     throttlerModule,
     HealthModule,
+    RealtimeModule,
     LineModule,
     AuthModule,
     SystemUsersModule,

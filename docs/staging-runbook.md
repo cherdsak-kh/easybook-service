@@ -77,6 +77,74 @@ either:
 `main.ts`'s trust-proxy comment for anything security-sensitive (the per-IP login rate
 limiter).** Flagging it here rather than silently assuming it's already correct.
 
+## 1b. Nginx WebSocket upgrade (hard prerequisite for realtime)
+
+The realtime gateway (`src/realtime/`) serves Socket.IO on the `/admin` namespace at engine path
+`/socket.io/`. **Nothing in §1's `location /` block makes a WebSocket upgrade work**, so without the
+block below the socket silently degrades to HTTP long-polling — or fails outright — even though it
+works locally against the Vite dev proxy. Add this to the same `server { }`:
+
+```nginx
+# REQUIRED at http{} level (or any included conf), NOT inside server{}.
+# `Connection` must be MAP-DRIVEN, never a literal `proxy_set_header Connection "upgrade";`.
+# Socket.IO opens with an HTTP *polling* request that carries no `Upgrade` header; hard-coding
+# "upgrade" corrupts that request and breaks the very fallback this deployment relies on.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    # … §1's listen/server_name/location / stay exactly as they are …
+
+    location /socket.io/ {
+        proxy_pass http://127.0.0.1:3300;
+
+        # The upgrade handshake itself.
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        # SECURITY CONTROL — do not drop or rewrite. The gateway validates `Origin` in its
+        # `allowRequest` hook to block Cross-Site WebSocket Hijacking: browsers do NOT apply
+        # same-origin policy to `new WebSocket()` but DO send cookies, and Socket.IO's own `cors`
+        # option governs only the polling transport, leaving the raw upgrade open. If Nginx does
+        # not forward `Origin` verbatim, that check either fails open or rejects every client.
+        proxy_set_header Origin $http_origin;
+
+        proxy_set_header Host             $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For  $proxy_add_x_forwarded_for;
+
+        # A websocket is idle by design between events; the default 60s read timeout would cut it.
+        proxy_read_timeout  3600s;
+        proxy_send_timeout  3600s;
+        proxy_buffering     off;
+    }
+}
+```
+
+**Cloudflare:** WebSockets are enabled by default on all plans (Network → WebSockets). Verify it is
+on, and note Cloudflare's own ~100s idle timeout applies regardless of `proxy_read_timeout` — the
+client's reconnection backoff is what absorbs that.
+
+**Verify after deploying** (a 101 is the only proof; a 200 means you are still on polling):
+
+```bash
+curl -i -sS -o /dev/null -w '%{http_code}\n' \
+  -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  -H 'Origin: https://staging.example.com' \
+  'https://staging.example.com/socket.io/?EIO=4&transport=websocket'
+```
+
+**Most likely failure mode, in order:** (1) the `map` block was placed inside `server{}` instead of
+`http{}` — nginx fails to reload; (2) `Origin` not forwarded, so every handshake is rejected as
+CSWSH; (3) `CORS_ORIGIN` in Infisical not matching the browser's real origin.
+
+**Rollback:** the frontend ships `VITE_WS_ENABLED=false`. The page falls back to its fetch-all path
+and works exactly as before — realtime is an enhancement, never a dependency.
+
 ## 2. `SWAGGER_ENABLED` in staging
 
 `SWAGGER_ENABLED` is opt-out (defaults to `true` — see `env.validation.ts` / `main.ts`). Staging

@@ -10,6 +10,7 @@ import {
 import { AppAccess, Prisma, SystemRole } from '@prisma/client';
 import type { LineUser, RichMenuType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { canAdminSetAccess } from './line-access.policy';
 import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
@@ -147,13 +148,54 @@ export class LineUserService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly line: LineService,
+    private readonly realtime: RealtimeGateway,
   ) {}
+
+  /**
+   * Fail-soft realtime publish. NEVER throws — it mirrors `notifyAccessChange`'s discipline: the
+   * write has already committed, so a fan-out failure is logged at `warn` and swallowed and can
+   * never roll back or fail the mutation.
+   *
+   * The `deletedAt: null` filter is **LOAD-BEARING, not defensive**: it is what structurally
+   * guarantees a soft-deleted row can never reach a `created`/`updated` event, for every call site
+   * at once — including the SUPER_ADMIN-only soft-deleted reach in `updateAccess` /
+   * `updateRegistrationByAdmin`, which would otherwise inject a row into every admin's table that
+   * `GET /line-users` refuses to return.
+   *
+   * The extra primary-key read is a deliberate trade: `updateAccess` and `updateRegistrationByAdmin`
+   * already hold a `PublicLineUser`, but using the row in hand there and re-reading elsewhere would
+   * mean two payload construction rules and two places for the soft-delete guard to be forgotten.
+   * **Do not "optimise" this away** without re-establishing that guarantee at every call site.
+   */
+  private async publish(
+    kind: 'created' | 'updated',
+    id: string,
+  ): Promise<void> {
+    try {
+      const row = await this.prisma.lineUser.findFirst({
+        where: { id, deletedAt: null },
+        select: LINE_USER_PUBLIC_FIELDS,
+      });
+      // Soft-deleted or gone → no event, by design.
+      if (!row) return;
+      const dto = this.toDto(row);
+      if (kind === 'created') this.realtime.emitLineUserCreated(dto);
+      else this.realtime.emitLineUserUpdated(dto);
+    } catch (error) {
+      // PII discipline: id + kind only. Never the DTO, never a name/phone/staffId.
+      this.logger.warn(
+        `Realtime publish failed (write already committed). id=${id} kind=${kind}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
 
   /**
    * Create the user on first follow, or restore (clear deletedAt) + refresh the
    * profile on re-follow. Existing `access`/`richMenuType` are preserved.
    */
-  upsertOnFollow(profile: LineProfileInput): Promise<LineUser> {
+  async upsertOnFollow(profile: LineProfileInput): Promise<LineUser> {
     const { lineUserId, ...rest } = profile;
     const data = {
       displayName: rest.displayName ?? null,
@@ -161,19 +203,42 @@ export class LineUserService {
       statusMessage: rest.statusMessage ?? null,
       language: rest.language ?? null,
     };
-    return this.prisma.lineUser.upsert({
+    const user = await this.prisma.lineUser.upsert({
       where: { lineUserId },
       create: { lineUserId, ...data },
       update: { ...data, deletedAt: null, followedAt: new Date() },
     });
+
+    // Emit site 1. A re-follow after an unfollow re-surfaces the row, so `created` is correct; the
+    // client's `created` handler is an upsert, so a plain profile refresh is harmless.
+    // `LineWebhookService` stays unchanged — the emit belongs to the service that owns the model.
+    await this.publish('created', user.id);
+    return user;
   }
 
-  /** Soft-delete on unfollow (no error if already absent/deleted). */
-  softDeleteByLineUserId(lineUserId: string): Promise<{ count: number }> {
-    return this.prisma.lineUser.updateMany({
+  /**
+   * Soft-delete on unfollow (no error if already absent/deleted).
+   *
+   * The id lookup exists because `updateMany` returns only a count and `lineUser.deleted` needs the
+   * cuid. `lineUserId` is `@unique`, so this is an indexed read and no new index is required. The
+   * `{ count }` return type is UNCHANGED, so `LineWebhookService` needs no edit. A concurrent double
+   * unfollow can emit `deleted` twice; the client's remove-by-id is idempotent.
+   */
+  async softDeleteByLineUserId(lineUserId: string): Promise<{ count: number }> {
+    const row = await this.prisma.lineUser.findFirst({
       where: { lineUserId, deletedAt: null },
+      select: { id: true },
+    });
+    if (!row) return { count: 0 };
+
+    await this.prisma.lineUser.update({
+      where: { id: row.id },
       data: { deletedAt: new Date() },
     });
+
+    // Emit site 6. "Deleted" means "left the list you are looking at" — the physical row survives.
+    this.realtime.emitLineUserDeleted(row.id);
+    return { count: 1 };
   }
 
   /** Look up an active (non-soft-deleted) user. */
@@ -356,8 +421,8 @@ export class LineUserService {
     dto: CreateLineUserRegistrationDto,
   ): Promise<LineUserStatusResponseDto> {
     try {
-      const { userId, access, registration } = await this.prisma.$transaction(
-        async (tx) => {
+      const { userId, access, registration, wasCreated } =
+        await this.prisma.$transaction(async (tx) => {
           const existing = await tx.lineUser.findFirst({
             where: { lineUserId, deletedAt: null },
             select: { id: true, access: true },
@@ -404,12 +469,18 @@ export class LineUserService {
             userId: user.id,
             access: updated.access,
             registration: created,
+            // The transaction already knows whether it created the row, so the created-vs-updated
+            // decision costs zero extra reads.
+            wasCreated: existing === null,
           };
-        },
-      );
+        });
 
       // PII discipline: log the id only, never the submitted PII.
       this.logger.log(`LineUser registered. id=${userId} access=${access}`);
+
+      // Emit site 2 — after the commit, BEFORE the LINE push (a best-effort HTTP call that can take
+      // a second or more; the socket path must not sit behind it).
+      await this.publish(wasCreated ? 'created' : 'updated', userId);
 
       // Best-effort "we received your registration" push (PENDING copy). Outside the transaction
       // so a push failure can never roll back the committed registration/access change.
@@ -495,6 +566,9 @@ export class LineUserService {
       });
 
       this.logger.log(`LineUser registration edited. id=${user.id}`);
+
+      // Emit site 3 — after the `$transaction` resolves, before the conditional PENDING push.
+      await this.publish('updated', user.id);
 
       // A REJECTED resubmit re-enters review → send the existing PENDING ack, AFTER the transaction
       // commits (fail-soft) so a push failure can't roll back the committed resubmit. A PENDING edit
@@ -659,6 +733,9 @@ export class LineUserService {
       this.logger.log(
         `LineUser access changed (soft-deleted; LINE side-effects skipped). id=${updated.id} access=${access} richMenuType=${richMenuType}`,
       );
+      // NO realtime event: `publish`'s `deletedAt: null` filter would drop it anyway, and the row
+      // is absent from `GET /line-users`, so broadcasting it would make every admin's table
+      // disagree with a refresh. Calling `publish` here would be a no-op; not calling it is clearer.
       return this.toDto(updated);
     }
 
@@ -680,6 +757,12 @@ export class LineUserService {
     this.logger.log(
       `LineUser access changed. id=${updated.id} access=${access} richMenuType=${richMenuType}`,
     );
+
+    // Emit site 4 — AFTER `applyRichMenu` succeeded and BEFORE the LINE push. A rich-menu failure
+    // raises a retryable 502 above, and NO event is emitted on that path: broadcasting a row whose
+    // LINE-side state we know is inconsistent, from a request that answers 502, is worse than being
+    // briefly stale, and the retry re-emits (the operation is idempotent).
+    await this.publish('updated', updated.id);
 
     // Best-effort notification, only after BOTH the DB write and the rich-menu apply succeeded.
     // Pushed to the LINE-side U… id (updated.lineUserId), never the cuid. A push failure here does
@@ -782,6 +865,12 @@ export class LineUserService {
     // PII discipline: log the id only, never the submitted field values or the body. `updated` is
     // guaranteed non-null — the LineUser row is never hard-deleted, and it existed at step 1.
     this.logger.log(`LineUser registration edited by admin. id=${row.id}`);
+
+    // Emit site 5 — after the `$transaction` and the re-read, before returning. A SUPER_ADMIN may
+    // reach a soft-deleted row here; `publish`'s `deletedAt: null` filter is what stops that row
+    // from being broadcast.
+    await this.publish('updated', row.id);
+
     return this.toDto(updated!);
   }
 
