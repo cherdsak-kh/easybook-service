@@ -5,6 +5,7 @@ import request from 'supertest';
 import type { App } from 'supertest/types';
 import { PasswordService } from '../src/auth/password.service';
 import { API_BASE_PATH } from '../src/common/api.constants';
+import { ACCESS_NOTIFICATION_MESSAGES } from '../src/line/line-user.service';
 import { LineService } from '../src/line/line.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import {
@@ -29,11 +30,13 @@ const STAFF = `${SU_PREFIX}staff@easybook.local`;
 
 const url = (path: string) => `${API_BASE_PATH}${path}`;
 
-// The exact status-change push copy (must match ACCESS_NOTIFICATION_MESSAGES in the service).
-const ALLOWED_MSG =
-  'ยินดีด้วย! บัญชีของคุณได้รับการอนุมัติการใช้งานเรียบร้อยแล้ว คุณสามารถกดปุ่มจองคิวที่เมนูด้านล่างเพื่อทำรายการได้ทันทีครับ 🎉';
-const BLOCKED_MSG =
-  'ขออภัย บัญชีการใช้งานของคุณถูกระงับสิทธิ์ชั่วคราวโดยผู้ดูแลระบบ หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่สถาบัน';
+// The status-change push copy per target access, read from the service's own source of truth (as
+// `src/line/line-user.service.spec.ts` does). These assertions still prove ROUTING — a real HTTP
+// PATCH runs `updateAccess` between the push spy and these constants, so "which copy goes out for
+// which transition, to which LINE id" stays covered — while a reword of the Thai copy in
+// `line-user.service.ts` can no longer redden the suite.
+const ALLOWED_MSG = ACCESS_NOTIFICATION_MESSAGES.ALLOWED!;
+const BLOCKED_MSG = ACCESS_NOTIFICATION_MESSAGES.BLOCKED!;
 
 interface Session {
   agent: request.Agent;

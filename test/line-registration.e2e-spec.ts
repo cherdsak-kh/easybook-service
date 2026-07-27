@@ -9,6 +9,7 @@ import type { Redis } from 'ioredis';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import { API_BASE_PATH } from '../src/common/api.constants';
+import { ACCESS_NOTIFICATION_MESSAGES } from '../src/line/line-user.service';
 import { LineService } from '../src/line/line.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { createE2eApp, prismaOf, redisOf, waitForRedis } from './e2e-app';
@@ -24,9 +25,11 @@ const ROLE_NAME = `${LU_PREFIX}Teacher`;
 const DEPT2_NAME = `${LU_PREFIX}Mathematics`;
 const DELETED_DEPT_NAME = `${LU_PREFIX}Retired Dept`;
 
-// The exact "registration received" push copy (must match ACCESS_NOTIFICATION_MESSAGES / PENDING).
-const PENDING_MSG =
-  'ระบบได้รับข้อมูลการลงทะเบียนของคุณแล้ว เจ้าหน้าที่กำลังดำเนินการตรวจสอบข้อมูลกรุณารอสักครู่ครับ ⏳';
+// The "registration received" push copy, read from the service's own source of truth (as
+// `src/line/line-user.service.spec.ts` does). The assertion below still proves ROUTING — a real
+// HTTP POST /register runs the whole service between the push spy and this constant — while a
+// reword of the Thai copy can no longer redden the suite.
+const PENDING_MSG = ACCESS_NOTIFICATION_MESSAGES.PENDING!;
 
 const optionIds = {
   departmentId: 0,
