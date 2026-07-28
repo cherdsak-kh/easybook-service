@@ -48,7 +48,6 @@ const dto: LineUserResponseDto = {
   registration: {
     firstName: 'Somchai',
     lastName: 'Jaidee',
-    staffId: '6412345678',
     phone: '081-234-5678',
     departmentId: 1,
     department: 'Computer Science',
@@ -211,7 +210,7 @@ describe('RealtimeGateway', () => {
     warn.mockRestore();
   });
 
-  it('AC B17 — no emit log line carries a name, phone or staffId', () => {
+  it('AC B17 — no emit log line carries a name or phone number', () => {
     const warn = jest
       .spyOn(Logger.prototype, 'warn')
       .mockImplementation(() => undefined);
@@ -228,7 +227,6 @@ describe('RealtimeGateway', () => {
       expect(text).not.toContain('Somchai');
       expect(text).not.toContain('Jaidee');
       expect(text).not.toContain('081-234-5678');
-      expect(text).not.toContain('6412345678');
       expect(text).not.toContain('Alice');
     }
     expect(String(warn.mock.calls[0][0])).toContain('id=lu-1');

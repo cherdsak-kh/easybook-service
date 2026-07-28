@@ -31,7 +31,6 @@ import {
   LINE_USER_REGISTRATION_NOT_FOUND,
   REGISTRATION_NOT_EDITABLE,
   REJECTION_REASON_REQUIRED,
-  STAFF_ID_TAKEN,
 } from './line-users.errors';
 
 interface TxOptions {
@@ -55,7 +54,6 @@ const makeTx = () => ({
 const VALID_DTO: CreateLineUserRegistrationDto = {
   firstName: 'Somchai',
   lastName: 'Jaidee',
-  staffId: '6412345678',
   phone: '081-234-5678',
   departmentId: 1,
   personnelRoleId: 2,
@@ -66,7 +64,6 @@ const OWNER_REGISTRATION_ROW = {
   id: 'reg-1',
   firstName: 'Somchai',
   lastName: 'Jaidee',
-  staffId: '6412345678',
   phone: '081-234-5678',
   departmentId: 1,
   personnelRoleId: 2,
@@ -382,7 +379,6 @@ describe('LineUserService', () => {
       expect(result.access).toBe(AppAccess.PENDING);
       expect(result.registration).toMatchObject({
         id: 'reg-1',
-        staffId: '6412345678',
         phone: '081-234-5678',
         departmentId: 1,
         department: 'Computer Science',
@@ -518,25 +514,6 @@ describe('LineUserService', () => {
       expect(tx.lineUserRegistration.create).not.toHaveBeenCalled();
     });
 
-    it('maps a P2002 on staffId to a 409 STAFF_ID_TAKEN (SC-B1)', async () => {
-      const tx = primeTx();
-      tx.lineUser.findFirst.mockResolvedValue({
-        id: 'lu-1',
-        access: AppAccess.UNREGISTERED,
-      });
-      tx.lineUserRegistration.create.mockRejectedValue(
-        new Prisma.PrismaClientKnownRequestError('unique', {
-          code: 'P2002',
-          clientVersion: 'x',
-          meta: { target: ['staffId'] },
-        }),
-      );
-
-      await expect(service.register('U123', VALID_DTO)).rejects.toThrow(
-        new ConflictException(STAFF_ID_TAKEN),
-      );
-    });
-
     it('maps a P2002 on lineUserId (a race) to a 409 ALREADY_REGISTERED (AC-B2)', async () => {
       const tx = primeTx();
       tx.lineUser.findFirst.mockResolvedValue({
@@ -588,7 +565,6 @@ describe('LineUserService', () => {
           data: {
             firstName: 'Somchai',
             lastName: 'Jaidee',
-            staffId: '6412345678',
             phone: '081-234-5678',
             departmentId: 1,
             personnelRoleId: 2,
@@ -598,7 +574,6 @@ describe('LineUserService', () => {
       expect(result.access).toBe(AppAccess.PENDING);
       expect(result.rejectionReason).toBeNull();
       expect(result.registration).toMatchObject({
-        staffId: '6412345678',
         department: 'Computer Science',
         personnelRole: 'Teacher',
       });
@@ -743,27 +718,6 @@ describe('LineUserService', () => {
         select: { id: true },
       });
     });
-
-    it('maps a P2002 on staffId (another registration) to 409 STAFF_ID_TAKEN (SC-B10)', async () => {
-      primeTx();
-      lineUser.findFirst.mockResolvedValue({
-        id: 'lu-1',
-        access: AppAccess.PENDING,
-      });
-      department.findFirst.mockResolvedValue({ id: 1 });
-      personnelRole.findFirst.mockResolvedValue({ id: 2 });
-      lineUserRegistration.update.mockRejectedValue(
-        new Prisma.PrismaClientKnownRequestError('unique', {
-          code: 'P2002',
-          clientVersion: 'x',
-          meta: { target: ['staffId'] },
-        }),
-      );
-
-      await expect(
-        service.updateRegistration('U123', EDIT_DTO),
-      ).rejects.toThrow(new ConflictException(STAFF_ID_TAKEN));
-    });
   });
 
   // ───────────────────────── getStatus ─────────────────────────
@@ -786,7 +740,6 @@ describe('LineUserService', () => {
       );
       expect(result.access).toBe(AppAccess.PENDING);
       expect(result.rejectionReason).toBeNull();
-      expect(result.registration?.staffId).toBe('6412345678');
       expect(result.registration?.department).toBe('Computer Science');
       expect(result.registration?.personnelRole).toBe('Teacher');
     });
@@ -881,7 +834,6 @@ describe('LineUserService', () => {
             registration: {
               firstName: 'Somchai',
               lastName: 'Jaidee',
-              staffId: '6412345678',
               phone: '081-234-5678',
               departmentId: 1,
               personnelRoleId: 2,
@@ -900,7 +852,6 @@ describe('LineUserService', () => {
       expect(result.data[0].registration).toEqual({
         firstName: 'Somchai',
         lastName: 'Jaidee',
-        staffId: '6412345678',
         phone: '081-234-5678',
         departmentId: 1,
         department: 'Computer Science',
@@ -1596,7 +1547,6 @@ describe('LineUserService', () => {
     const ADMIN_EDIT_DTO: AdminUpdateLineUserRegistrationDto = {
       firstName: 'Edited',
       lastName: 'Name',
-      staffId: 'NEW-STAFF',
       phone: '099-999-9999',
       departmentId: 3,
       personnelRoleId: 4,
@@ -1609,7 +1559,6 @@ describe('LineUserService', () => {
       registration: {
         firstName: 'Edited',
         lastName: 'Name',
-        staffId: 'NEW-STAFF',
         phone: '099-999-9999',
         departmentId: 3,
         personnelRoleId: 4,
@@ -1641,7 +1590,7 @@ describe('LineUserService', () => {
     };
 
     it.each([SystemRole.ADMIN, SystemRole.SUPER_ADMIN])(
-      'AC-B2 — %s edits all six fields, persists them, and returns the updated row (200)',
+      'AC-B2 — %s edits all five fields, persists them, and returns the updated row (200)',
       async (role) => {
         const tx = primeSuccess();
 
@@ -1656,13 +1605,12 @@ describe('LineUserService', () => {
           where: { id: 'lu-1' },
           select: { id: true, deletedAt: true },
         });
-        // All six fields written, keyed on the 1:1 lineUserId.
+        // All five fields written, keyed on the 1:1 lineUserId.
         expect(tx.lineUserRegistration.update).toHaveBeenCalledWith({
           where: { lineUserId: 'lu-1' },
           data: {
             firstName: 'Edited',
             lastName: 'Name',
-            staffId: 'NEW-STAFF',
             phone: '099-999-9999',
             departmentId: 3,
             personnelRoleId: 4,
@@ -1671,7 +1619,6 @@ describe('LineUserService', () => {
         // Response is the re-read LINE_USER_PUBLIC_FIELDS row, incl. the summary option ids (§B-8a).
         expect(result.registration).toMatchObject({
           firstName: 'Edited',
-          staffId: 'NEW-STAFF',
           departmentId: 3,
           department: 'New Dept',
           personnelRoleId: 4,
@@ -1709,53 +1656,6 @@ describe('LineUserService', () => {
         ]
       )[0].select;
       expect(firstSelect).not.toHaveProperty('access');
-    });
-
-    it('AC-B5 — a staffId held by ANOTHER registration is a 409 STAFF_ID_TAKEN', async () => {
-      lineUser.findUnique.mockResolvedValueOnce({
-        id: 'lu-1',
-        deletedAt: null,
-      });
-      lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
-      const tx = {
-        department: { findFirst: jest.fn().mockResolvedValue({ id: 3 }) },
-        personnelRole: { findFirst: jest.fn().mockResolvedValue({ id: 4 }) },
-        lineUserRegistration: {
-          update: jest.fn().mockRejectedValue(
-            new Prisma.PrismaClientKnownRequestError('unique', {
-              code: 'P2002',
-              clientVersion: 'x',
-              meta: { target: ['staffId'] },
-            }),
-          ),
-        },
-      };
-      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
-        cb(tx),
-      );
-
-      await expect(
-        service.updateRegistrationByAdmin(
-          'lu-1',
-          ADMIN_EDIT_DTO,
-          SystemRole.ADMIN,
-        ),
-      ).rejects.toThrow(new ConflictException(STAFF_ID_TAKEN));
-    });
-
-    it('AC-B5 — re-submitting the row’s OWN current staffId does not self-collide (no false 409)', async () => {
-      // A Prisma update writing the row's own staffId does not violate the unique constraint, so the
-      // update resolves and the method returns 200 — there is no manual own-id exclusion to get wrong.
-      const tx = primeSuccess();
-
-      const result = await service.updateRegistrationByAdmin(
-        'lu-1',
-        ADMIN_EDIT_DTO,
-        SystemRole.ADMIN,
-      );
-
-      expect(tx.lineUserRegistration.update).toHaveBeenCalled();
-      expect(result.access).toBe(AppAccess.ALLOWED);
     });
 
     it.each([SystemRole.ADMIN, SystemRole.SUPER_ADMIN])(
@@ -2151,7 +2051,6 @@ describe('LineUserService', () => {
         {
           firstName: 'Edited',
           lastName: 'Name',
-          staffId: 'NEW-STAFF',
           phone: '099-999-9999',
           departmentId: 3,
           personnelRoleId: 4,
@@ -2190,10 +2089,9 @@ describe('LineUserService', () => {
         .find((msg) => msg.includes('Realtime publish failed'));
       expect(line0).toContain('id=lu-1');
       expect(line0).toContain('kind=updated');
-      // PDPA: never a name, phone, staffId or the DTO itself.
+      // PDPA: never a name, phone or the DTO itself.
       expect(line0).not.toContain('Alice');
       expect(line0).not.toContain('081-234-5678');
-      expect(line0).not.toContain('6412345678');
       warn.mockRestore();
     });
 

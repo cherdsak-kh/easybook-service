@@ -70,7 +70,7 @@ model LineUser {
 }
 
 /// Personnel identity a LINE end-user submits to move from UNREGISTERED -> PENDING.
-/// 1:1 with LineUser. Holds PDPA-governed PII (real name, university ID, phone).
+/// 1:1 with LineUser. Holds PDPA-governed PII (real name, phone).
 model LineUserRegistration {
   id String @id @default(cuid())
 
@@ -82,11 +82,6 @@ model LineUserRegistration {
 
   firstName String
   lastName  String
-
-  /// University staff/personnel ID. Globally @unique — one ID identifies one person, so two
-  /// registrations sharing an ID is a data error the DB rejects (P2002 -> 409 in the endpoint).
-  /// Renamed from `studentStaffId` (SC-B1): the domain targets educational personnel/staff.
-  staffId String @unique
 
   /// Loosely validated in the DTO (Thai formats), mirroring SystemUser.phoneNumber. Stored as given.
   phone String

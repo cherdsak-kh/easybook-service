@@ -128,7 +128,6 @@ describe('LineUsersController', () => {
     const dto = {
       firstName: 'Somchai',
       lastName: 'Jaidee',
-      staffId: '6412345678',
       phone: '081-234-5678',
       departmentId: 1,
       personnelRoleId: 2,

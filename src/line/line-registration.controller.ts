@@ -120,7 +120,7 @@ export class LineRegistrationController {
     type: ErrorResponseDto,
   })
   @ApiConflictResponse({
-    description: 'Already registered, or the staff ID is taken.',
+    description: 'This LINE user is already registered.',
     type: ErrorResponseDto,
   })
   @ApiBadGatewayResponse({
@@ -139,7 +139,7 @@ export class LineRegistrationController {
   @ApiOperation({
     summary: 'Edit your registration while PENDING (full re-submit).',
     description:
-      'A caller whose `access` is strictly `PENDING` may update all their registration fields. `ALLOWED`/`BLOCKED`/`UNREGISTERED` → `403` (no partial write). `access` stays `PENDING` and the rich menu stays `TYPE_1`; no LINE push fires. Same validation as register (options must be non-deleted; a `staffId` taken by another registration → `409`; re-submitting your own is fine). No `lineUserId` body field.',
+      'A caller whose `access` is strictly `PENDING` may update all their registration fields. `ALLOWED`/`BLOCKED`/`UNREGISTERED` → `403` (no partial write). `access` stays `PENDING` and the rich menu stays `TYPE_1`; no LINE push fires. Same validation as register (options must be non-deleted). No `lineUserId` body field.',
   })
   @ApiOkResponse({
     description: 'Updated; still PENDING.',
@@ -157,10 +157,6 @@ export class LineRegistrationController {
   @ApiForbiddenResponse({
     description:
       'The caller is not PENDING (ALLOWED / BLOCKED / UNREGISTERED).',
-    type: ErrorResponseDto,
-  })
-  @ApiConflictResponse({
-    description: 'The staff ID is taken by another registration.',
     type: ErrorResponseDto,
   })
   @ApiBadGatewayResponse({

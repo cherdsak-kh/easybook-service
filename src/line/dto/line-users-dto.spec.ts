@@ -152,7 +152,6 @@ describe('CreateLineUserRegistrationDto (through the global ValidationPipe)', ()
   const VALID = {
     firstName: 'Somchai',
     lastName: 'Jaidee',
-    staffId: '6412345678',
     phone: '081-234-5678',
     departmentId: 1,
     personnelRoleId: 2,
@@ -177,18 +176,24 @@ describe('CreateLineUserRegistrationDto (through the global ValidationPipe)', ()
     );
   });
 
-  it('rejects the removed free-text `department`/`role`/`studentStaffId` keys (SC-B1)', async () => {
+  // `forbidNonWhitelisted` is key-agnostic: every property absent from the DTO is a 400, so this one
+  // assertion covers every retired registration key — the free-text `department`/`role` pair AND the
+  // personnel-ID field dropped in this sprint (its current spelling is deliberately not written
+  // anywhere under src/ or test/, so `studentStaffId`, the same field's earlier name, stands in).
+  it('rejects retired registration keys — a stale client gets a 400, never a silent accept', async () => {
     const messages = await messagesOf({
       ...VALID,
       department: 'Computer Science',
       role: 'Student',
+      studentStaffId: '6412345678',
     });
     const joined = messages.join(' ');
     expect(joined).toContain('property department should not exist');
     expect(joined).toContain('property role should not exist');
+    expect(joined).toContain('property studentStaffId should not exist');
   });
 
-  it.each(['firstName', 'lastName', 'staffId'])(
+  it.each(['firstName', 'lastName'])(
     'rejects a blank %s (SC-B1/SC-B6)',
     async (field) => {
       const messages = await messagesOf({ ...VALID, [field]: '   ' });
@@ -221,7 +226,6 @@ describe('AdminUpdateLineUserRegistrationDto (through the global ValidationPipe)
   const VALID = {
     firstName: 'Somchai',
     lastName: 'Jaidee',
-    staffId: '6412345678',
     phone: '081-234-5678',
     departmentId: 1,
     personnelRoleId: 2,
@@ -249,7 +253,7 @@ describe('AdminUpdateLineUserRegistrationDto (through the global ValidationPipe)
     );
   });
 
-  it.each(['firstName', 'lastName', 'staffId'])(
+  it.each(['firstName', 'lastName'])(
     'AC-B4 — rejects a blank %s',
     async (field) => {
       const messages = await messagesOf({ ...VALID, [field]: '   ' });

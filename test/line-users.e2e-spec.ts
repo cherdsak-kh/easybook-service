@@ -46,7 +46,6 @@ interface Session {
 interface RegistrationSummary {
   firstName: string;
   lastName: string;
-  staffId: string;
   phone: string;
   departmentId: number;
   department: string;
@@ -205,7 +204,6 @@ describe('LINE Users management (e2e)', () => {
         lineUserId: luIds[`${LU_PREFIX}allowed`],
         firstName: 'Bob',
         lastName: 'Allowed',
-        staffId: `${LU_PREFIX}stid-allowed`,
         phone: '081-000-0000',
         departmentId: optionIds.departmentId,
         personnelRoleId: optionIds.personnelRoleId,
@@ -354,7 +352,6 @@ describe('LINE Users management (e2e)', () => {
       expect(allowed?.registration).toEqual({
         firstName: 'Bob',
         lastName: 'Allowed',
-        staffId: `${LU_PREFIX}stid-allowed`,
         phone: '081-000-0000',
         // §B-8a additive: the summary now carries the raw FK ids (for the admin edit modal's
         // dropdown pre-select) alongside the RESOLVED option names.
@@ -674,7 +671,6 @@ describe('LINE Users management (e2e)', () => {
     const validBody = () => ({
       firstName: 'Edited',
       lastName: 'Person',
-      staffId: `${LU_PREFIX}stid-edited`,
       phone: '099-888-7777',
       departmentId: optionIds.departmentId,
       personnelRoleId: optionIds.personnelRoleId,
@@ -686,7 +682,6 @@ describe('LINE Users management (e2e)', () => {
         select: {
           firstName: true,
           lastName: true,
-          staffId: true,
           phone: true,
           departmentId: true,
           personnelRoleId: true,
@@ -718,17 +713,15 @@ describe('LINE Users management (e2e)', () => {
       expect(body.registration).toMatchObject({
         firstName: 'Edited',
         lastName: 'Person',
-        staffId: `${LU_PREFIX}stid-edited`,
         phone: '099-888-7777',
         departmentId: optionIds.departmentId,
         personnelRoleId: optionIds.personnelRoleId,
       });
 
-      // All six fields persisted.
+      // All five fields persisted.
       expect(await regRowOf('allowed')).toEqual({
         firstName: 'Edited',
         lastName: 'Person',
-        staffId: `${LU_PREFIX}stid-edited`,
         phone: '099-888-7777',
         departmentId: optionIds.departmentId,
         personnelRoleId: optionIds.personnelRoleId,
@@ -748,50 +741,6 @@ describe('LINE Users management (e2e)', () => {
         .expect(200);
       const row = await regRowOf('allowed');
       expect(row?.firstName).toBe('BySuper');
-    });
-
-    it('AC-B5 — re-submitting the row’s OWN current staffId is not a false 409', async () => {
-      const { agent, token } = await login(ADMIN);
-      await agent
-        .patch(regUrl('allowed'))
-        .set('x-csrf-token', token)
-        // keep the fixture's existing staffId, change only the name
-        .send({
-          ...validBody(),
-          staffId: `${LU_PREFIX}stid-allowed`,
-          firstName: 'SameStaffId',
-        })
-        .expect(200);
-      const row = await regRowOf('allowed');
-      expect(row?.staffId).toBe(`${LU_PREFIX}stid-allowed`);
-      expect(row?.firstName).toBe('SameStaffId');
-    });
-
-    it('AC-B5 — a staffId held by ANOTHER registration is a 409', async () => {
-      // Give the PENDING fixture its own registration with a distinct staffId.
-      await prisma.lineUserRegistration.create({
-        data: {
-          lineUserId: luIds[`${LU_PREFIX}pending`],
-          firstName: 'Other',
-          lastName: 'Holder',
-          staffId: `${LU_PREFIX}stid-other`,
-          phone: '081-111-1111',
-          departmentId: optionIds.departmentId,
-          personnelRoleId: optionIds.personnelRoleId,
-        },
-      });
-
-      const { agent, token } = await login(ADMIN);
-      await agent
-        .patch(regUrl('allowed'))
-        .set('x-csrf-token', token)
-        .send({ ...validBody(), staffId: `${LU_PREFIX}stid-other` })
-        .expect(409);
-
-      // The clash left the row unchanged.
-      expect((await regRowOf('allowed'))?.staffId).toBe(
-        `${LU_PREFIX}stid-allowed`,
-      );
     });
 
     it('AC-B6 — a system-reserved option is 400 for BOTH ADMIN and SUPER_ADMIN (reserved-for-everyone)', async () => {
@@ -863,7 +812,6 @@ describe('LINE Users management (e2e)', () => {
           lineUserId: luIds[`${LU_PREFIX}deleted`],
           firstName: 'Ghost',
           lastName: 'User',
-          staffId: `${LU_PREFIX}stid-deleted`,
           phone: '082-222-2222',
           departmentId: optionIds.departmentId,
           personnelRoleId: optionIds.personnelRoleId,

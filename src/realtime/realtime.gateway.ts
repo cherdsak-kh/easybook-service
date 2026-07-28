@@ -143,7 +143,7 @@ export class RealtimeGateway
    * and swallowed. It must never roll back or fail an HTTP mutation.
    *
    * PII discipline: the log line carries the event name and `id=` only — never the DTO, never a
-   * name, phone or staffId.
+   * name or phone number.
    */
   private emit(event: string, payload: unknown, id: string): void {
     try {

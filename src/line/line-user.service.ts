@@ -33,7 +33,6 @@ import {
   LINE_USER_REGISTRATION_NOT_FOUND,
   REGISTRATION_NOT_EDITABLE,
   REJECTION_REASON_REQUIRED,
-  STAFF_ID_TAKEN,
 } from './line-users.errors';
 import { RICH_MENU_SPECS } from './rich-menu.constants';
 
@@ -86,7 +85,7 @@ export const buildRejectionMessage = (reason: string): string =>
  * THE one definition of "a publicly visible LineUser" — exactly the `LineUserResponseDto` fields.
  * Kept explicit so the DTO stays the response boundary (never `deletedAt`/`language`/audit columns),
  * mirroring `system-users.fields.ts`'s `PUBLIC_FIELDS`. The nested `registration` select is the
- * compact admin summary: `staffId` + `phone` + the RESOLVED option names (via the FK relations, with
+ * compact admin summary: the name + `phone` + the RESOLVED option names (via the FK relations, with
  * NO `deletedAt` filter — a soft-deleted option must still resolve its name for display, SC-2.4).
  */
 export const LINE_USER_PUBLIC_FIELDS = {
@@ -102,7 +101,6 @@ export const LINE_USER_PUBLIC_FIELDS = {
     select: {
       firstName: true,
       lastName: true,
-      staffId: true,
       phone: true,
       departmentId: true,
       personnelRoleId: true,
@@ -126,7 +124,6 @@ const REGISTRATION_OWNER_SELECT = {
   id: true,
   firstName: true,
   lastName: true,
-  staffId: true,
   phone: true,
   departmentId: true,
   personnelRoleId: true,
@@ -182,7 +179,7 @@ export class LineUserService {
       if (kind === 'created') this.realtime.emitLineUserCreated(dto);
       else this.realtime.emitLineUserUpdated(dto);
     } catch (error) {
-      // PII discipline: id + kind only. Never the DTO, never a name/phone/staffId.
+      // PII discipline: id + kind only. Never the DTO, never a name or phone.
       this.logger.warn(
         `Realtime publish failed (write already committed). id=${id} kind=${kind}: ${
           error instanceof Error ? error.message : String(error)
@@ -413,8 +410,7 @@ export class LineUserService {
    *
    * One `$transaction`: get-or-create the active LineUser, gate on `UNREGISTERED`, assert both option
    * ids are non-deleted (`400`), create the 1:1 registration, then flip `access` to `PENDING`. A
-   * `P2002` on the LineUser 1:1 (a race) or on `staffId` (used by someone else) becomes a `409` with
-   * distinct messages (design §3.1 / SC-3.2).
+   * `P2002` on the LineUser 1:1 (a race) becomes a `409 ALREADY_REGISTERED` (design §3.1).
    */
   async register(
     lineUserId: string,
@@ -451,7 +447,6 @@ export class LineUserService {
               lineUserId: user.id,
               firstName: dto.firstName,
               lastName: dto.lastName,
-              staffId: dto.staffId,
               phone: dto.phone,
               departmentId: dto.departmentId,
               personnelRoleId: dto.personnelRoleId,
@@ -499,9 +494,13 @@ export class LineUserService {
    *
    * State gate (SC-B9): permitted ONLY while `access ∈ {PENDING, REJECTED}`. `ALLOWED`/`BLOCKED`/
    * `UNREGISTERED`/no-row → `403` (authorization-by-state), deterministic with no partial write —
-   * distinct from register's duplicate-resource `409`. Options are re-validated non-deleted (`400`);
-   * a `staffId` collision with ANOTHER registration → `409` (re-submitting the caller's own value is
-   * a no-op). `richMenuType` stays `TYPE_1` (both PENDING and REJECTED derive TYPE_1).
+   * distinct from register's duplicate-resource `409`. Options are re-validated non-deleted (`400`).
+   * `richMenuType` stays `TYPE_1` (both PENDING and REJECTED derive TYPE_1).
+   *
+   * This path CANNOT raise a `409`: it never writes `lineUserId` (the only unique key left on
+   * `LineUserRegistration`), so no duplicate-key error is reachable and `mapRegistrationWriteError`
+   * is deliberately NOT wired in here — an unexpected Prisma error surfaces as a 500, not a
+   * misleading conflict.
    *
    * A REJECTED caller who resubmits RE-ENTERS review: in the SAME transaction the access flips
    * `REJECTED → PENDING` and `rejectionReason` is cleared to null (invariant), and the existing
@@ -530,58 +529,49 @@ export class LineUserService {
 
     const wasRejected = user.access === AppAccess.REJECTED;
 
-    try {
-      // One transaction so a partial write can't leave `access: REJECTED` with an already-edited
-      // registration (or vice versa). Options are re-validated non-deleted/non-reserved (400) first,
-      // mirroring register()'s shape. A REJECTED resubmit ALSO flips access → PENDING and clears the
-      // reason in the SAME transaction (invariant); the PENDING-caller path performs no lineUser write.
-      const updated = await this.prisma.$transaction(async (tx) => {
-        await this.assertActiveOptions(
-          tx,
-          dto.departmentId,
-          dto.personnelRoleId,
-        );
+    // One transaction so a partial write can't leave `access: REJECTED` with an already-edited
+    // registration (or vice versa). Options are re-validated non-deleted/non-reserved (400) first,
+    // mirroring register()'s shape. A REJECTED resubmit ALSO flips access → PENDING and clears the
+    // reason in the SAME transaction (invariant); the PENDING-caller path performs no lineUser write.
+    const updated = await this.prisma.$transaction(async (tx) => {
+      await this.assertActiveOptions(tx, dto.departmentId, dto.personnelRoleId);
 
-        const registration = await tx.lineUserRegistration.update({
-          where: { lineUserId: user.id },
-          data: {
-            firstName: dto.firstName,
-            lastName: dto.lastName,
-            staffId: dto.staffId,
-            phone: dto.phone,
-            departmentId: dto.departmentId,
-            personnelRoleId: dto.personnelRoleId,
-          },
-          select: REGISTRATION_OWNER_SELECT,
-        });
-
-        if (wasRejected) {
-          await tx.lineUser.update({
-            where: { id: user.id },
-            data: { access: AppAccess.PENDING, rejectionReason: null },
-          });
-        }
-
-        return registration;
+      const registration = await tx.lineUserRegistration.update({
+        where: { lineUserId: user.id },
+        data: {
+          firstName: dto.firstName,
+          lastName: dto.lastName,
+          phone: dto.phone,
+          departmentId: dto.departmentId,
+          personnelRoleId: dto.personnelRoleId,
+        },
+        select: REGISTRATION_OWNER_SELECT,
       });
 
-      this.logger.log(`LineUser registration edited. id=${user.id}`);
-
-      // Emit site 3 — after the `$transaction` resolves, before the conditional PENDING push.
-      await this.publish('updated', user.id);
-
-      // A REJECTED resubmit re-enters review → send the existing PENDING ack, AFTER the transaction
-      // commits (fail-soft) so a push failure can't roll back the committed resubmit. A PENDING edit
-      // sends NO push (Q6). Pushed to the caller's verified U… id (the method param), never the cuid.
       if (wasRejected) {
-        await this.notifyAccessChange(lineUserId, AppAccess.PENDING);
+        await tx.lineUser.update({
+          where: { id: user.id },
+          data: { access: AppAccess.PENDING, rejectionReason: null },
+        });
       }
 
-      // Both paths land on PENDING with the reason cleared (REJECTED resubmit) or already null (edit).
-      return this.toStatusDto(AppAccess.PENDING, updated, null);
-    } catch (error) {
-      throw this.mapRegistrationWriteError(error);
+      return registration;
+    });
+
+    this.logger.log(`LineUser registration edited. id=${user.id}`);
+
+    // Emit site 3 — after the `$transaction` resolves, before the conditional PENDING push.
+    await this.publish('updated', user.id);
+
+    // A REJECTED resubmit re-enters review → send the existing PENDING ack, AFTER the transaction
+    // commits (fail-soft) so a push failure can't roll back the committed resubmit. A PENDING edit
+    // sends NO push (Q6). Pushed to the caller's verified U… id (the method param), never the cuid.
+    if (wasRejected) {
+      await this.notifyAccessChange(lineUserId, AppAccess.PENDING);
     }
+
+    // Both paths land on PENDING with the reason cleared (REJECTED resubmit) or already null (edit).
+    return this.toStatusDto(AppAccess.PENDING, updated, null);
   }
 
   /**
@@ -781,7 +771,7 @@ export class LineUserService {
 
   /**
    * Admin edit of a LINE user's registration fields (`PATCH /line-users/:id/registration`). Keyed on
-   * the cuid `LineUser.id`. A FULL re-submit of the six editable fields; `role` is the authenticated
+   * the cuid `LineUser.id`. A FULL re-submit of the five editable fields; `role` is the authenticated
    * actor's `SystemRole` and governs only the soft-deleted visibility (below), NOT the fields.
    *
    * **Orthogonal to the Item 3 access matrix (AC-B9/AC-B10):** this method never reads or writes
@@ -798,9 +788,11 @@ export class LineUserService {
    *
    * `access` is deliberately NOT selected — the edit is not PENDING-gated. `assertActiveOptions` is
    * the SAME role-blind guard the LIFF self-edit uses: a system-reserved option is rejected for EVERY
-   * actor, SUPER_ADMIN included (a LINE end-user is never a System Developer). `staffId` is globally
-   * `@unique`; a collision with ANOTHER registration → 409 via `mapRegistrationWriteError` (P2002),
-   * while re-writing the row's own current `staffId` does not self-collide (no false 409).
+   * actor, SUPER_ADMIN included (a LINE end-user is never a System Developer).
+   *
+   * Like the LIFF self-edit, this path CANNOT raise a `409`: none of the five editable fields is
+   * unique and `lineUserId` (the only unique key) is never written, so no duplicate-key error is
+   * reachable and `mapRegistrationWriteError` is deliberately NOT wired in here.
    */
   async updateRegistrationByAdmin(
     id: string,
@@ -831,31 +823,21 @@ export class LineUserService {
       throw new NotFoundException(LINE_USER_REGISTRATION_NOT_FOUND);
     }
 
-    try {
-      // One transaction so the option-validity check and the write are atomic (as `register` does).
-      await this.prisma.$transaction(async (tx) => {
-        await this.assertActiveOptions(
-          tx,
-          dto.departmentId,
-          dto.personnelRoleId,
-        );
-        await tx.lineUserRegistration.update({
-          // The 1:1 key. Writing the row's own current staffId is a no-op — no self-collision.
-          where: { lineUserId: row.id },
-          data: {
-            firstName: dto.firstName,
-            lastName: dto.lastName,
-            staffId: dto.staffId,
-            phone: dto.phone,
-            departmentId: dto.departmentId,
-            personnelRoleId: dto.personnelRoleId,
-          },
-        });
+    // One transaction so the option-validity check and the write are atomic (as `register` does).
+    await this.prisma.$transaction(async (tx) => {
+      await this.assertActiveOptions(tx, dto.departmentId, dto.personnelRoleId);
+      await tx.lineUserRegistration.update({
+        // The 1:1 key — read-only here; the identity is immutable.
+        where: { lineUserId: row.id },
+        data: {
+          firstName: dto.firstName,
+          lastName: dto.lastName,
+          phone: dto.phone,
+          departmentId: dto.departmentId,
+          personnelRoleId: dto.personnelRoleId,
+        },
       });
-    } catch (error) {
-      // A P2002 on staffId → 409 STAFF_ID_TAKEN; the 400 from assertActiveOptions passes through.
-      throw this.mapRegistrationWriteError(error);
-    }
+    });
 
     const updated = await this.prisma.lineUser.findUnique({
       where: { id: row.id },
@@ -888,7 +870,6 @@ export class LineUserService {
         ? {
             firstName: user.registration.firstName,
             lastName: user.registration.lastName,
-            staffId: user.registration.staffId,
             phone: user.registration.phone,
             departmentId: user.registration.departmentId,
             department: user.registration.department.name,
@@ -900,25 +881,20 @@ export class LineUserService {
   }
 
   /**
-   * A duplicate-key from a registration write. On `staffId` → `409 STAFF_ID_TAKEN`; on the LineUser
-   * 1:1 (`lineUserId`, a register race) → `409 ALREADY_REGISTERED`. Deliberately-thrown
-   * `HttpException`s (the 400/403/409 raised inside the flow) pass straight through; anything else is
-   * rethrown unchanged.
+   * A duplicate-key from the `register` write. `lineUserId` (the LineUser 1:1) is the ONLY unique key
+   * left on `LineUserRegistration`, so any `P2002` here is a create race → `409 ALREADY_REGISTERED`.
+   * Deliberately-thrown `HttpException`s (the 400/403/409 raised inside the flow) pass straight
+   * through; anything else is rethrown unchanged.
+   *
+   * Wired into `register` ONLY. Neither PATCH path writes a unique column, so a duplicate key is
+   * unreachable there and neither endpoint advertises a 409 any more.
    */
   private mapRegistrationWriteError(error: unknown): Error {
     if (
       error instanceof Prisma.PrismaClientKnownRequestError &&
       error.code === 'P2002'
     ) {
-      const rawTarget = error.meta?.target;
-      const target = Array.isArray(rawTarget)
-        ? rawTarget.join(',')
-        : typeof rawTarget === 'string'
-          ? rawTarget
-          : '';
-      return new ConflictException(
-        target.includes('staffId') ? STAFF_ID_TAKEN : ALREADY_REGISTERED,
-      );
+      return new ConflictException(ALREADY_REGISTERED);
     }
     return error instanceof Error ? error : new Error(String(error));
   }
@@ -944,7 +920,6 @@ export class LineUserService {
       id: registration.id,
       firstName: registration.firstName,
       lastName: registration.lastName,
-      staffId: registration.staffId,
       phone: registration.phone,
       departmentId: registration.departmentId,
       department: registration.department.name,

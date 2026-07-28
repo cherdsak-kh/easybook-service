@@ -24,7 +24,10 @@ const trim = ({ value }: { value: unknown }): unknown =>
  * `Department` / `PersonnelRole` option tables (validated non-deleted in the service → `400` on a
  * deleted/unknown id). `@Type(() => Number)` makes the string→number coercion explicit and reliable
  * under the global `transform: true` pipe, and `@IsInt()` rejects non-integer values. They replace
- * the former free-text `department`/`role`. `staffId` replaces `studentStaffId`.
+ * the former free-text `department`/`role`.
+ *
+ * The personnel-ID field was removed as a domain concept; a stale client still sending it gets a
+ * `400` from `forbidNonWhitelisted`, never a silent accept.
  */
 export class CreateLineUserRegistrationDto {
   @ApiProperty({ example: 'Somchai', maxLength: 100 })
@@ -40,17 +43,6 @@ export class CreateLineUserRegistrationDto {
   @IsNotEmpty()
   @MaxLength(100)
   lastName!: string;
-
-  @ApiProperty({
-    example: '6412345678',
-    maxLength: 50,
-    description: 'University staff/personnel ID. Globally unique.',
-  })
-  @Transform(trim)
-  @IsString()
-  @IsNotEmpty()
-  @MaxLength(50)
-  staffId!: string;
 
   // Deliberately loose (Thai-friendly), mirroring SystemUser.phoneNumber: libphonenumber would
   // reject the local/office formats real users type. Display/notification only — not a lookup key.

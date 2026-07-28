@@ -16,9 +16,6 @@ export class LineUserRegistrationResponseDto {
   @ApiProperty({ example: 'Jaidee' })
   lastName!: string;
 
-  @ApiProperty({ example: '6412345678' })
-  staffId!: string;
-
   @ApiProperty({ example: '081-234-5678' })
   phone!: string;
 

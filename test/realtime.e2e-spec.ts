@@ -1,3 +1,28 @@
+/**
+ * ⚠️ These two writes MUST sit physically ABOVE the import block — "before the app boots" is NOT
+ * enough. `ConfigModule.forRoot()` executes at *import* time of `../src/app.module` (pulled in via
+ * `./e2e-app`): it loads `.env`, runs `validate`, and the resulting object is what
+ * `ConfigService.get()` reads — so `.env` wins over any later `process.env` write, and dotenv itself
+ * never overwrites a key that is already set. Assigning in `beforeAll` is therefore too late *by
+ * construction*: `.env`'s `WS_REVALIDATE_INTERVAL_MS=30000` would pin the sweep to 30 s (making the
+ * AC-B12 revocation assertions time out at 3 s) and `.env`'s CORS list would silently replace the
+ * allowlist this suite means to test. TypeScript's CommonJS emit preserves source order between
+ * top-level statements and the `require()` calls it generates for these imports, which is what makes
+ * this placement work — same precedent as `line-registration.e2e-spec.ts`'s `LINE_LOGIN_CHANNEL_ID`.
+ *
+ * `??` so an explicit shell export still wins. `ENV_BACKUP` is captured BEFORE the writes so
+ * `afterAll` can leave `process.env` exactly as it found it: `test/jest-e2e.json` pins
+ * `maxWorkers: 1`, so a leaked 500 ms sweep interval would bleed into the next suite in this worker.
+ */
+const ENV_BACKUP: Record<string, string | undefined> = {
+  WS_REVALIDATE_INTERVAL_MS: process.env.WS_REVALIDATE_INTERVAL_MS,
+  CORS_ORIGIN: process.env.CORS_ORIGIN,
+};
+process.env.WS_REVALIDATE_INTERVAL_MS =
+  process.env.WS_REVALIDATE_INTERVAL_MS ?? '500';
+process.env.CORS_ORIGIN =
+  process.env.CORS_ORIGIN ?? 'http://localhost:2200,http://127.0.0.1:2200';
+
 import type { INestApplication } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { AppAccess, SystemRole } from '@prisma/client';
@@ -40,21 +65,23 @@ const STAFF = `${SU_PREFIX}staff@easybook.local`;
 const url = (path: string) => `${API_BASE_PATH}${path}`;
 
 /**
- * The suite pins its own allowlist rather than inheriting the developer's `.env`, so the
- * `FORBIDDEN_ORIGIN` case can never pass or fail for an environmental reason. A comma-separated
- * value also exercises `resolveCorsOrigin`'s list-splitting on the socket side.
+ * The suite pins its own allowlist rather than inheriting the developer's `.env` (that pinning is
+ * the top-of-file write), so the `FOREIGN_ORIGIN` case can never pass or fail for an environmental
+ * reason. A comma-separated value also exercises `resolveCorsOrigin`'s list-splitting on the socket
+ * side. Read back from `process.env` rather than re-declared, so an exported override stays
+ * consistent with the allowlist the app actually resolved — `ALLOWED_ORIGIN` is the first entry.
  */
-const ALLOWED_ORIGIN = 'http://localhost:2200';
-const CORS_ORIGIN = `${ALLOWED_ORIGIN},http://127.0.0.1:2200`;
+const CORS_ORIGIN = process.env.CORS_ORIGIN;
+const ALLOWED_ORIGIN = CORS_ORIGIN.split(',')[0].trim();
 const FOREIGN_ORIGIN = 'http://evil.example';
 
 /**
  * 500 ms instead of the production 30 000 ms. The stated 35 s exposure window is arithmetic on this
  * interval, not a separate code path, so exercising the same mechanism 60× faster tests the same
- * guarantee. It MUST be set before the app boots — `RealtimeGateway` reads it via `ConfigService`
- * once, in `afterInit`.
+ * guarantee. It MUST be set before the app MODULE IS IMPORTED — not merely before the app boots; see
+ * the top-of-file write for why. `RealtimeGateway` reads it via `ConfigService` once, in `afterInit`.
  */
-const SWEEP_INTERVAL_MS = '500';
+const SWEEP_INTERVAL_MS = process.env.WS_REVALIDATE_INTERVAL_MS;
 
 /** The bound the revocation window is asserted against (design §4.4). */
 const REVOCATION_BUDGET_MS = 3_000;
@@ -104,7 +131,6 @@ describe('Realtime gateway (e2e)', () => {
   /** Measured time from "the revoking write returned" to "the socket was closed", for the log. */
   const revocationTimings: Array<[string, number]> = [];
 
-  const envBackup: Record<string, string | undefined> = {};
   const server = () => app.getHttpServer();
 
   // ───────────────────────────── helpers ─────────────────────────────
@@ -293,14 +319,10 @@ describe('Realtime gateway (e2e)', () => {
   // ───────────────────────────── lifecycle ─────────────────────────────
 
   beforeAll(async () => {
-    // BEFORE boot, or neither value is read: the gateway resolves the sweep period once in
-    // `afterInit`, and the adapter resolves the origin allowlist once in `createIOServer`.
-    for (const key of ['WS_REVALIDATE_INTERVAL_MS', 'CORS_ORIGIN']) {
-      envBackup[key] = process.env[key];
-    }
-    process.env.WS_REVALIDATE_INTERVAL_MS = SWEEP_INTERVAL_MS;
-    process.env.CORS_ORIGIN = CORS_ORIGIN;
-
+    // Both env values are pinned at the TOP OF THIS FILE, above the import block — by the time this
+    // hook runs, `ConfigModule.forRoot()` has already read them. The gateway resolves the sweep
+    // period once in `afterInit`, and the adapter resolves the origin allowlist once in
+    // `createIOServer`; setting either here would be a no-op. See the top-of-file note.
     app = await createE2eApp();
     prisma = prismaOf(app);
     redis = redisOf(app);
@@ -351,8 +373,9 @@ describe('Realtime gateway (e2e)', () => {
     await clearThrottleCounters(redis);
     await app.close();
 
-    // Restore, or a 500 ms sweep leaks into whichever suite Jest runs next in this worker.
-    for (const [key, value] of Object.entries(envBackup)) {
+    // Restore, or a 500 ms sweep leaks into whichever suite Jest runs next in this worker
+    // (`maxWorkers: 1`). `ENV_BACKUP` was captured at the top of the file, before the pinning writes.
+    for (const [key, value] of Object.entries(ENV_BACKUP)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }

@@ -36,11 +36,11 @@ export const LINE_USER_ACCESS_TRANSITION_FORBIDDEN =
   'You are not permitted to make this status change.';
 
 /**
- * Registration conflicts (design §3.1). Distinct messages so the frontend can tell the two apart:
- * the caller already has a registration vs. the submitted ID belongs to someone else.
+ * The one registration conflict (design §3.1): the caller already has a registration. `lineUserId`
+ * is now the ONLY unique key on `LineUserRegistration`, so this is the only P2002 the write paths
+ * can raise (see `mapRegistrationWriteError`).
  */
 export const ALREADY_REGISTERED = 'This LINE user is already registered.';
-export const STAFF_ID_TAKEN = 'This staff ID is already registered.';
 
 /**
  * A chosen `departmentId`/`personnelRoleId` did not resolve to a NON-DELETED option (SC-3.2/SC-B6).
