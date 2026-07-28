@@ -1,8 +1,8 @@
 import { CreateLineUserRegistrationDto } from './create-line-user-registration.dto';
 
 /**
- * The body for the admin `PATCH /line-users/:id/registration` — a FULL re-submit of the six editable
- * registration fields by an `ADMIN`/`SUPER_ADMIN`.
+ * The body for the admin `PATCH /line-users/:id/registration` — a FULL re-submit of the five
+ * editable registration fields by an `ADMIN`/`SUPER_ADMIN`.
  *
  * It `extends` `CreateLineUserRegistrationDto` so the validation shape is reused verbatim (required
  * fields, phone regex, non-empty names, `@Type(() => Number) @IsInt()`-coerced option ids) while

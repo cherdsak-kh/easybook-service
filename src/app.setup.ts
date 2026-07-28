@@ -7,7 +7,9 @@ import { ConfigService } from '@nestjs/config';
 import cookieParser from 'cookie-parser';
 import type { Redis } from 'ioredis';
 import { API_BASE_PATH } from './common/api.constants';
+import { resolveCorsOrigin } from './config/cors';
 import { CsrfService, csrfErrorHandler } from './csrf/csrf.service';
+import { SessionIoAdapter } from './realtime/session-io.adapter';
 import { REDIS_CLIENT } from './redis/redis.constants';
 import {
   createSessionMiddleware,
@@ -37,13 +39,13 @@ export function configureApp(app: INestApplication): void {
   //    With cookie sessions + `credentials: true` the allowlist is a security control, never `*`.
   //    `CORS_ORIGIN` may be a single origin or a comma-separated list (e.g. the Vite dev server
   //    plus a tunnel used for on-device LIFF testing); a list becomes an array of trimmed origins.
-  const corsOrigin = config.get<string>('CORS_ORIGIN', 'http://localhost:2200');
-  app.enableCors({
-    origin: corsOrigin.includes(',')
-      ? corsOrigin.split(',').map((origin) => origin.trim())
-      : corsOrigin,
-    credentials: true,
-  });
+  app.enableCors({ origin: resolveCorsOrigin(config), credentials: true });
+
+  // 1b. The Socket.IO adapter, registered BEFORE `app.init()` so `main.ts` and every e2e spec get
+  //     byte-identical socket wiring. It reads the SAME `resolveCorsOrigin` allowlist for both the
+  //     `cors` option (which only covers the polling transport) and `allowRequest`'s `Origin`
+  //     validation (which covers every transport and is the CSWSH control).
+  app.useWebSocketAdapter(new SessionIoAdapter(app));
 
   // 2. Versioned API surface. The root welcome banner (GET /) is excluded from the prefix so
   //    it answers at the bare origin (http://localhost:3300/) instead of 404-ing; everything

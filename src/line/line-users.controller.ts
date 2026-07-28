@@ -10,7 +10,6 @@ import {
 import { SystemRole } from '@prisma/client';
 import {
   ApiBadRequestResponse,
-  ApiConflictResponse,
   ApiCookieAuth,
   ApiForbiddenResponse,
   ApiHeader,
@@ -134,7 +133,7 @@ export class LineUsersController {
   @ApiOperation({
     summary: "Edit a LINE user's registration fields (admin).",
     description:
-      'Full re-submit of firstName, lastName, staffId, phone, departmentId, personnelRoleId. Does NOT change `access` or the rich menu — it is orthogonal to the approve/block transition matrix. Both ADMIN and SUPER_ADMIN may edit. A system-reserved or soft-deleted option id is rejected for every actor (400). For ADMIN a soft-deleted user is 404; SUPER_ADMIN may edit one, with no LINE side-effect.',
+      'Full re-submit of firstName, lastName, phone, departmentId, personnelRoleId. Does NOT change `access` or the rich menu — it is orthogonal to the approve/block transition matrix. Both ADMIN and SUPER_ADMIN may edit. A system-reserved or soft-deleted option id is rejected for every actor (400). For ADMIN a soft-deleted user is 404; SUPER_ADMIN may edit one, with no LINE side-effect.',
   })
   @ApiHeader({ name: 'x-csrf-token', required: true })
   @ApiOkResponse({ description: 'Updated.', type: LineUserResponseDto })
@@ -154,10 +153,6 @@ export class LineUsersController {
   @ApiNotFoundResponse({
     description:
       'Unknown id (both roles); a soft-deleted id for ADMIN; or the user exists but has no registration to edit.',
-    type: ErrorResponseDto,
-  })
-  @ApiConflictResponse({
-    description: 'The `staffId` is taken by another registration (P2002).',
     type: ErrorResponseDto,
   })
   @ApiServiceUnavailableResponse({

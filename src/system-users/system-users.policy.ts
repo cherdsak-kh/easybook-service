@@ -97,9 +97,29 @@ export function canPatch(
     case SystemRole.SUPER_ADMIN:
       return allow();
     case SystemRole.ADMIN:
-      // An ADMIN may address a STAFF target only — which already implies "may write isActive on
-      // a STAFF target only". A second explicit check would be the duplicated authz that drifts.
-      return target.role === SystemRole.STAFF
+      // An ADMIN may address a STAFF target — which already implies "may write isActive on a
+      // STAFF target only", so a second explicit check would be the duplicated authz that
+      // drifts — OR their OWN row (SELF-PROFILE-2, PO-approved; it removes an asymmetry with
+      // `case SUPER_ADMIN`, which has always permitted a self-patch).
+      //
+      // THREE things about the second disjunct, each of which a "simplification" would break:
+      //
+      //  1. It compares IDS, never roles and never emails. An ADMIN patching a DIFFERENT ADMIN
+      //     (or a SUPER_ADMIN) is still denied — there is no ADMIN -> ADMIN lateral widening.
+      //  2. It stays scoped INSIDE this case. Hoisting `if (actor.id === target.id) allow()`
+      //     above the switch would place it in front of `default:`, so a future @Roles(...)
+      //     widening to STAFF would silently hand STAFF a self-edit capability while the
+      //     defence-in-depth arm that exists to catch that widening never ran.
+      //  3. It does NOT re-check `role` / `isActive`. Step 5 runs FIRST and already denied a
+      //     self-patch carrying either key, so this branch is unreachable for them. A second
+      //     copy would duplicate the rule AND replace the 403 reason the frontend and the e2e
+      //     suite assert on (CANNOT_CHANGE_OWN_ROLE / CANNOT_CHANGE_OWN_ACTIVE_STATUS).
+      //
+      // The newly reachable consequence: an ADMIN self-patch now reaches the service's
+      // `assertOptionsAssignable`, where a SYSTEM-RESERVED departmentId/personnelRoleId is the
+      // same 400 as an unknown id — never a 403. That boundary is unchanged; it is simply
+      // reachable for the first time.
+      return target.role === SystemRole.STAFF || actor.id === target.id
         ? allow()
         : deny(ADMIN_MAY_ONLY_MODIFY_STAFF);
     default:

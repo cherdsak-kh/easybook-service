@@ -10,6 +10,7 @@ import {
 import { AppAccess, Prisma, SystemRole } from '@prisma/client';
 import type { LineUser, RichMenuType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { canAdminSetAccess } from './line-access.policy';
 import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
@@ -32,7 +33,6 @@ import {
   LINE_USER_REGISTRATION_NOT_FOUND,
   REGISTRATION_NOT_EDITABLE,
   REJECTION_REASON_REQUIRED,
-  STAFF_ID_TAKEN,
 } from './line-users.errors';
 import { RICH_MENU_SPECS } from './rich-menu.constants';
 
@@ -61,23 +61,31 @@ export const accessToRichMenuType = (access: AppAccess): RichMenuType =>
 export const ACCESS_NOTIFICATION_MESSAGES: Record<AppAccess, string | null> = {
   UNREGISTERED: null,
   PENDING:
-    'ระบบได้รับข้อมูลการลงทะเบียนของคุณแล้ว เจ้าหน้าที่กำลังดำเนินการตรวจสอบข้อมูลกรุณารอสักครู่ครับ ⏳',
+    'ระบบได้รับข้อมูลการลงทะเบียนของคุณแล้ว เจ้าหน้าที่กำลังดำเนินการตรวจสอบข้อมูล กรุณารอสักครู่ ⏳',
   ALLOWED:
-    'ยินดีด้วย! บัญชีของคุณได้รับการอนุมัติการใช้งานเรียบร้อยแล้ว คุณสามารถกดปุ่มจองคิวที่เมนูด้านล่างเพื่อทำรายการได้ทันทีครับ 🎉',
+    'ยินดีด้วย! บัญชีของคุณได้รับการอนุมัติการใช้งานเรียบร้อยแล้ว คุณสามารถกดที่เมนูด้านล่างเพื่อใช้งานระบบได้ทันที 🎉',
   BLOCKED:
-    'ขออภัย บัญชีการใช้งานของคุณถูกระงับสิทธิ์ชั่วคราวโดยผู้ดูแลระบบ หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่สถาบัน',
-  // The reject copy is built in `notifyRejection` (it interpolates the mandatory reason), NOT here —
-  // so this entry is `null` ("notifyAccessChange sends nothing for REJECTED"). Keeping the reject
-  // copy out of this record is deliberate: this record is register()'s single source for the PENDING
-  // ack and must not be overwritten or repurposed.
+    'ขออภัย บัญชีการใช้งานของคุณถูกระงับสิทธิ์ชั่วคราว หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่',
+  // The reject copy is built by `buildRejectionMessage` below (it interpolates the mandatory
+  // reason), NOT here — so this entry is `null` ("notifyAccessChange sends nothing for REJECTED").
+  // Keeping the reject copy out of this record is deliberate: this record is register()'s single
+  // source for the PENDING ack and must not be overwritten or repurposed.
   REJECTED: null,
 };
+
+/**
+ * THE one definition of the Reject push copy. It cannot live in `ACCESS_NOTIFICATION_MESSAGES`
+ * (a static `Record`) because it interpolates the mandatory rejection reason — hence a builder,
+ * kept adjacent to that record so both copy sources sit together.
+ */
+export const buildRejectionMessage = (reason: string): string =>
+  `ขออภัย การลงทะเบียนของคุณไม่ผ่านการอนุมัติ เนื่องจาก: ${reason} กรุณาเปิดแอปพลิเคชันเพื่อแก้ไขข้อมูลใหม่อีกครั้ง`;
 
 /**
  * THE one definition of "a publicly visible LineUser" — exactly the `LineUserResponseDto` fields.
  * Kept explicit so the DTO stays the response boundary (never `deletedAt`/`language`/audit columns),
  * mirroring `system-users.fields.ts`'s `PUBLIC_FIELDS`. The nested `registration` select is the
- * compact admin summary: `staffId` + `phone` + the RESOLVED option names (via the FK relations, with
+ * compact admin summary: the name + `phone` + the RESOLVED option names (via the FK relations, with
  * NO `deletedAt` filter — a soft-deleted option must still resolve its name for display, SC-2.4).
  */
 export const LINE_USER_PUBLIC_FIELDS = {
@@ -93,7 +101,6 @@ export const LINE_USER_PUBLIC_FIELDS = {
     select: {
       firstName: true,
       lastName: true,
-      staffId: true,
       phone: true,
       departmentId: true,
       personnelRoleId: true,
@@ -117,7 +124,6 @@ const REGISTRATION_OWNER_SELECT = {
   id: true,
   firstName: true,
   lastName: true,
-  staffId: true,
   phone: true,
   departmentId: true,
   personnelRoleId: true,
@@ -139,13 +145,54 @@ export class LineUserService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly line: LineService,
+    private readonly realtime: RealtimeGateway,
   ) {}
+
+  /**
+   * Fail-soft realtime publish. NEVER throws — it mirrors `notifyAccessChange`'s discipline: the
+   * write has already committed, so a fan-out failure is logged at `warn` and swallowed and can
+   * never roll back or fail the mutation.
+   *
+   * The `deletedAt: null` filter is **LOAD-BEARING, not defensive**: it is what structurally
+   * guarantees a soft-deleted row can never reach a `created`/`updated` event, for every call site
+   * at once — including the SUPER_ADMIN-only soft-deleted reach in `updateAccess` /
+   * `updateRegistrationByAdmin`, which would otherwise inject a row into every admin's table that
+   * `GET /line-users` refuses to return.
+   *
+   * The extra primary-key read is a deliberate trade: `updateAccess` and `updateRegistrationByAdmin`
+   * already hold a `PublicLineUser`, but using the row in hand there and re-reading elsewhere would
+   * mean two payload construction rules and two places for the soft-delete guard to be forgotten.
+   * **Do not "optimise" this away** without re-establishing that guarantee at every call site.
+   */
+  private async publish(
+    kind: 'created' | 'updated',
+    id: string,
+  ): Promise<void> {
+    try {
+      const row = await this.prisma.lineUser.findFirst({
+        where: { id, deletedAt: null },
+        select: LINE_USER_PUBLIC_FIELDS,
+      });
+      // Soft-deleted or gone → no event, by design.
+      if (!row) return;
+      const dto = this.toDto(row);
+      if (kind === 'created') this.realtime.emitLineUserCreated(dto);
+      else this.realtime.emitLineUserUpdated(dto);
+    } catch (error) {
+      // PII discipline: id + kind only. Never the DTO, never a name or phone.
+      this.logger.warn(
+        `Realtime publish failed (write already committed). id=${id} kind=${kind}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
 
   /**
    * Create the user on first follow, or restore (clear deletedAt) + refresh the
    * profile on re-follow. Existing `access`/`richMenuType` are preserved.
    */
-  upsertOnFollow(profile: LineProfileInput): Promise<LineUser> {
+  async upsertOnFollow(profile: LineProfileInput): Promise<LineUser> {
     const { lineUserId, ...rest } = profile;
     const data = {
       displayName: rest.displayName ?? null,
@@ -153,19 +200,42 @@ export class LineUserService {
       statusMessage: rest.statusMessage ?? null,
       language: rest.language ?? null,
     };
-    return this.prisma.lineUser.upsert({
+    const user = await this.prisma.lineUser.upsert({
       where: { lineUserId },
       create: { lineUserId, ...data },
       update: { ...data, deletedAt: null, followedAt: new Date() },
     });
+
+    // Emit site 1. A re-follow after an unfollow re-surfaces the row, so `created` is correct; the
+    // client's `created` handler is an upsert, so a plain profile refresh is harmless.
+    // `LineWebhookService` stays unchanged — the emit belongs to the service that owns the model.
+    await this.publish('created', user.id);
+    return user;
   }
 
-  /** Soft-delete on unfollow (no error if already absent/deleted). */
-  softDeleteByLineUserId(lineUserId: string): Promise<{ count: number }> {
-    return this.prisma.lineUser.updateMany({
+  /**
+   * Soft-delete on unfollow (no error if already absent/deleted).
+   *
+   * The id lookup exists because `updateMany` returns only a count and `lineUser.deleted` needs the
+   * cuid. `lineUserId` is `@unique`, so this is an indexed read and no new index is required. The
+   * `{ count }` return type is UNCHANGED, so `LineWebhookService` needs no edit. A concurrent double
+   * unfollow can emit `deleted` twice; the client's remove-by-id is idempotent.
+   */
+  async softDeleteByLineUserId(lineUserId: string): Promise<{ count: number }> {
+    const row = await this.prisma.lineUser.findFirst({
       where: { lineUserId, deletedAt: null },
+      select: { id: true },
+    });
+    if (!row) return { count: 0 };
+
+    await this.prisma.lineUser.update({
+      where: { id: row.id },
       data: { deletedAt: new Date() },
     });
+
+    // Emit site 6. "Deleted" means "left the list you are looking at" — the physical row survives.
+    this.realtime.emitLineUserDeleted(row.id);
+    return { count: 1 };
   }
 
   /** Look up an active (non-soft-deleted) user. */
@@ -248,9 +318,10 @@ export class LineUserService {
   /**
    * Best-effort LINE push for a Reject (→REJECTED). NEVER throws (same fail-soft discipline as
    * `notifyAccessChange`): a push failure is logged at `warn` and swallowed — the reject write already
-   * committed. The reject copy is built HERE, deliberately NOT added to `ACCESS_NOTIFICATION_MESSAGES`:
-   * that record is `register()`'s single source for the PENDING ack and must not be overwritten or the
-   * ack regresses. `reason` is always present (mandatory, guarded in `updateAccess`).
+   * committed. The reject copy comes from `buildRejectionMessage`, deliberately NOT added to
+   * `ACCESS_NOTIFICATION_MESSAGES`: that record is `register()`'s single source for the PENDING ack and
+   * must not be overwritten or the ack regresses. `reason` is always present (mandatory, guarded in
+   * `updateAccess`).
    * PII: the reason is NEVER logged (log lines stay lineUserId=/access= only, matching notifyAccessChange).
    *
    * @param lineUserId the LINE-side `U…` identifier (`LineUser.lineUserId`), NOT the cuid `LineUser.id`.
@@ -259,9 +330,7 @@ export class LineUserService {
     lineUserId: string,
     reason: string,
   ): Promise<void> {
-    const text =
-      `ขออภัย การลงทะเบียนของคุณไม่ผ่านการอนุมัติ เนื่องจาก: ${reason} ` +
-      `กรุณาเปิดแอปพลิเคชันเพื่อแก้ไขข้อมูลใหม่อีกครั้ง`;
+    const text = buildRejectionMessage(reason);
     try {
       await this.line.push(lineUserId, [{ type: 'text', text }]);
     } catch (error) {
@@ -341,16 +410,15 @@ export class LineUserService {
    *
    * One `$transaction`: get-or-create the active LineUser, gate on `UNREGISTERED`, assert both option
    * ids are non-deleted (`400`), create the 1:1 registration, then flip `access` to `PENDING`. A
-   * `P2002` on the LineUser 1:1 (a race) or on `staffId` (used by someone else) becomes a `409` with
-   * distinct messages (design §3.1 / SC-3.2).
+   * `P2002` on the LineUser 1:1 (a race) becomes a `409 ALREADY_REGISTERED` (design §3.1).
    */
   async register(
     lineUserId: string,
     dto: CreateLineUserRegistrationDto,
   ): Promise<LineUserStatusResponseDto> {
     try {
-      const { userId, access, registration } = await this.prisma.$transaction(
-        async (tx) => {
+      const { userId, access, registration, wasCreated } =
+        await this.prisma.$transaction(async (tx) => {
           const existing = await tx.lineUser.findFirst({
             where: { lineUserId, deletedAt: null },
             select: { id: true, access: true },
@@ -379,7 +447,6 @@ export class LineUserService {
               lineUserId: user.id,
               firstName: dto.firstName,
               lastName: dto.lastName,
-              staffId: dto.staffId,
               phone: dto.phone,
               departmentId: dto.departmentId,
               personnelRoleId: dto.personnelRoleId,
@@ -397,12 +464,18 @@ export class LineUserService {
             userId: user.id,
             access: updated.access,
             registration: created,
+            // The transaction already knows whether it created the row, so the created-vs-updated
+            // decision costs zero extra reads.
+            wasCreated: existing === null,
           };
-        },
-      );
+        });
 
       // PII discipline: log the id only, never the submitted PII.
       this.logger.log(`LineUser registered. id=${userId} access=${access}`);
+
+      // Emit site 2 — after the commit, BEFORE the LINE push (a best-effort HTTP call that can take
+      // a second or more; the socket path must not sit behind it).
+      await this.publish(wasCreated ? 'created' : 'updated', userId);
 
       // Best-effort "we received your registration" push (PENDING copy). Outside the transaction
       // so a push failure can never roll back the committed registration/access change.
@@ -421,9 +494,13 @@ export class LineUserService {
    *
    * State gate (SC-B9): permitted ONLY while `access ∈ {PENDING, REJECTED}`. `ALLOWED`/`BLOCKED`/
    * `UNREGISTERED`/no-row → `403` (authorization-by-state), deterministic with no partial write —
-   * distinct from register's duplicate-resource `409`. Options are re-validated non-deleted (`400`);
-   * a `staffId` collision with ANOTHER registration → `409` (re-submitting the caller's own value is
-   * a no-op). `richMenuType` stays `TYPE_1` (both PENDING and REJECTED derive TYPE_1).
+   * distinct from register's duplicate-resource `409`. Options are re-validated non-deleted (`400`).
+   * `richMenuType` stays `TYPE_1` (both PENDING and REJECTED derive TYPE_1).
+   *
+   * This path CANNOT raise a `409`: it never writes `lineUserId` (the only unique key left on
+   * `LineUserRegistration`), so no duplicate-key error is reachable and `mapRegistrationWriteError`
+   * is deliberately NOT wired in here — an unexpected Prisma error surfaces as a 500, not a
+   * misleading conflict.
    *
    * A REJECTED caller who resubmits RE-ENTERS review: in the SAME transaction the access flips
    * `REJECTED → PENDING` and `rejectionReason` is cleared to null (invariant), and the existing
@@ -452,55 +529,49 @@ export class LineUserService {
 
     const wasRejected = user.access === AppAccess.REJECTED;
 
-    try {
-      // One transaction so a partial write can't leave `access: REJECTED` with an already-edited
-      // registration (or vice versa). Options are re-validated non-deleted/non-reserved (400) first,
-      // mirroring register()'s shape. A REJECTED resubmit ALSO flips access → PENDING and clears the
-      // reason in the SAME transaction (invariant); the PENDING-caller path performs no lineUser write.
-      const updated = await this.prisma.$transaction(async (tx) => {
-        await this.assertActiveOptions(
-          tx,
-          dto.departmentId,
-          dto.personnelRoleId,
-        );
+    // One transaction so a partial write can't leave `access: REJECTED` with an already-edited
+    // registration (or vice versa). Options are re-validated non-deleted/non-reserved (400) first,
+    // mirroring register()'s shape. A REJECTED resubmit ALSO flips access → PENDING and clears the
+    // reason in the SAME transaction (invariant); the PENDING-caller path performs no lineUser write.
+    const updated = await this.prisma.$transaction(async (tx) => {
+      await this.assertActiveOptions(tx, dto.departmentId, dto.personnelRoleId);
 
-        const registration = await tx.lineUserRegistration.update({
-          where: { lineUserId: user.id },
-          data: {
-            firstName: dto.firstName,
-            lastName: dto.lastName,
-            staffId: dto.staffId,
-            phone: dto.phone,
-            departmentId: dto.departmentId,
-            personnelRoleId: dto.personnelRoleId,
-          },
-          select: REGISTRATION_OWNER_SELECT,
-        });
-
-        if (wasRejected) {
-          await tx.lineUser.update({
-            where: { id: user.id },
-            data: { access: AppAccess.PENDING, rejectionReason: null },
-          });
-        }
-
-        return registration;
+      const registration = await tx.lineUserRegistration.update({
+        where: { lineUserId: user.id },
+        data: {
+          firstName: dto.firstName,
+          lastName: dto.lastName,
+          phone: dto.phone,
+          departmentId: dto.departmentId,
+          personnelRoleId: dto.personnelRoleId,
+        },
+        select: REGISTRATION_OWNER_SELECT,
       });
 
-      this.logger.log(`LineUser registration edited. id=${user.id}`);
-
-      // A REJECTED resubmit re-enters review → send the existing PENDING ack, AFTER the transaction
-      // commits (fail-soft) so a push failure can't roll back the committed resubmit. A PENDING edit
-      // sends NO push (Q6). Pushed to the caller's verified U… id (the method param), never the cuid.
       if (wasRejected) {
-        await this.notifyAccessChange(lineUserId, AppAccess.PENDING);
+        await tx.lineUser.update({
+          where: { id: user.id },
+          data: { access: AppAccess.PENDING, rejectionReason: null },
+        });
       }
 
-      // Both paths land on PENDING with the reason cleared (REJECTED resubmit) or already null (edit).
-      return this.toStatusDto(AppAccess.PENDING, updated, null);
-    } catch (error) {
-      throw this.mapRegistrationWriteError(error);
+      return registration;
+    });
+
+    this.logger.log(`LineUser registration edited. id=${user.id}`);
+
+    // Emit site 3 — after the `$transaction` resolves, before the conditional PENDING push.
+    await this.publish('updated', user.id);
+
+    // A REJECTED resubmit re-enters review → send the existing PENDING ack, AFTER the transaction
+    // commits (fail-soft) so a push failure can't roll back the committed resubmit. A PENDING edit
+    // sends NO push (Q6). Pushed to the caller's verified U… id (the method param), never the cuid.
+    if (wasRejected) {
+      await this.notifyAccessChange(lineUserId, AppAccess.PENDING);
     }
+
+    // Both paths land on PENDING with the reason cleared (REJECTED resubmit) or already null (edit).
+    return this.toStatusDto(AppAccess.PENDING, updated, null);
   }
 
   /**
@@ -652,6 +723,9 @@ export class LineUserService {
       this.logger.log(
         `LineUser access changed (soft-deleted; LINE side-effects skipped). id=${updated.id} access=${access} richMenuType=${richMenuType}`,
       );
+      // NO realtime event: `publish`'s `deletedAt: null` filter would drop it anyway, and the row
+      // is absent from `GET /line-users`, so broadcasting it would make every admin's table
+      // disagree with a refresh. Calling `publish` here would be a no-op; not calling it is clearer.
       return this.toDto(updated);
     }
 
@@ -674,11 +748,18 @@ export class LineUserService {
       `LineUser access changed. id=${updated.id} access=${access} richMenuType=${richMenuType}`,
     );
 
+    // Emit site 4 — AFTER `applyRichMenu` succeeded and BEFORE the LINE push. A rich-menu failure
+    // raises a retryable 502 above, and NO event is emitted on that path: broadcasting a row whose
+    // LINE-side state we know is inconsistent, from a request that answers 502, is worse than being
+    // briefly stale, and the retry re-emits (the operation is idempotent).
+    await this.publish('updated', updated.id);
+
     // Best-effort notification, only after BOTH the DB write and the rich-menu apply succeeded.
     // Pushed to the LINE-side U… id (updated.lineUserId), never the cuid. A push failure here does
     // not undo the access change or the linked menu, and must not fail the request. A Reject uses the
-    // separate `notifyRejection` builder (it interpolates the mandatory reason); every other target
-    // uses the shared `ACCESS_NOTIFICATION_MESSAGES` copy via `notifyAccessChange`.
+    // separate `notifyRejection` path, whose copy comes from `buildRejectionMessage` (it interpolates
+    // the mandatory reason); every other target uses the shared `ACCESS_NOTIFICATION_MESSAGES` copy
+    // via `notifyAccessChange`.
     if (access === AppAccess.REJECTED) {
       await this.notifyRejection(updated.lineUserId, reason!);
     } else {
@@ -690,7 +771,7 @@ export class LineUserService {
 
   /**
    * Admin edit of a LINE user's registration fields (`PATCH /line-users/:id/registration`). Keyed on
-   * the cuid `LineUser.id`. A FULL re-submit of the six editable fields; `role` is the authenticated
+   * the cuid `LineUser.id`. A FULL re-submit of the five editable fields; `role` is the authenticated
    * actor's `SystemRole` and governs only the soft-deleted visibility (below), NOT the fields.
    *
    * **Orthogonal to the Item 3 access matrix (AC-B9/AC-B10):** this method never reads or writes
@@ -707,9 +788,11 @@ export class LineUserService {
    *
    * `access` is deliberately NOT selected — the edit is not PENDING-gated. `assertActiveOptions` is
    * the SAME role-blind guard the LIFF self-edit uses: a system-reserved option is rejected for EVERY
-   * actor, SUPER_ADMIN included (a LINE end-user is never a System Developer). `staffId` is globally
-   * `@unique`; a collision with ANOTHER registration → 409 via `mapRegistrationWriteError` (P2002),
-   * while re-writing the row's own current `staffId` does not self-collide (no false 409).
+   * actor, SUPER_ADMIN included (a LINE end-user is never a System Developer).
+   *
+   * Like the LIFF self-edit, this path CANNOT raise a `409`: none of the five editable fields is
+   * unique and `lineUserId` (the only unique key) is never written, so no duplicate-key error is
+   * reachable and `mapRegistrationWriteError` is deliberately NOT wired in here.
    */
   async updateRegistrationByAdmin(
     id: string,
@@ -740,31 +823,21 @@ export class LineUserService {
       throw new NotFoundException(LINE_USER_REGISTRATION_NOT_FOUND);
     }
 
-    try {
-      // One transaction so the option-validity check and the write are atomic (as `register` does).
-      await this.prisma.$transaction(async (tx) => {
-        await this.assertActiveOptions(
-          tx,
-          dto.departmentId,
-          dto.personnelRoleId,
-        );
-        await tx.lineUserRegistration.update({
-          // The 1:1 key. Writing the row's own current staffId is a no-op — no self-collision.
-          where: { lineUserId: row.id },
-          data: {
-            firstName: dto.firstName,
-            lastName: dto.lastName,
-            staffId: dto.staffId,
-            phone: dto.phone,
-            departmentId: dto.departmentId,
-            personnelRoleId: dto.personnelRoleId,
-          },
-        });
+    // One transaction so the option-validity check and the write are atomic (as `register` does).
+    await this.prisma.$transaction(async (tx) => {
+      await this.assertActiveOptions(tx, dto.departmentId, dto.personnelRoleId);
+      await tx.lineUserRegistration.update({
+        // The 1:1 key — read-only here; the identity is immutable.
+        where: { lineUserId: row.id },
+        data: {
+          firstName: dto.firstName,
+          lastName: dto.lastName,
+          phone: dto.phone,
+          departmentId: dto.departmentId,
+          personnelRoleId: dto.personnelRoleId,
+        },
       });
-    } catch (error) {
-      // A P2002 on staffId → 409 STAFF_ID_TAKEN; the 400 from assertActiveOptions passes through.
-      throw this.mapRegistrationWriteError(error);
-    }
+    });
 
     const updated = await this.prisma.lineUser.findUnique({
       where: { id: row.id },
@@ -774,6 +847,12 @@ export class LineUserService {
     // PII discipline: log the id only, never the submitted field values or the body. `updated` is
     // guaranteed non-null — the LineUser row is never hard-deleted, and it existed at step 1.
     this.logger.log(`LineUser registration edited by admin. id=${row.id}`);
+
+    // Emit site 5 — after the `$transaction` and the re-read, before returning. A SUPER_ADMIN may
+    // reach a soft-deleted row here; `publish`'s `deletedAt: null` filter is what stops that row
+    // from being broadcast.
+    await this.publish('updated', row.id);
+
     return this.toDto(updated!);
   }
 
@@ -791,7 +870,6 @@ export class LineUserService {
         ? {
             firstName: user.registration.firstName,
             lastName: user.registration.lastName,
-            staffId: user.registration.staffId,
             phone: user.registration.phone,
             departmentId: user.registration.departmentId,
             department: user.registration.department.name,
@@ -803,25 +881,20 @@ export class LineUserService {
   }
 
   /**
-   * A duplicate-key from a registration write. On `staffId` → `409 STAFF_ID_TAKEN`; on the LineUser
-   * 1:1 (`lineUserId`, a register race) → `409 ALREADY_REGISTERED`. Deliberately-thrown
-   * `HttpException`s (the 400/403/409 raised inside the flow) pass straight through; anything else is
-   * rethrown unchanged.
+   * A duplicate-key from the `register` write. `lineUserId` (the LineUser 1:1) is the ONLY unique key
+   * left on `LineUserRegistration`, so any `P2002` here is a create race → `409 ALREADY_REGISTERED`.
+   * Deliberately-thrown `HttpException`s (the 400/403/409 raised inside the flow) pass straight
+   * through; anything else is rethrown unchanged.
+   *
+   * Wired into `register` ONLY. Neither PATCH path writes a unique column, so a duplicate key is
+   * unreachable there and neither endpoint advertises a 409 any more.
    */
   private mapRegistrationWriteError(error: unknown): Error {
     if (
       error instanceof Prisma.PrismaClientKnownRequestError &&
       error.code === 'P2002'
     ) {
-      const rawTarget = error.meta?.target;
-      const target = Array.isArray(rawTarget)
-        ? rawTarget.join(',')
-        : typeof rawTarget === 'string'
-          ? rawTarget
-          : '';
-      return new ConflictException(
-        target.includes('staffId') ? STAFF_ID_TAKEN : ALREADY_REGISTERED,
-      );
+      return new ConflictException(ALREADY_REGISTERED);
     }
     return error instanceof Error ? error : new Error(String(error));
   }
@@ -847,7 +920,6 @@ export class LineUserService {
       id: registration.id,
       firstName: registration.firstName,
       lastName: registration.lastName,
-      staffId: registration.staffId,
       phone: registration.phone,
       departmentId: registration.departmentId,
       department: registration.department.name,

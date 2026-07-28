@@ -8,14 +8,13 @@ import {
 import { Reflector } from '@nestjs/core';
 import { PrismaService } from '../../prisma/prisma.service';
 import { destroySessionQuietly } from '../../session/session.util';
-import { PUBLIC_FIELDS } from '../../system-users/system-users.fields';
 import {
   AUTHENTICATION_REQUIRED,
   MUST_CHANGE_PASSWORD,
-  SESSION_ABSOLUTE_MAX_AGE_MS,
 } from '../auth.constants';
 import type { RequestWithSystemUser } from '../auth.types';
 import { ALLOW_PASSWORD_CHANGE_GATE } from '../decorators/allow-password-change-gate.decorator';
+import { resolveSessionUser } from '../session-user.resolver';
 
 /**
  * Cookie-session authentication.
@@ -43,6 +42,12 @@ import { ALLOW_PASSWORD_CHANGE_GATE } from '../decorators/allow-password-change-
  * Order is load-bearing: `deletedAt`/`isActive` are 401s that DESTROY the session and fire FIRST, so
  * a suspended or soft-deleted user never reaches the reset screen. `mustChangePassword` is a
  * CREDENTIAL state, not a fourth lifecycle state: the session is KEPT and the answer is 403.
+ *
+ * The lifecycle decision itself now lives in `resolveSessionUser` so the WebSocket handshake can
+ * reuse it verbatim instead of growing a second auth path. This guard keeps everything that is
+ * HTTP-specific and unchanged: the session destruction on the three 401 paths, the `Reflector`
+ * gate, and the 403. `session.guard.spec.ts` passes unmodified — that is the contract of the
+ * extraction, not a coincidence.
  */
 @Injectable()
 export class SessionGuard implements CanActivate {
@@ -54,41 +59,21 @@ export class SessionGuard implements CanActivate {
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const req = context.switchToHttp().getRequest<RequestWithSystemUser>();
 
-    const systemUserId = req.session?.systemUserId;
-    if (!systemUserId) {
+    const resolution = await resolveSessionUser(this.prisma, req.session);
+
+    if (!resolution.ok) {
+      // `NO_SESSION` is the one 401 that does NOT destroy: there is nothing to destroy, and
+      // `req.session` may not exist at all. The other three (expired / user gone / revoked) each
+      // leave a worthless Redis key behind, so they are cleaned up exactly as before.
+      if (resolution.reason !== 'NO_SESSION') {
+        await destroySessionQuietly(req);
+      }
       throw new UnauthorizedException(AUTHENTICATION_REQUIRED);
     }
 
-    // Absolute cap, independent of the rolling idle window.
-    if (
-      Date.now() - (req.session.createdAt ?? 0) >
-      SESSION_ABSOLUTE_MAX_AGE_MS
-    ) {
-      await destroySessionQuietly(req);
-      throw new UnauthorizedException(AUTHENTICATION_REQUIRED);
-    }
-
-    const user = await this.prisma.systemUser.findUnique({
-      where: { id: systemUserId },
-      select: { ...PUBLIC_FIELDS, deletedAt: true },
-    });
-
-    if (!user) {
-      await destroySessionQuietly(req);
-      throw new UnauthorizedException(AUTHENTICATION_REQUIRED);
-    }
-
-    // `deletedAt` is destructured out here and nowhere else: it is selected ONLY so it can be
-    // checked, and `publicUser` — the object that reaches `req.systemUser` and therefore
-    // `GET /auth/system/me`'s response body — provably cannot carry it.
-    const { deletedAt, ...publicUser } = user;
-
-    // Both flags, independently. A soft-deleted user is typically still `isActive: true`, so
-    // checking `isActive` alone would authenticate a deleted account holding a live cookie.
-    if (deletedAt !== null || !publicUser.isActive) {
-      await destroySessionQuietly(req);
-      throw new UnauthorizedException(AUTHENTICATION_REQUIRED);
-    }
+    // Already stripped of `deletedAt` by the resolver, so it provably cannot reach
+    // `req.systemUser` and therefore `GET /auth/system/me`'s response body.
+    const publicUser = resolution.user;
 
     // The forced-reset gate. Deny by default; opt out with @AllowPasswordChangeGate(). The session
     // survives — this is a credential state, not a lifecycle failure — so the caller can still reach

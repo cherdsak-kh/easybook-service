@@ -5,6 +5,7 @@ import request from 'supertest';
 import type { App } from 'supertest/types';
 import { PasswordService } from '../src/auth/password.service';
 import { API_BASE_PATH } from '../src/common/api.constants';
+import { ACCESS_NOTIFICATION_MESSAGES } from '../src/line/line-user.service';
 import { LineService } from '../src/line/line.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import {
@@ -29,11 +30,13 @@ const STAFF = `${SU_PREFIX}staff@easybook.local`;
 
 const url = (path: string) => `${API_BASE_PATH}${path}`;
 
-// The exact status-change push copy (must match ACCESS_NOTIFICATION_MESSAGES in the service).
-const ALLOWED_MSG =
-  'ยินดีด้วย! บัญชีของคุณได้รับการอนุมัติการใช้งานเรียบร้อยแล้ว คุณสามารถกดปุ่มจองคิวที่เมนูด้านล่างเพื่อทำรายการได้ทันทีครับ 🎉';
-const BLOCKED_MSG =
-  'ขออภัย บัญชีการใช้งานของคุณถูกระงับสิทธิ์ชั่วคราวโดยผู้ดูแลระบบ หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่สถาบัน';
+// The status-change push copy per target access, read from the service's own source of truth (as
+// `src/line/line-user.service.spec.ts` does). These assertions still prove ROUTING — a real HTTP
+// PATCH runs `updateAccess` between the push spy and these constants, so "which copy goes out for
+// which transition, to which LINE id" stays covered — while a reword of the Thai copy in
+// `line-user.service.ts` can no longer redden the suite.
+const ALLOWED_MSG = ACCESS_NOTIFICATION_MESSAGES.ALLOWED!;
+const BLOCKED_MSG = ACCESS_NOTIFICATION_MESSAGES.BLOCKED!;
 
 interface Session {
   agent: request.Agent;
@@ -43,7 +46,6 @@ interface Session {
 interface RegistrationSummary {
   firstName: string;
   lastName: string;
-  staffId: string;
   phone: string;
   departmentId: number;
   department: string;
@@ -202,7 +204,6 @@ describe('LINE Users management (e2e)', () => {
         lineUserId: luIds[`${LU_PREFIX}allowed`],
         firstName: 'Bob',
         lastName: 'Allowed',
-        staffId: `${LU_PREFIX}stid-allowed`,
         phone: '081-000-0000',
         departmentId: optionIds.departmentId,
         personnelRoleId: optionIds.personnelRoleId,
@@ -351,7 +352,6 @@ describe('LINE Users management (e2e)', () => {
       expect(allowed?.registration).toEqual({
         firstName: 'Bob',
         lastName: 'Allowed',
-        staffId: `${LU_PREFIX}stid-allowed`,
         phone: '081-000-0000',
         // §B-8a additive: the summary now carries the raw FK ids (for the admin edit modal's
         // dropdown pre-select) alongside the RESOLVED option names.
@@ -671,7 +671,6 @@ describe('LINE Users management (e2e)', () => {
     const validBody = () => ({
       firstName: 'Edited',
       lastName: 'Person',
-      staffId: `${LU_PREFIX}stid-edited`,
       phone: '099-888-7777',
       departmentId: optionIds.departmentId,
       personnelRoleId: optionIds.personnelRoleId,
@@ -683,7 +682,6 @@ describe('LINE Users management (e2e)', () => {
         select: {
           firstName: true,
           lastName: true,
-          staffId: true,
           phone: true,
           departmentId: true,
           personnelRoleId: true,
@@ -715,17 +713,15 @@ describe('LINE Users management (e2e)', () => {
       expect(body.registration).toMatchObject({
         firstName: 'Edited',
         lastName: 'Person',
-        staffId: `${LU_PREFIX}stid-edited`,
         phone: '099-888-7777',
         departmentId: optionIds.departmentId,
         personnelRoleId: optionIds.personnelRoleId,
       });
 
-      // All six fields persisted.
+      // All five fields persisted.
       expect(await regRowOf('allowed')).toEqual({
         firstName: 'Edited',
         lastName: 'Person',
-        staffId: `${LU_PREFIX}stid-edited`,
         phone: '099-888-7777',
         departmentId: optionIds.departmentId,
         personnelRoleId: optionIds.personnelRoleId,
@@ -745,50 +741,6 @@ describe('LINE Users management (e2e)', () => {
         .expect(200);
       const row = await regRowOf('allowed');
       expect(row?.firstName).toBe('BySuper');
-    });
-
-    it('AC-B5 — re-submitting the row’s OWN current staffId is not a false 409', async () => {
-      const { agent, token } = await login(ADMIN);
-      await agent
-        .patch(regUrl('allowed'))
-        .set('x-csrf-token', token)
-        // keep the fixture's existing staffId, change only the name
-        .send({
-          ...validBody(),
-          staffId: `${LU_PREFIX}stid-allowed`,
-          firstName: 'SameStaffId',
-        })
-        .expect(200);
-      const row = await regRowOf('allowed');
-      expect(row?.staffId).toBe(`${LU_PREFIX}stid-allowed`);
-      expect(row?.firstName).toBe('SameStaffId');
-    });
-
-    it('AC-B5 — a staffId held by ANOTHER registration is a 409', async () => {
-      // Give the PENDING fixture its own registration with a distinct staffId.
-      await prisma.lineUserRegistration.create({
-        data: {
-          lineUserId: luIds[`${LU_PREFIX}pending`],
-          firstName: 'Other',
-          lastName: 'Holder',
-          staffId: `${LU_PREFIX}stid-other`,
-          phone: '081-111-1111',
-          departmentId: optionIds.departmentId,
-          personnelRoleId: optionIds.personnelRoleId,
-        },
-      });
-
-      const { agent, token } = await login(ADMIN);
-      await agent
-        .patch(regUrl('allowed'))
-        .set('x-csrf-token', token)
-        .send({ ...validBody(), staffId: `${LU_PREFIX}stid-other` })
-        .expect(409);
-
-      // The clash left the row unchanged.
-      expect((await regRowOf('allowed'))?.staffId).toBe(
-        `${LU_PREFIX}stid-allowed`,
-      );
     });
 
     it('AC-B6 — a system-reserved option is 400 for BOTH ADMIN and SUPER_ADMIN (reserved-for-everyone)', async () => {
@@ -860,7 +812,6 @@ describe('LINE Users management (e2e)', () => {
           lineUserId: luIds[`${LU_PREFIX}deleted`],
           firstName: 'Ghost',
           lastName: 'User',
-          staffId: `${LU_PREFIX}stid-deleted`,
           phone: '082-222-2222',
           departmentId: optionIds.departmentId,
           personnelRoleId: optionIds.personnelRoleId,

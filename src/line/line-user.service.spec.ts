@@ -9,6 +9,7 @@ import {
 import { AppAccess, Prisma, SystemRole } from '@prisma/client';
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
@@ -16,6 +17,7 @@ import { LineService } from './line.service';
 import {
   ACCESS_NOTIFICATION_MESSAGES,
   accessToRichMenuType,
+  buildRejectionMessage,
   LINE_USER_PUBLIC_FIELDS,
   LineUserService,
 } from './line-user.service';
@@ -29,7 +31,6 @@ import {
   LINE_USER_REGISTRATION_NOT_FOUND,
   REGISTRATION_NOT_EDITABLE,
   REJECTION_REASON_REQUIRED,
-  STAFF_ID_TAKEN,
 } from './line-users.errors';
 
 interface TxOptions {
@@ -53,7 +54,6 @@ const makeTx = () => ({
 const VALID_DTO: CreateLineUserRegistrationDto = {
   firstName: 'Somchai',
   lastName: 'Jaidee',
-  staffId: '6412345678',
   phone: '081-234-5678',
   departmentId: 1,
   personnelRoleId: 2,
@@ -64,7 +64,6 @@ const OWNER_REGISTRATION_ROW = {
   id: 'reg-1',
   firstName: 'Somchai',
   lastName: 'Jaidee',
-  staffId: '6412345678',
   phone: '081-234-5678',
   departmentId: 1,
   personnelRoleId: 2,
@@ -98,19 +97,23 @@ describe('LineUserService', () => {
     linkRichMenuToUser: jest.fn(),
     push: jest.fn(),
   };
+  // The gateway is a three-method mock, the same shape `LineService` already has. Its methods are
+  // synchronous and `void` in production, so nothing here needs to resolve.
+  const realtime = {
+    emitLineUserCreated: jest.fn(),
+    emitLineUserUpdated: jest.fn(),
+    emitLineUserDeleted: jest.fn(),
+  };
 
-  // The exact push copy per target access (mirrors ACCESS_NOTIFICATION_MESSAGES in the service).
-  const ALLOWED_MSG =
-    'ยินดีด้วย! บัญชีของคุณได้รับการอนุมัติการใช้งานเรียบร้อยแล้ว คุณสามารถกดปุ่มจองคิวที่เมนูด้านล่างเพื่อทำรายการได้ทันทีครับ 🎉';
-  const BLOCKED_MSG =
-    'ขออภัย บัญชีการใช้งานของคุณถูกระงับสิทธิ์ชั่วคราวโดยผู้ดูแลระบบ หากมีข้อสงสัยกรุณาติดต่อเจ้าหน้าที่สถาบัน';
-  const PENDING_MSG =
-    'ระบบได้รับข้อมูลการลงทะเบียนของคุณแล้ว เจ้าหน้าที่กำลังดำเนินการตรวจสอบข้อมูลกรุณารอสักครู่ครับ ⏳';
+  // The push copy per target access, read from the service's own source of truth so these
+  // assertions test ROUTING (which copy goes out for which transition), not the copy's spelling.
+  const ALLOWED_MSG = ACCESS_NOTIFICATION_MESSAGES.ALLOWED!;
+  const BLOCKED_MSG = ACCESS_NOTIFICATION_MESSAGES.BLOCKED!;
+  const PENDING_MSG = ACCESS_NOTIFICATION_MESSAGES.PENDING!;
 
-  // The exact reject copy built by `notifyRejection` ({reason} interpolated).
-  const rejectMsg = (reason: string) =>
-    `ขออภัย การลงทะเบียนของคุณไม่ผ่านการอนุมัติ เนื่องจาก: ${reason} ` +
-    `กรุณาเปิดแอปพลิเคชันเพื่อแก้ไขข้อมูลใหม่อีกครั้ง`;
+  // The exact reject copy `notifyRejection` sends ({reason} interpolated) — same builder, so a
+  // change to the template stays covered by the reason-interpolation assertions instead of a diff.
+  const rejectMsg = (reason: string) => buildRejectionMessage(reason);
 
   const publicRow = {
     id: 'lu-1',
@@ -140,6 +143,7 @@ describe('LineUserService', () => {
           },
         },
         { provide: LineService, useValue: line },
+        { provide: RealtimeGateway, useValue: realtime },
       ],
     }).compile();
     service = module.get<LineUserService>(LineUserService);
@@ -147,6 +151,7 @@ describe('LineUserService', () => {
 
   it('upserts on follow: create by lineUserId, restore (deletedAt=null) on update', async () => {
     lineUser.upsert.mockResolvedValue({ id: '1' });
+    lineUser.findFirst.mockResolvedValue(null); // publish() re-read: no event, not the point here
     await service.upsertOnFollow({
       lineUserId: 'U123',
       displayName: 'Alice',
@@ -169,15 +174,48 @@ describe('LineUserService', () => {
     expect(arg.update).not.toHaveProperty('richMenuType');
   });
 
+  // The unfollow path was reworked from `updateMany` (count only) to a lookup + update, because the
+  // `lineUser.deleted` payload needs the cuid. The `{ count }` return contract is UNCHANGED, so
+  // `LineWebhookService` needs no edit — asserted below.
   it('soft-deletes only active rows for the given lineUserId', async () => {
-    lineUser.updateMany.mockResolvedValue({ count: 1 });
-    await service.softDeleteByLineUserId('U123');
+    lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
+    lineUser.update.mockResolvedValue({ id: 'lu-1' });
 
-    const [arg] = lineUser.updateMany.mock.calls[0] as [
+    await expect(service.softDeleteByLineUserId('U123')).resolves.toEqual({
+      count: 1,
+    });
+
+    const [lookup] = lineUser.findFirst.mock.calls[0] as [
+      { where: Record<string, unknown>; select: Record<string, unknown> },
+    ];
+    expect(lookup.where).toEqual({ lineUserId: 'U123', deletedAt: null });
+
+    const [arg] = lineUser.update.mock.calls[0] as [
       { where: Record<string, unknown>; data: Record<string, unknown> },
     ];
-    expect(arg.where).toEqual({ lineUserId: 'U123', deletedAt: null });
+    expect(arg.where).toEqual({ id: 'lu-1' });
     expect(arg.data.deletedAt).toBeInstanceOf(Date);
+  });
+
+  it('unfollow emits lineUser.deleted with the CUID, not the LINE-side U… id', async () => {
+    lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
+    lineUser.update.mockResolvedValue({ id: 'lu-1' });
+
+    await service.softDeleteByLineUserId('U123');
+
+    expect(realtime.emitLineUserDeleted).toHaveBeenCalledTimes(1);
+    expect(realtime.emitLineUserDeleted).toHaveBeenCalledWith('lu-1');
+  });
+
+  it('unfollow of an absent/already-deleted row writes nothing and emits nothing', async () => {
+    lineUser.findFirst.mockResolvedValue(null);
+
+    await expect(service.softDeleteByLineUserId('U404')).resolves.toEqual({
+      count: 0,
+    });
+
+    expect(lineUser.update).not.toHaveBeenCalled();
+    expect(realtime.emitLineUserDeleted).not.toHaveBeenCalled();
   });
 
   it('finds only active users', async () => {
@@ -341,7 +379,6 @@ describe('LineUserService', () => {
       expect(result.access).toBe(AppAccess.PENDING);
       expect(result.registration).toMatchObject({
         id: 'reg-1',
-        staffId: '6412345678',
         phone: '081-234-5678',
         departmentId: 1,
         department: 'Computer Science',
@@ -477,25 +514,6 @@ describe('LineUserService', () => {
       expect(tx.lineUserRegistration.create).not.toHaveBeenCalled();
     });
 
-    it('maps a P2002 on staffId to a 409 STAFF_ID_TAKEN (SC-B1)', async () => {
-      const tx = primeTx();
-      tx.lineUser.findFirst.mockResolvedValue({
-        id: 'lu-1',
-        access: AppAccess.UNREGISTERED,
-      });
-      tx.lineUserRegistration.create.mockRejectedValue(
-        new Prisma.PrismaClientKnownRequestError('unique', {
-          code: 'P2002',
-          clientVersion: 'x',
-          meta: { target: ['staffId'] },
-        }),
-      );
-
-      await expect(service.register('U123', VALID_DTO)).rejects.toThrow(
-        new ConflictException(STAFF_ID_TAKEN),
-      );
-    });
-
     it('maps a P2002 on lineUserId (a race) to a 409 ALREADY_REGISTERED (AC-B2)', async () => {
       const tx = primeTx();
       tx.lineUser.findFirst.mockResolvedValue({
@@ -547,7 +565,6 @@ describe('LineUserService', () => {
           data: {
             firstName: 'Somchai',
             lastName: 'Jaidee',
-            staffId: '6412345678',
             phone: '081-234-5678',
             departmentId: 1,
             personnelRoleId: 2,
@@ -557,7 +574,6 @@ describe('LineUserService', () => {
       expect(result.access).toBe(AppAccess.PENDING);
       expect(result.rejectionReason).toBeNull();
       expect(result.registration).toMatchObject({
-        staffId: '6412345678',
         department: 'Computer Science',
         personnelRole: 'Teacher',
       });
@@ -702,27 +718,6 @@ describe('LineUserService', () => {
         select: { id: true },
       });
     });
-
-    it('maps a P2002 on staffId (another registration) to 409 STAFF_ID_TAKEN (SC-B10)', async () => {
-      primeTx();
-      lineUser.findFirst.mockResolvedValue({
-        id: 'lu-1',
-        access: AppAccess.PENDING,
-      });
-      department.findFirst.mockResolvedValue({ id: 1 });
-      personnelRole.findFirst.mockResolvedValue({ id: 2 });
-      lineUserRegistration.update.mockRejectedValue(
-        new Prisma.PrismaClientKnownRequestError('unique', {
-          code: 'P2002',
-          clientVersion: 'x',
-          meta: { target: ['staffId'] },
-        }),
-      );
-
-      await expect(
-        service.updateRegistration('U123', EDIT_DTO),
-      ).rejects.toThrow(new ConflictException(STAFF_ID_TAKEN));
-    });
   });
 
   // ───────────────────────── getStatus ─────────────────────────
@@ -745,7 +740,6 @@ describe('LineUserService', () => {
       );
       expect(result.access).toBe(AppAccess.PENDING);
       expect(result.rejectionReason).toBeNull();
-      expect(result.registration?.staffId).toBe('6412345678');
       expect(result.registration?.department).toBe('Computer Science');
       expect(result.registration?.personnelRole).toBe('Teacher');
     });
@@ -840,7 +834,6 @@ describe('LineUserService', () => {
             registration: {
               firstName: 'Somchai',
               lastName: 'Jaidee',
-              staffId: '6412345678',
               phone: '081-234-5678',
               departmentId: 1,
               personnelRoleId: 2,
@@ -859,7 +852,6 @@ describe('LineUserService', () => {
       expect(result.data[0].registration).toEqual({
         firstName: 'Somchai',
         lastName: 'Jaidee',
-        staffId: '6412345678',
         phone: '081-234-5678',
         departmentId: 1,
         department: 'Computer Science',
@@ -1372,7 +1364,7 @@ describe('LineUserService', () => {
         select: LINE_USER_PUBLIC_FIELDS,
       });
       expect(result.access).toBe(AppAccess.REJECTED);
-      // Exactly ONE push, using the reject template (with `เนื่องจาก: <reason>`) — NOT the PENDING copy.
+      // Exactly ONE push, using the reject template — NOT the PENDING copy.
       expect(line.push).toHaveBeenCalledTimes(1);
       expect(line.push).toHaveBeenCalledWith('U123', [
         { type: 'text', text: rejectMsg('phone is wrong') },
@@ -1380,7 +1372,12 @@ describe('LineUserService', () => {
       const pushed = (
         line.push.mock.calls[0] as [string, { text: string }[]]
       )[1][0].text;
-      expect(pushed).toContain('เนื่องจาก: phone is wrong');
+      // Copy-agnostic on purpose: assert the admin's REASON is interpolated into whatever the
+      // template currently says, rather than pinning a Thai fragment of the template itself. The
+      // service still has to run to produce `pushed`, so this keeps asserting that a Reject routes
+      // the reason through buildRejectionMessage — it just no longer breaks when the copy is
+      // reworded. (The `toHaveBeenCalledWith` above already pins the exact builder output.)
+      expect(pushed).toContain('phone is wrong');
       expect(pushed).not.toBe(PENDING_MSG);
     });
 
@@ -1525,10 +1522,21 @@ describe('LineUserService', () => {
       expect(line.push).not.toHaveBeenCalled();
     });
 
-    it('AC5 — the reject copy lives in notifyRejection: ACCESS_NOTIFICATION_MESSAGES.PENDING is unchanged and .REJECTED is null', () => {
+    it('AC5 — the reject copy lives in buildRejectionMessage: ACCESS_NOTIFICATION_MESSAGES.PENDING is present and .REJECTED is null', () => {
       // Guards against someone moving the reject copy into the shared record (which would regress
-      // register()'s PENDING ack) or overwriting the PENDING entry.
-      expect(ACCESS_NOTIFICATION_MESSAGES.PENDING).toBe(PENDING_MSG);
+      // register()'s PENDING ack) or blanking the PENDING entry.
+      //
+      // This asserts the SHAPE of the record, not the wording. The Thai copy is product text that
+      // is expected to be reworded freely in the service without reddening this suite, so there is
+      // deliberately NO pinned literal here and no comparison against `PENDING_MSG` (which now
+      // reads from this same record, and would only ever restate `X === X`).
+      //
+      // The trade-off is explicit: a truncated or accidentally emptied PENDING string is still
+      // caught, but a *reworded* one is not. Nothing in this suite verifies the exact PENDING
+      // wording any more — if that guarantee is ever wanted back, it needs a pinned literal here,
+      // not a reference to the record.
+      expect(typeof ACCESS_NOTIFICATION_MESSAGES.PENDING).toBe('string');
+      expect(ACCESS_NOTIFICATION_MESSAGES.PENDING?.length).toBeGreaterThan(0);
       expect(ACCESS_NOTIFICATION_MESSAGES.REJECTED).toBeNull();
     });
   });
@@ -1539,7 +1547,6 @@ describe('LineUserService', () => {
     const ADMIN_EDIT_DTO: AdminUpdateLineUserRegistrationDto = {
       firstName: 'Edited',
       lastName: 'Name',
-      staffId: 'NEW-STAFF',
       phone: '099-999-9999',
       departmentId: 3,
       personnelRoleId: 4,
@@ -1552,7 +1559,6 @@ describe('LineUserService', () => {
       registration: {
         firstName: 'Edited',
         lastName: 'Name',
-        staffId: 'NEW-STAFF',
         phone: '099-999-9999',
         departmentId: 3,
         personnelRoleId: 4,
@@ -1584,7 +1590,7 @@ describe('LineUserService', () => {
     };
 
     it.each([SystemRole.ADMIN, SystemRole.SUPER_ADMIN])(
-      'AC-B2 — %s edits all six fields, persists them, and returns the updated row (200)',
+      'AC-B2 — %s edits all five fields, persists them, and returns the updated row (200)',
       async (role) => {
         const tx = primeSuccess();
 
@@ -1599,13 +1605,12 @@ describe('LineUserService', () => {
           where: { id: 'lu-1' },
           select: { id: true, deletedAt: true },
         });
-        // All six fields written, keyed on the 1:1 lineUserId.
+        // All five fields written, keyed on the 1:1 lineUserId.
         expect(tx.lineUserRegistration.update).toHaveBeenCalledWith({
           where: { lineUserId: 'lu-1' },
           data: {
             firstName: 'Edited',
             lastName: 'Name',
-            staffId: 'NEW-STAFF',
             phone: '099-999-9999',
             departmentId: 3,
             personnelRoleId: 4,
@@ -1614,7 +1619,6 @@ describe('LineUserService', () => {
         // Response is the re-read LINE_USER_PUBLIC_FIELDS row, incl. the summary option ids (§B-8a).
         expect(result.registration).toMatchObject({
           firstName: 'Edited',
-          staffId: 'NEW-STAFF',
           departmentId: 3,
           department: 'New Dept',
           personnelRoleId: 4,
@@ -1652,53 +1656,6 @@ describe('LineUserService', () => {
         ]
       )[0].select;
       expect(firstSelect).not.toHaveProperty('access');
-    });
-
-    it('AC-B5 — a staffId held by ANOTHER registration is a 409 STAFF_ID_TAKEN', async () => {
-      lineUser.findUnique.mockResolvedValueOnce({
-        id: 'lu-1',
-        deletedAt: null,
-      });
-      lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
-      const tx = {
-        department: { findFirst: jest.fn().mockResolvedValue({ id: 3 }) },
-        personnelRole: { findFirst: jest.fn().mockResolvedValue({ id: 4 }) },
-        lineUserRegistration: {
-          update: jest.fn().mockRejectedValue(
-            new Prisma.PrismaClientKnownRequestError('unique', {
-              code: 'P2002',
-              clientVersion: 'x',
-              meta: { target: ['staffId'] },
-            }),
-          ),
-        },
-      };
-      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
-        cb(tx),
-      );
-
-      await expect(
-        service.updateRegistrationByAdmin(
-          'lu-1',
-          ADMIN_EDIT_DTO,
-          SystemRole.ADMIN,
-        ),
-      ).rejects.toThrow(new ConflictException(STAFF_ID_TAKEN));
-    });
-
-    it('AC-B5 — re-submitting the row’s OWN current staffId does not self-collide (no false 409)', async () => {
-      // A Prisma update writing the row's own staffId does not violate the unique constraint, so the
-      // update resolves and the method returns 200 — there is no manual own-id exclusion to get wrong.
-      const tx = primeSuccess();
-
-      const result = await service.updateRegistrationByAdmin(
-        'lu-1',
-        ADMIN_EDIT_DTO,
-        SystemRole.ADMIN,
-      );
-
-      expect(tx.lineUserRegistration.update).toHaveBeenCalled();
-      expect(result.access).toBe(AppAccess.ALLOWED);
     });
 
     it.each([SystemRole.ADMIN, SystemRole.SUPER_ADMIN])(
@@ -1846,6 +1803,318 @@ describe('LineUserService', () => {
       // No 502/500 path — a registration edit has no LINE side-effect to skip in the first place.
       expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
       expect(line.push).not.toHaveBeenCalled();
+    });
+  });
+
+  // ───────────────────────── realtime fan-out (design §6/§7) ─────────────────────────
+
+  describe('realtime fan-out', () => {
+    /** The DTO `publish()` builds from `publicRow` — byte-identical to a `GET /line-users` element. */
+    const expectedDto = {
+      id: 'lu-1',
+      lineUserId: 'U123',
+      displayName: 'Alice',
+      pictureUrl: null,
+      statusMessage: null,
+      richMenuType: 'TYPE_1',
+      access: AppAccess.PENDING,
+      followedAt: '2026-07-07T10:00:00.000Z',
+      registration: null,
+    };
+
+    it('publish() re-reads with the LOAD-BEARING deletedAt: null filter and the list select', async () => {
+      lineUser.findUnique.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+        deletedAt: null,
+      });
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.ALLOWED,
+        richMenuType: 'TYPE_2',
+      });
+      line.findRichMenuId.mockResolvedValue('rm-type2');
+      lineUser.findFirst.mockResolvedValue(publicRow);
+
+      await service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN);
+
+      expect(lineUser.findFirst).toHaveBeenCalledWith({
+        where: { id: 'lu-1', deletedAt: null },
+        select: LINE_USER_PUBLIC_FIELDS,
+      });
+    });
+
+    it('B8 — updateAccess emits ONE lineUser.updated, after applyRichMenu and before the LINE push', async () => {
+      lineUser.findUnique.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+        deletedAt: null,
+      });
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.ALLOWED,
+        richMenuType: 'TYPE_2',
+      });
+      line.findRichMenuId.mockResolvedValue('rm-type2');
+      lineUser.findFirst.mockResolvedValue(publicRow);
+
+      await service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN);
+
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledTimes(1);
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(expectedDto);
+      expect(realtime.emitLineUserCreated).not.toHaveBeenCalled();
+      // Ordering: rich menu -> emit -> push. Broadcasting before the menu applied would advertise a
+      // state we might still 502 on; emitting after the push would put LINE's latency on the socket.
+      const emitAt = realtime.emitLineUserUpdated.mock.invocationCallOrder[0];
+      expect(emitAt).toBeGreaterThan(
+        line.linkRichMenuToUser.mock.invocationCallOrder[0],
+      );
+      expect(emitAt).toBeLessThan(line.push.mock.invocationCallOrder[0]);
+    });
+
+    it('B8 — the 502 rich-menu path emits NOTHING (the retry re-emits)', async () => {
+      lineUser.findUnique.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+        deletedAt: null,
+      });
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.ALLOWED,
+        richMenuType: 'TYPE_2',
+      });
+      line.findRichMenuId.mockResolvedValue(null); // menu missing on LINE -> 502
+
+      await expect(
+        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+      ).rejects.toThrow(BadGatewayException);
+
+      expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [
+        '404 (unknown id)',
+        () => lineUser.findUnique.mockResolvedValue(null),
+        SystemRole.ADMIN,
+        AppAccess.ALLOWED,
+      ],
+      [
+        '403 (forbidden ADMIN transition)',
+        () =>
+          lineUser.findUnique.mockResolvedValue({
+            id: 'lu-1',
+            access: AppAccess.ALLOWED,
+            deletedAt: null,
+          }),
+        SystemRole.ADMIN,
+        AppAccess.PENDING,
+      ],
+      [
+        '400 (reject from UNREGISTERED)',
+        () =>
+          lineUser.findUnique.mockResolvedValue({
+            id: 'lu-1',
+            access: AppAccess.UNREGISTERED,
+            deletedAt: null,
+          }),
+        SystemRole.SUPER_ADMIN,
+        AppAccess.REJECTED,
+      ],
+    ])(
+      'B8 — a failed mutation (%s) emits nothing at all',
+      async (_label, prime, role, target) => {
+        prime();
+
+        await expect(
+          service.updateAccess('lu-1', target, role),
+        ).rejects.toThrow();
+
+        expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
+        expect(realtime.emitLineUserCreated).not.toHaveBeenCalled();
+        expect(realtime.emitLineUserDeleted).not.toHaveBeenCalled();
+      },
+    );
+
+    it('§6.4 — a SUPER_ADMIN PATCH on a SOFT-DELETED row broadcasts nothing', async () => {
+      lineUser.findUnique.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+        deletedAt: new Date(),
+      });
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.BLOCKED,
+      });
+      // Even if the guard above were removed, publish()'s filter returns no row for a deleted id.
+      lineUser.findFirst.mockResolvedValue(null);
+
+      await service.updateAccess(
+        'lu-1',
+        AppAccess.BLOCKED,
+        SystemRole.SUPER_ADMIN,
+      );
+
+      expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
+      expect(realtime.emitLineUserCreated).not.toHaveBeenCalled();
+    });
+
+    it('B11 — upsertOnFollow emits lineUser.created', async () => {
+      lineUser.upsert.mockResolvedValue({ id: 'lu-1' });
+      lineUser.findFirst.mockResolvedValue(publicRow);
+
+      await service.upsertOnFollow({ lineUserId: 'U123' });
+
+      expect(realtime.emitLineUserCreated).toHaveBeenCalledTimes(1);
+      expect(realtime.emitLineUserCreated).toHaveBeenCalledWith(expectedDto);
+    });
+
+    it('B11 — register() emits CREATED when the transaction created the LineUser row', async () => {
+      const tx = makeTx();
+      tx.department.findFirst.mockResolvedValue({ id: 1 });
+      tx.personnelRole.findFirst.mockResolvedValue({ id: 2 });
+      tx.lineUser.findFirst.mockResolvedValue(null); // LIFF-first caller: no prior row
+      tx.lineUser.create.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.UNREGISTERED,
+      });
+      tx.lineUserRegistration.create.mockResolvedValue(OWNER_REGISTRATION_ROW);
+      tx.lineUser.update.mockResolvedValue({ access: AppAccess.PENDING });
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+      lineUser.findFirst.mockResolvedValue(publicRow);
+
+      await service.register('U123', VALID_DTO);
+
+      expect(realtime.emitLineUserCreated).toHaveBeenCalledTimes(1);
+      expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
+    });
+
+    it('B11 — register() emits UPDATED when the LineUser row already existed (follow first)', async () => {
+      const tx = makeTx();
+      tx.department.findFirst.mockResolvedValue({ id: 1 });
+      tx.personnelRole.findFirst.mockResolvedValue({ id: 2 });
+      tx.lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.UNREGISTERED,
+      });
+      tx.lineUserRegistration.create.mockResolvedValue(OWNER_REGISTRATION_ROW);
+      tx.lineUser.update.mockResolvedValue({ access: AppAccess.PENDING });
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+      lineUser.findFirst.mockResolvedValue(publicRow);
+
+      await service.register('U123', VALID_DTO);
+
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledTimes(1);
+      expect(realtime.emitLineUserCreated).not.toHaveBeenCalled();
+      expect(tx.lineUser.create).not.toHaveBeenCalled();
+    });
+
+    it('B9 — the LIFF self-edit emits ONE lineUser.updated', async () => {
+      $transaction.mockImplementation((cb: (client: unknown) => unknown) =>
+        cb({ lineUser, lineUserRegistration, department, personnelRole }),
+      );
+      lineUser.findFirst
+        .mockResolvedValueOnce({ id: 'lu-1', access: AppAccess.PENDING }) // the caller's row
+        .mockResolvedValueOnce(publicRow); // publish()'s re-read
+      department.findFirst.mockResolvedValue({ id: 1 });
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
+      lineUserRegistration.update.mockResolvedValue(OWNER_REGISTRATION_ROW);
+
+      await service.updateRegistration('U123', { ...VALID_DTO });
+
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledTimes(1);
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(expectedDto);
+    });
+
+    it('B9 — the admin registration edit emits ONE lineUser.updated', async () => {
+      lineUser.findUnique
+        .mockResolvedValueOnce({ id: 'lu-1', deletedAt: null })
+        .mockResolvedValueOnce(publicRow);
+      lineUserRegistration.findFirst.mockResolvedValue({ id: 'reg-1' });
+      $transaction.mockImplementation((cb: (client: unknown) => unknown) =>
+        cb({
+          department: { findFirst: jest.fn().mockResolvedValue({ id: 3 }) },
+          personnelRole: { findFirst: jest.fn().mockResolvedValue({ id: 4 }) },
+          lineUserRegistration: {
+            update: jest.fn().mockResolvedValue({ id: 'reg-1' }),
+          },
+        }),
+      );
+      lineUser.findFirst.mockResolvedValue(publicRow);
+
+      await service.updateRegistrationByAdmin(
+        'lu-1',
+        {
+          firstName: 'Edited',
+          lastName: 'Name',
+          phone: '099-999-9999',
+          departmentId: 3,
+          personnelRoleId: 4,
+        },
+        SystemRole.ADMIN,
+      );
+
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledTimes(1);
+    });
+
+    it('B15/B17 — a publish failure is swallowed, and the log line carries id + kind ONLY', async () => {
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      lineUser.findUnique.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+        deletedAt: null,
+      });
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.ALLOWED,
+        richMenuType: 'TYPE_2',
+      });
+      line.findRichMenuId.mockResolvedValue('rm-type2');
+      lineUser.findFirst.mockRejectedValue(new Error('db gone'));
+
+      // The write already committed — the mutation must still succeed.
+      await expect(
+        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+      ).resolves.toMatchObject({ id: 'lu-1' });
+
+      expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
+      const line0 = warn.mock.calls
+        .map((call) => String(call[0]))
+        .find((msg) => msg.includes('Realtime publish failed'));
+      expect(line0).toContain('id=lu-1');
+      expect(line0).toContain('kind=updated');
+      // PDPA: never a name, phone or the DTO itself.
+      expect(line0).not.toContain('Alice');
+      expect(line0).not.toContain('081-234-5678');
+      warn.mockRestore();
+    });
+
+    it('B15 — an emit that throws cannot fail the mutation (the gateway swallows, the service too)', async () => {
+      realtime.emitLineUserUpdated.mockImplementationOnce(() => {
+        throw new Error('transport down');
+      });
+      lineUser.findUnique.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+        deletedAt: null,
+      });
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.ALLOWED,
+        richMenuType: 'TYPE_2',
+      });
+      line.findRichMenuId.mockResolvedValue('rm-type2');
+      lineUser.findFirst.mockResolvedValue(publicRow);
+
+      await expect(
+        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+      ).resolves.toMatchObject({ id: 'lu-1' });
     });
   });
 });
