@@ -71,6 +71,19 @@ export class LineService {
     return this.client.linkRichMenuIdToUser(userId, richMenuId);
   }
 
+  /**
+   * Bulk variant of `linkRichMenuToUser`. LINE accepts at most 500 user ids per
+   * call (`RICH_MENU_LINK_BATCH_SIZE`); batching is the caller's job.
+   *
+   * Used by `scripts/setup-rich-menu.ts` to re-link every existing user after the
+   * menus are recreated — deleting a rich menu drops every per-user link to it, so
+   * without this pass a menu refresh silently demotes approved users to the
+   * account-level default menu.
+   */
+  linkRichMenuToUsers(richMenuId: string, userIds: string[]): Promise<unknown> {
+    return this.client.linkRichMenuIdToUsers({ richMenuId, userIds });
+  }
+
   async listRichMenus(): Promise<messagingApi.RichMenuResponse[]> {
     const { richmenus } = await this.client.getRichMenuList();
     return richmenus;
