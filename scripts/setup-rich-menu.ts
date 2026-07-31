@@ -13,69 +13,114 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { NestFactory } from '@nestjs/core';
 import type { messagingApi } from '@line/bot-sdk';
+import type { RichMenuType } from '@prisma/client';
 import { AppModule } from '../src/app.module';
 import { LineService } from '../src/line/line.service';
+import { PrismaService } from '../src/prisma/prisma.service';
+import {
+  RICH_MENU_LINK_BATCH_SIZE,
+  RICH_MENU_SHORTCUTS,
+  RICH_MENU_SPECS,
+} from '../src/line/rich-menu.constants';
 
 const LIFF_URI = 'https://liff.line.me/2010582836-zgUc8zRb';
 const ASSET_DIR = resolve(__dirname, '..', 'assets', 'richmenu');
 
+// `name` and `size` are taken from RICH_MENU_SPECS rather than restated here.
+// They were duplicated before, and the copies drifted the moment the TYPE_1
+// artwork changed height: this script would have created a 2500x843 menu, the
+// upload of a 2500x1686 image would have been rejected, and even had it
+// succeeded LineService.findRichMenuId would never have matched the result. One
+// source means swapping artwork is a single edit in rich-menu.constants.ts.
+const TYPE_1 = RICH_MENU_SPECS.TYPE_1;
+const TYPE_2 = RICH_MENU_SPECS.TYPE_2;
+
 interface MenuDef {
   key: 'type1' | 'type2';
+  /** The DB-side `LineUser.richMenuType` this menu serves — the join key for re-linking. */
+  richMenuType: RichMenuType;
   image: string;
   menu: messagingApi.RichMenuRequest;
 }
 
-// menu_type_1.jpg — 2500x843, a single full-width area that opens the LIFF app.
+// menu_type_1.jpg — 2500x1686 ("Check Status / Login"), one full-bleed area that
+// opens the LIFF app. This artwork was 2500x843 (half height) before 2026-07-31;
+// the size below and RICH_MENU_SPECS.TYPE_1 both had to change with it, because
+// LINE rejects an image whose dimensions differ from the declared size.
 const menuType1: MenuDef = {
   key: 'type1',
+  richMenuType: 'TYPE_1',
   image: resolve(ASSET_DIR, 'menu_type_1.jpg'),
   menu: {
-    size: { width: 2500, height: 843 },
+    size: { width: TYPE_1.width, height: TYPE_1.height },
     selected: true,
-    name: 'easy-book-liff',
+    name: TYPE_1.name,
     chatBarText: 'EasyBook App',
     areas: [
       {
-        bounds: { x: 0, y: 0, width: 2500, height: 843 },
-        action: { type: 'uri', label: 'Open app', uri: LIFF_URI },
+        bounds: { x: 0, y: 0, width: TYPE_1.width, height: TYPE_1.height },
+        action: { type: 'uri', label: 'Check Status / Login', uri: LIFF_URI },
       },
     ],
   },
 };
 
-// menu_type_2.jpg — 2500x1686: top full-width banner + 3 columns on the bottom.
+// menu_type_2.jpg — 2500x1686: one wide "Enter EasyBook" card on top, three cards
+// below (My Bookings / Report Issue / Settings).
+//
+// The bounds below are MEASURED from the artwork, not assumed: the gutters between
+// the bottom cards sit at x≈815-870 and x≈1635-1670, and the gap between the top
+// card and the bottom row at y≈931-969. The split lines (x=840, x=1650, y=950)
+// therefore fall in the middle of a gutter rather than clipping a card edge, and
+// the four areas tile the full 2500x1686 so there is no dead zone that swallows a
+// tap. The previous layout assumed an even 843/843 split with equal thirds, which
+// no longer matches this artwork.
+//
+// Only the top card has a destination today. The other three are shortcuts to
+// pages that do not exist yet, so they postback and the webhook answers with
+// RICH_MENU_SHORTCUTS[...].pendingMessage. Swap a button to a `uri` action once
+// its page ships — see rich-menu.constants.ts.
 const menuType2: MenuDef = {
   key: 'type2',
+  richMenuType: 'TYPE_2',
   image: resolve(ASSET_DIR, 'menu_type_2.jpg'),
   menu: {
-    size: { width: 2500, height: 1686 },
+    size: { width: TYPE_2.width, height: TYPE_2.height },
     selected: false,
-    name: 'easy-book-main',
+    name: TYPE_2.name,
     chatBarText: 'เริ่มต้นใช้งาน',
     areas: [
       {
-        // Top banner → opens the LIFF app.
-        bounds: { x: 0, y: 0, width: 2500, height: 843 },
-        action: { type: 'uri', label: 'Open app', uri: LIFF_URI },
+        // Top card "Enter EasyBook" → opens the LIFF app.
+        bounds: { x: 0, y: 0, width: TYPE_2.width, height: 950 },
+        action: { type: 'uri', label: 'Enter EasyBook', uri: LIFF_URI },
       },
       {
-        // Bottom-left (green) → postback handled by the webhook.
-        bounds: { x: 0, y: 843, width: 833, height: 843 },
-        action: { type: 'postback', label: 'Browse', data: 'action=browse' },
-      },
-      {
-        // Bottom-middle (pink).
-        bounds: { x: 833, y: 843, width: 834, height: 843 },
+        // Bottom-left "My Bookings" (blue).
+        bounds: { x: 0, y: 950, width: 840, height: 736 },
         action: {
           type: 'postback',
-          label: 'My bookings',
-          data: 'action=my-bookings',
+          label: RICH_MENU_SHORTCUTS.myBookings.label,
+          data: RICH_MENU_SHORTCUTS.myBookings.data,
         },
       },
       {
-        // Bottom-right (orange).
-        bounds: { x: 1667, y: 843, width: 833, height: 843 },
-        action: { type: 'postback', label: 'Help', data: 'action=help' },
+        // Bottom-middle "Report Issue" (orange).
+        bounds: { x: 840, y: 950, width: 810, height: 736 },
+        action: {
+          type: 'postback',
+          label: RICH_MENU_SHORTCUTS.reportIssue.label,
+          data: RICH_MENU_SHORTCUTS.reportIssue.data,
+        },
+      },
+      {
+        // Bottom-right "Settings" (green).
+        bounds: { x: 1650, y: 950, width: 850, height: 736 },
+        action: {
+          type: 'postback',
+          label: RICH_MENU_SHORTCUTS.settings.label,
+          data: RICH_MENU_SHORTCUTS.settings.data,
+        },
       },
     ],
   },
@@ -83,44 +128,135 @@ const menuType2: MenuDef = {
 
 const MENUS: MenuDef[] = [menuType1, menuType2];
 
+/**
+ * Re-link every active LineUser to the freshly created menu for their stored
+ * `richMenuType`.
+ *
+ * This step is NOT optional. Deleting a rich menu on LINE destroys every per-user
+ * link pointing at it, and nothing else in the app ever re-links: the only caller
+ * of `LineUserService.applyRichMenu` is `updateAccess` (approve/block/reinstate),
+ * and `upsertOnFollow` deliberately does not link. So before this pass existed, a
+ * menu refresh silently dropped every ALLOWED user onto the account default —
+ * which this script sets to type1, the restricted "Check Status / Login" menu —
+ * while the DB still read `richMenuType: TYPE_2`. Nothing detected the drift, and
+ * the only recovery was an admin re-approving each user by hand.
+ *
+ * Returns the number of users it failed to re-link, so the caller can decide
+ * whether it is safe to delete the old menus.
+ */
+async function relinkUsers(
+  prisma: PrismaService,
+  line: LineService,
+  idByType: Map<RichMenuType, string>,
+): Promise<number> {
+  const users = await prisma.lineUser.findMany({
+    where: { deletedAt: null },
+    select: { lineUserId: true, richMenuType: true },
+  });
+  if (users.length === 0) {
+    console.log('No active users to re-link.');
+    return 0;
+  }
+
+  let failed = 0;
+  for (const [richMenuType, richMenuId] of idByType) {
+    const userIds = users
+      .filter((user) => user.richMenuType === richMenuType)
+      .map((user) => user.lineUserId);
+    if (userIds.length === 0) continue;
+
+    for (let i = 0; i < userIds.length; i += RICH_MENU_LINK_BATCH_SIZE) {
+      const batch = userIds.slice(i, i + RICH_MENU_LINK_BATCH_SIZE);
+      try {
+        await line.linkRichMenuToUsers(richMenuId, batch);
+        console.log(`  re-linked ${batch.length} user(s) to ${richMenuType}`);
+      } catch (error) {
+        failed += batch.length;
+        console.error(
+          `  FAILED to re-link ${batch.length} user(s) to ${richMenuType}:`,
+          error instanceof Error ? error.message : error,
+        );
+      }
+    }
+  }
+  return failed;
+}
+
 async function main(): Promise<void> {
   const app = await NestFactory.createApplicationContext(AppModule, {
     logger: ['error', 'warn', 'log'],
   });
   try {
     const line = app.get(LineService);
+    const prisma = app.get(PrismaService);
     const defaultKey = process.env.DEFAULT_RICH_MENU ?? 'type1';
 
-    // Delete any pre-existing menus this script owns (matched by name), so a
-    // rerun replaces them instead of accumulating duplicates.
+    // Order matters: create-then-relink-then-delete, NOT delete-then-create. The
+    // old order left a window with no menus on the account at all, and destroyed
+    // every user link before there was anything to re-link them to.
+    //
+    // The stale menus are captured BY ID here, before the replacements exist,
+    // because from step 2 onward two menus share each managed name and a
+    // delete-by-name pass could not tell them apart.
     const managedNames = new Set(MENUS.map(({ menu }) => menu.name));
-    const existing = await line.listRichMenus();
-    for (const menu of existing) {
-      if (managedNames.has(menu.name)) {
-        await line.deleteRichMenu(menu.richMenuId);
-        console.log(
-          `Deleted existing rich menu '${menu.name}':`,
-          menu.richMenuId,
-        );
-      }
-    }
+    const stale = (await line.listRichMenus()).filter((menu) =>
+      managedNames.has(menu.name),
+    );
+    console.log(`== Found ${stale.length} existing menu(s) to replace ==`);
 
-    for (const { key, image, menu } of MENUS) {
+    // 1. Create the replacements and upload their images.
+    const idByType = new Map<RichMenuType, string>();
+    for (const { key, richMenuType, image, menu } of MENUS) {
       const richMenuId = await line.createRichMenu(menu);
-      console.log(`Created rich menu '${key}':`, richMenuId);
-
       await line.setRichMenuImage(
         richMenuId,
         readFileSync(image),
         'image/jpeg',
       );
+      idByType.set(richMenuType, richMenuId);
+      console.log(`Created rich menu '${key}' (${richMenuType}):`, richMenuId);
       console.log(`  uploaded ${image}`);
-
-      if (key === defaultKey) {
-        await line.setDefaultRichMenu(richMenuId);
-        console.log(`  set as DEFAULT rich menu ✓`);
-      }
     }
+
+    // 2. Point the account default at the new menu before anyone can land on the
+    //    old one.
+    const defaultMenu = MENUS.find(({ key }) => key === defaultKey);
+    const defaultId = defaultMenu && idByType.get(defaultMenu.richMenuType);
+    if (defaultId) {
+      await line.setDefaultRichMenu(defaultId);
+      console.log(`Set DEFAULT rich menu to '${defaultKey}' ✓`);
+    } else {
+      console.warn(
+        `DEFAULT_RICH_MENU='${defaultKey}' matches no menu — no default was set.`,
+      );
+    }
+
+    // 3. Restore every existing user's own menu.
+    console.log('== Re-linking existing users ==');
+    const failed = await relinkUsers(prisma, line, idByType);
+
+    // 4. Only now retire the old menus — and only if every user made it across.
+    //    A user we failed to re-link is still pointing at their OLD menu, so
+    //    deleting it would drop them to the default. Leaving the old menus in
+    //    place keeps them working; re-running this script converges (the next run
+    //    treats both generations as stale and replaces them).
+    if (failed > 0) {
+      console.error(
+        `\n${failed} user(s) could not be re-linked. NOT deleting the old menus — ` +
+          `they are what those users are still using. Fix the cause and re-run ` +
+          `this script; a re-run replaces every generation it finds.\n` +
+          `Note: until then two menus share each name, so LineService.findRichMenuId ` +
+          `may resolve either generation.`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    for (const menu of stale) {
+      await line.deleteRichMenu(menu.richMenuId);
+      console.log(`Deleted old rich menu '${menu.name}':`, menu.richMenuId);
+    }
+    console.log('\nRich-menu setup complete ✓');
   } finally {
     await app.close();
   }

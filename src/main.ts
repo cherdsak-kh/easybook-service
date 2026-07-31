@@ -10,8 +10,22 @@ import { AppModule } from './app.module';
 import { configureApp } from './app.setup';
 import { DEFAULT_SESSION_COOKIE_NAME } from './session/session.middleware';
 
-// The staging deployment sits behind a fixed 2-proxy chain: Cloudflare -> Nginx -> app.
-// Express must trust exactly that many hops to resolve the true client IP.
+// Reverse-proxy hops in front of the app. This is a DEPLOYMENT fact, not a code constant.
+//
+// An earlier version of this comment described the chain as "Cloudflare -> Nginx -> app" with
+// Nginx on the same box. That is NOT the staging topology: Nginx runs on a SEPARATE VM and
+// forwards to the Docker-published port on the app VM, so there is at least one more internal
+// hop than that description implied. 2 is kept as the default because it matches the chain
+// actually observed in the frontend container's access log (an `X-Forwarded-For` of
+// `<client>, <internal proxy>` arriving from a different internal address) — which works out to
+// exactly 2 trusted hops. That observation was made on the frontend hostname; the backend's own
+// hostname may be routed through a different server block and was never traced end to end.
+//
+// Getting this wrong is silent in both directions: too LOW and req.ips[0] resolves to an
+// internal proxy address, collapsing every client into a single login rate-limit bucket; too
+// HIGH and a client can forge X-Forwarded-For entries that Express then trusts, evading the
+// limiter entirely. Verify per environment with the procedure in docs/staging-runbook.md §1 and
+// override with TRUST_PROXY_HOPS rather than editing this default.
 const DEFAULT_TRUST_PROXY_HOPS = 2;
 
 // Dedicated Nest logger context for HTTP access logs. Piping morgan through Logger (not
@@ -70,13 +84,26 @@ async function bootstrap() {
   });
   const config = app.get(ConfigService);
 
-  // Trust the fixed reverse-proxy chain (Cloudflare -> Nginx -> app) so req.ip / req.ips —
-  // and therefore the login rate limiter (which reads req.ips first) — see the real client
-  // IP instead of the Nginx socket address. Set before any middleware runs.
-  const trustProxyHops = resolveTrustProxyHops(
-    config.get<string>('TRUST_PROXY_HOPS'),
-  );
+  // Trust the reverse-proxy chain so req.ip / req.ips — and therefore the login rate limiter
+  // (which reads req.ips first) — see the real client IP instead of the nearest proxy's socket
+  // address. Set before any middleware runs. See DEFAULT_TRUST_PROXY_HOPS above for why the
+  // right number is topology-dependent and must be verified per environment.
+  const rawTrustProxyHops = config.get<string>('TRUST_PROXY_HOPS');
+  const trustProxyHops = resolveTrustProxyHops(rawTrustProxyHops);
   app.set('trust proxy', trustProxyHops);
+
+  // Logged at boot so the value actually in effect is visible in `docker logs` without shelling
+  // into the container. This is the number that decides whether the per-IP login limiter buckets
+  // per client or collapses into one bucket, and it is step 1 of the verification procedure in
+  // docs/staging-runbook.md §1 — an unset var silently falling back to the default is exactly
+  // the case that is invisible otherwise.
+  new Logger('Bootstrap').log(
+    `Trust proxy hops: ${trustProxyHops} (${
+      rawTrustProxyHops === undefined || rawTrustProxyHops.trim() === ''
+        ? 'default; TRUST_PROXY_HOPS unset'
+        : `from TRUST_PROXY_HOPS="${rawTrustProxyHops}"`
+    })`,
+  );
 
   // HTTP request logging — mounted here (not in the shared app.setup) on purpose: keeping it
   // out of configureApp() means the 62 e2e requests never spam the test terminal. Registered

@@ -39,11 +39,17 @@ will fail the corresponding step, usually at SSH connect or GHCR auth.
 
 ## 1. Nginx `X-Forwarded-For` hygiene (hard prerequisite)
 
-`main.ts` sets `app.set('trust proxy', TRUST_PROXY_HOPS)` with `TRUST_PROXY_HOPS=2`, on the
-assumption that the request chain is exactly **Cloudflare → Nginx → app**, and that each hop
-appends itself to `X-Forwarded-For` rather than letting the client forge it. That assumption is
-**only true if Nginx is configured correctly** — there is no Nginx config in this repo, so this
-must be verified on the staging box directly:
+`main.ts` sets `app.set('trust proxy', TRUST_PROXY_HOPS)`, defaulting to `2`. The hop count must
+match the **real** request chain, and each hop must append itself to `X-Forwarded-For` rather than
+letting the client forge it.
+
+**Topology correction (this section previously got it wrong):** Nginx does **not** run on the same
+VM as the containers. It lives on a **separate VM** and forwards to the app VM's Docker-published
+port, so `proxy_pass` targets that VM's address — not `127.0.0.1` — and there is at least one more
+internal hop than the old "Cloudflare → Nginx → app" description implied. Do not treat `2` as a
+known-good constant on that basis; measure it (procedure below).
+
+There is no Nginx config in this repo, so this must be verified on the staging boxes directly:
 
 ```nginx
 server {
@@ -51,7 +57,10 @@ server {
     server_name staging.example.com;  # replace
 
     location / {
-        proxy_pass http://127.0.0.1:3300;
+        # NOT 127.0.0.1 — Nginx is on a different VM than the containers. This is the app VM's
+        # address on the private network, matching the `3300:3300` publish in
+        # docker-compose.staging.yml.
+        proxy_pass http://<APP_VM_PRIVATE_IP>:3300;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
 
@@ -73,9 +82,38 @@ either:
 - have Nginx set `X-Forwarded-For` from `$http_cf_connecting_ip` instead of `$remote_addr`
   ancestry, if Cloudflare's proxy chain isn't otherwise trusted.
 
-**This must be verified on the staging box before relying on `TRUST_PROXY_HOPS=2` /
-`main.ts`'s trust-proxy comment for anything security-sensitive (the per-IP login rate
-limiter).** Flagging it here rather than silently assuming it's already correct.
+**This must be verified before relying on `TRUST_PROXY_HOPS` for anything security-sensitive (the
+per-IP login rate limiter).** Flagging it here rather than silently assuming it's already correct.
+
+### Verifying the hop count (do this after any proxy/topology change)
+
+The value is silently wrong in both directions, so measure it rather than reasoning about it:
+
+1. Read the value actually in effect — the app logs it once at boot:
+
+   ```bash
+   docker logs easybook-service 2>&1 | grep "Trust proxy hops:"
+   ```
+
+2. From a machine **outside** the staging network, note your real public IP (`curl ifconfig.me`),
+   then load any page that hits the API.
+
+3. Read what the app resolved as the client IP — the morgan line ends with `- IP: <clientIp>`:
+
+   ```bash
+   docker logs easybook-service --tail 20
+   ```
+
+4. Compare:
+   - **Logged IP == your public IP** → the hop count is correct.
+   - **Logged IP is an internal address** (`192.168.…`, the proxy VM) → hop count is **too low**;
+     every client currently shares one rate-limit bucket. Increase `TRUST_PROXY_HOPS` by the
+     number of internal proxies and re-check.
+   - **Logged IP is an address you did not send from** → the hop count is **too high** and a
+     forged `X-Forwarded-For` is being trusted. Decrease it.
+
+Re-run this whenever a proxy is added or removed anywhere in the chain — a change on the Nginx VM
+silently invalidates a value set here, and nothing fails loudly when it does.
 
 ## 1b. Nginx WebSocket upgrade (hard prerequisite for realtime)
 

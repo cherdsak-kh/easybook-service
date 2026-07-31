@@ -14,6 +14,9 @@ import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
 import { LineService } from './line.service';
+// Asserted against the shared constant, not a restated literal: these fixtures
+// silently went stale when the TYPE_1 artwork changed from 2500x843 to 2500x1686.
+import { RICH_MENU_SPECS } from './rich-menu.constants';
 import {
   ACCESS_NOTIFICATION_MESSAGES,
   accessToRichMenuType,
@@ -274,11 +277,7 @@ describe('LineUserService', () => {
       lineUserId: 'U123',
       richMenuType: 'TYPE_2',
     });
-    expect(line.findRichMenuId).toHaveBeenCalledWith({
-      name: 'easy-book-main',
-      width: 2500,
-      height: 1686,
-    });
+    expect(line.findRichMenuId).toHaveBeenCalledWith(RICH_MENU_SPECS.TYPE_2);
     expect(line.linkRichMenuToUser).toHaveBeenCalledWith('U123', 'rm-123');
   });
 
@@ -970,11 +969,7 @@ describe('LineUserService', () => {
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
-      expect(line.findRichMenuId).toHaveBeenCalledWith({
-        name: 'easy-book-main',
-        width: 2500,
-        height: 1686,
-      });
+      expect(line.findRichMenuId).toHaveBeenCalledWith(RICH_MENU_SPECS.TYPE_2);
       expect(line.linkRichMenuToUser).toHaveBeenCalledWith('U123', 'rm-type2');
       expect(result.access).toBe(AppAccess.ALLOWED);
       expect(result.richMenuType).toBe('TYPE_2');
@@ -1004,11 +999,7 @@ describe('LineUserService', () => {
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
-      expect(line.findRichMenuId).toHaveBeenCalledWith({
-        name: 'easy-book-liff',
-        width: 2500,
-        height: 843,
-      });
+      expect(line.findRichMenuId).toHaveBeenCalledWith(RICH_MENU_SPECS.TYPE_1);
       expect(line.linkRichMenuToUser).toHaveBeenCalledWith('U123', 'rm-type1');
       // Pushes the exact BLOCKED copy to the LINE-side U… id.
       expect(line.push).toHaveBeenCalledWith('U123', [

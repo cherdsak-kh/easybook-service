@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import type { webhook } from '@line/bot-sdk';
 import { LineService } from './line.service';
 import { LineUserService } from './line-user.service';
+import { PENDING_MESSAGE_BY_POSTBACK_DATA } from './rich-menu.constants';
 
 /**
  * Dispatches incoming LINE webhook events to handlers. Each event is handled
@@ -63,13 +64,36 @@ export class LineWebhookService {
         }
         break;
 
-      case 'postback':
-        if (event.replyToken) {
-          await this.line.reply(event.replyToken, [
-            { type: 'text', text: `Received action: ${event.postback.data}` },
-          ]);
+      case 'postback': {
+        if (!event.replyToken) {
+          break;
         }
+        // The TYPE_2 rich menu's three bottom buttons are shortcuts to pages that
+        // do not exist yet, so they answer with a "still being built" message
+        // keyed off the postback data (see rich-menu.constants.ts, which both this
+        // file and scripts/setup-rich-menu.ts import so the tokens cannot drift).
+        //
+        // Unknown data gets a generic reply, never an echo of the payload: the old
+        // `Received action: ${data}` handed the user an internal action token, which
+        // is developer output leaking into a real conversation. Log it instead — an
+        // unrecognised token means a rich menu is live that this build does not know
+        // about, which is worth seeing server-side.
+        const pending = PENDING_MESSAGE_BY_POSTBACK_DATA.get(
+          event.postback.data,
+        );
+        if (!pending) {
+          this.logger.warn(
+            `Unrecognised postback data: '${event.postback.data}'`,
+          );
+        }
+        await this.line.reply(event.replyToken, [
+          {
+            type: 'text',
+            text: pending ?? 'ขออภัย ระบบไม่รู้จักคำสั่งนี้',
+          },
+        ]);
         break;
+      }
 
       default:
         this.logger.debug(`Unhandled event type: ${event.type}`);
