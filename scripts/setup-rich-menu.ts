@@ -128,6 +128,29 @@ const menuType2: MenuDef = {
 
 const MENUS: MenuDef[] = [menuType1, menuType2];
 
+interface ActiveUser {
+  lineUserId: string;
+  richMenuType: RichMenuType;
+}
+
+/**
+ * Read every active user's stored `richMenuType`.
+ *
+ * Called BEFORE anything on LINE is touched, on purpose. This read is the only
+ * part of the run that depends on the database, and it is read-only — doing it
+ * first means an unreachable DB aborts with zero side effects. The first version
+ * of this script read it in the middle, after the new menus had been created and
+ * the account default repointed, so a DB outage left LINE half-migrated (observed
+ * on 2026-07-31: `.env` pointed at a local Postgres that was not running, and the
+ * run died with ECONNREFUSED holding two fresh menus and a changed default).
+ */
+async function loadActiveUsers(prisma: PrismaService): Promise<ActiveUser[]> {
+  return prisma.lineUser.findMany({
+    where: { deletedAt: null },
+    select: { lineUserId: true, richMenuType: true },
+  });
+}
+
 /**
  * Re-link every active LineUser to the freshly created menu for their stored
  * `richMenuType`.
@@ -145,14 +168,10 @@ const MENUS: MenuDef[] = [menuType1, menuType2];
  * whether it is safe to delete the old menus.
  */
 async function relinkUsers(
-  prisma: PrismaService,
   line: LineService,
+  users: ActiveUser[],
   idByType: Map<RichMenuType, string>,
 ): Promise<number> {
-  const users = await prisma.lineUser.findMany({
-    where: { deletedAt: null },
-    select: { lineUserId: true, richMenuType: true },
-  });
   if (users.length === 0) {
     console.log('No active users to re-link.');
     return 0;
@@ -191,12 +210,30 @@ async function main(): Promise<void> {
     const prisma = app.get(PrismaService);
     const defaultKey = process.env.DEFAULT_RICH_MENU ?? 'type1';
 
-    // Order matters: create-then-relink-then-delete, NOT delete-then-create. The
-    // old order left a window with no menus on the account at all, and destroyed
-    // every user link before there was anything to re-link them to.
+    // Order matters: read-DB, then create-relink-delete — NOT delete-then-create,
+    // and never a LINE mutation before the DB read. The original order left a
+    // window with no menus on the account at all and destroyed every user link
+    // before there was anything to re-link them to; reading the DB last also meant
+    // a DB outage could strand LINE half-migrated.
     //
+    // Step 0 is therefore the read-only DB query. Nothing on LINE has been touched
+    // yet, so a failure here costs nothing.
+    const users = await loadActiveUsers(prisma);
+    const countByType = new Map<RichMenuType, number>();
+    for (const user of users) {
+      countByType.set(
+        user.richMenuType,
+        (countByType.get(user.richMenuType) ?? 0) + 1,
+      );
+    }
+    console.log(
+      `== ${users.length} active user(s) to re-link: ` +
+        `${[...countByType].map(([type, n]) => `${type}=${n}`).join(', ') || 'none'} ==`,
+    );
+    console.log('   (sanity-check these counts before the menus are replaced)');
+
     // The stale menus are captured BY ID here, before the replacements exist,
-    // because from step 2 onward two menus share each managed name and a
+    // because from the create step onward two menus share each managed name and a
     // delete-by-name pass could not tell them apart.
     const managedNames = new Set(MENUS.map(({ menu }) => menu.name));
     const stale = (await line.listRichMenus()).filter((menu) =>
@@ -233,7 +270,7 @@ async function main(): Promise<void> {
 
     // 3. Restore every existing user's own menu.
     console.log('== Re-linking existing users ==');
-    const failed = await relinkUsers(prisma, line, idByType);
+    const failed = await relinkUsers(line, users, idByType);
 
     // 4. Only now retire the old menus — and only if every user made it across.
     //    A user we failed to re-link is still pointing at their OLD menu, so
