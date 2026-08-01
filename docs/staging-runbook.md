@@ -43,13 +43,32 @@ will fail the corresponding step, usually at SSH connect or GHCR auth.
 match the **real** request chain, and each hop must append itself to `X-Forwarded-For` rather than
 letting the client forge it.
 
-**Topology correction (this section previously got it wrong):** Nginx does **not** run on the same
-VM as the containers. It lives on a **separate VM** and forwards to the app VM's Docker-published
-port, so `proxy_pass` targets that VM's address — not `127.0.0.1` — and there is at least one more
-internal hop than the old "Cloudflare → Nginx → app" description implied. Do not treat `2` as a
-known-good constant on that basis; measure it (procedure below).
+**Topology (this section previously described it wrongly as a single box):**
 
-There is no Nginx config in this repo, so this must be verified on the staging boxes directly:
+```
+client → Cloudflare edge → cloudflared 192.168.10.250 → NPM 192.168.10.251 → 192.168.10.5:3300
+                           (also the LAN gateway)        (Nginx Proxy Manager)   (Docker VM)
+```
+
+All three hosts are on one LAN. The reverse proxy is **Nginx Proxy Manager on its own VM**, so
+`proxy_pass` targets `192.168.10.5` — **not** `127.0.0.1`, which was what this section used to say
+and would resolve to the NPM VM itself.
+
+Two consequences worth stating, because neither is obvious from either repo:
+
+- **Ports 2200/3300 are not forwarded at the router** (verified 2026-07-31 — they do not answer
+  from the public internet). Cloudflare → cloudflared → NPM is the only ingress, so the origin
+  cannot be hit directly and Cloudflare cannot be bypassed. Keep it that way; a router forward
+  added "for convenience" would silently undo it.
+- **`TRUST_PROXY_HOPS=2` is correct for exactly this chain.** The two hops Express trusts are NPM
+  (`.251`, which is the socket address the container sees) and cloudflared (`.250`, which NPM
+  appends to `X-Forwarded-For`). That leaves the genuine client as the left-most entry, which is
+  what `req.ips[0]` and the login rate limiter read. **Removing or adding any hop — dropping
+  cloudflared, putting a load balancer in front of NPM, pointing NPM straight at the container —
+  invalidates this number, and nothing fails loudly when it does.** Re-measure with the procedure
+  below after any such change.
+
+There is no Nginx/NPM config in this repo, so this must be verified on the staging boxes directly:
 
 ```nginx
 server {
@@ -57,10 +76,10 @@ server {
     server_name staging.example.com;  # replace
 
     location / {
-        # NOT 127.0.0.1 — Nginx is on a different VM than the containers. This is the app VM's
-        # address on the private network, matching the `3300:3300` publish in
+        # NOT 127.0.0.1 — NPM is on a different VM (.251) than the containers (.5). This is the
+        # Docker VM's LAN address, matching the `3300:3300` publish in
         # docker-compose.staging.yml.
-        proxy_pass http://<APP_VM_PRIVATE_IP>:3300;
+        proxy_pass http://192.168.10.5:3300;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-Proto $scheme;
 
@@ -87,6 +106,10 @@ per-IP login rate limiter).** Flagging it here rather than silently assuming it'
 
 ### Verifying the hop count (do this after any proxy/topology change)
 
+**Last measured 2026-08-01: `TRUST_PROXY_HOPS=2` is correct.** A request from a known public
+address was logged by morgan as that same address, not as `192.168.10.250`/`.251`, confirming
+Express resolves past both cloudflared and NPM to the real client.
+
 The value is silently wrong in both directions, so measure it rather than reasoning about it:
 
 1. Read the value actually in effect — the app logs it once at boot:
@@ -112,8 +135,17 @@ The value is silently wrong in both directions, so measure it rather than reason
    - **Logged IP is an address you did not send from** → the hop count is **too high** and a
      forged `X-Forwarded-For` is being trusted. Decrease it.
 
-Re-run this whenever a proxy is added or removed anywhere in the chain — a change on the Nginx VM
+Re-run this whenever a proxy is added or removed anywhere in the chain — a change on the NPM VM
 silently invalidates a value set here, and nothing fails loudly when it does.
+
+**Gotcha that cost an hour on 2026-08-01:** `docker logs` only ever shows the CURRENT container's
+output. A `docker compose up -d`, a redeploy, or a host reboot recreates the container and the old
+log goes with it. Probes sent before that point simply vanish, which reads exactly like "external
+traffic never reaches this container" — a far more alarming conclusion than the truth. Always send
+the probe and read the log in the same sitting, and sanity-check with
+`docker inspect easybook-service --format '{{.State.StartedAt}}'` before concluding anything from
+an absence of log lines. The steady `GET /api/v1/health … - IP: ::1` line every 15s is the
+container's own healthcheck over loopback, not real traffic — do not mistake it for one.
 
 ## 1b. Nginx WebSocket upgrade (hard prerequisite for realtime)
 
@@ -249,3 +281,41 @@ green checkmark on a broken deploy. Possible states the server can be left in, a
   `easybook-service`-`migrator` tags), excluding any tag currently referenced by
   `docker-compose.staging.yml` on the server. Left for a follow-up `devops` task once there is
   real deploy volume to justify it — premature to build now (anti-over-engineering guardrail).
+
+## 6. Reaching Postgres / Redis on staging (SSH tunnel only)
+
+`postgres-sv` and `redis-sv` publish `1101:5432` and `1102:6379` on the Docker VM. **Those ports
+are deliberately NOT forwarded at the router** — they were until 2026-08-01, when a check from an
+outside network confirmed both answered from the public internet. Postgres offers no TLS at all
+(the official image's default: an `SSLRequest` is answered `N`), so every external client session
+was sending its password and every returned row in cleartext across the internet, and Redis — which
+holds the back-office session store — was reachable for unlimited offline-speed password guessing.
+
+The app itself never needed either port: `easybook-service` reaches both by container name over
+`easybook-network`. The publish exists purely for admin tooling, so the fix was to reach it through
+SSH instead of exposing it.
+
+**Connect from anywhere:**
+
+```bash
+ssh -N -o ServerAliveInterval=60 -L 1101:127.0.0.1:1101 -L 1102:127.0.0.1:1102 <user>@<staging-host> -p <ssh-port>
+```
+
+Then point any client at `localhost:1101` (Postgres) or `localhost:1102` (Redis) with the normal
+credentials. GUI clients can manage the tunnel themselves instead:
+
+| Client | Where | Setting |
+|---|---|---|
+| DBeaver | SSH tab | Use SSH Tunnel; **Implementation `JSch`** — `SSHJ` builds the wrong `known_hosts` path on Windows when `HOME` is unset (it looks for `%USERPROFILE%\ssh\` instead of `.ssh\`) and fails before connecting |
+| DBeaver | Main tab | Host `127.0.0.1`, Port `1101` — resolved from the SSH server, so **not** the public hostname |
+| RedisInsight | Security tab | Use SSH Tunnel; leave **Use TLS off** (this Redis speaks plaintext RESP) |
+| RedisInsight | General tab | Host `127.0.0.1`, Port `1102`, username `default`, timeout `30` (the `1`s default is too tight for a tunnel) |
+
+Use `127.0.0.1` rather than the VM's LAN address as the tunnel target: it keeps working if the
+publish is ever narrowed to `127.0.0.1:1101:5432`, which is the remaining hardening step here.
+
+Local scripts that need the DB (e.g. `npm run line:setup-richmenu`) should point `DATABASE_URL` at
+`@localhost:1101` with the tunnel up — not at the public hostname, which no longer resolves to an
+open port.
+
+**Do not re-add the router forward for these ports.** If a teammate needs access, give them SSH.

@@ -32,13 +32,16 @@ services:
       # bound to 127.0.0.1. Its `proxy_pass` therefore targets this VM's private address, not
       # loopback — see docs/staging-runbook.md §1.
       #
-      # Because of that, the bind address here is a real security boundary rather than a
-      # formality: `'3300:3300'` publishes on 0.0.0.0, i.e. every interface this VM has,
-      # including any public one. Prefer pinning it to the private interface the Nginx VM uses
-      # (`'<APP_VM_PRIVATE_IP>:3300:3300'`) so the API is not also listening on a public address.
-      # Note that Docker's published ports bypass ufw's INPUT rules (it DNATs in `nat
-      # PREROUTING` and filters in its own `DOCKER-USER` chain), so a host firewall is not a
-      # substitute for getting this bind address right.
+      # `'3300:3300'` publishes on 0.0.0.0 — every interface of the Docker VM (192.168.10.5).
+      # Those are all RFC1918 LAN interfaces; the VM has no public address of its own, and this
+      # port is NOT forwarded at the router (verified 2026-07-31: it does not answer from the
+      # public internet). So the only route in is Cloudflare -> cloudflared -> NPM, which is the
+      # intended one. Narrowing the bind to the LAN address would be defence in depth, not a fix
+      # for a live exposure.
+      #
+      # Worth knowing if that ever changes: Docker's published ports bypass ufw's INPUT rules
+      # (it DNATs in `nat PREROUTING` and filters in its own `DOCKER-USER` chain), so a host
+      # firewall is not a substitute for the bind address or the router's forwarding rules.
       - '3300:3300'
     # Sensible ceilings for a single small LIFF-app instance, not a production capacity plan —
     # revisit if/when real staging traffic numbers exist.
