@@ -13,13 +13,19 @@ import { DEFAULT_SESSION_COOKIE_NAME } from './session/session.middleware';
 // Reverse-proxy hops in front of the app. This is a DEPLOYMENT fact, not a code constant.
 //
 // An earlier version of this comment described the chain as "Cloudflare -> Nginx -> app" with
-// Nginx on the same box. That is NOT the staging topology: Nginx runs on a SEPARATE VM and
-// forwards to the Docker-published port on the app VM, so there is at least one more internal
-// hop than that description implied. 2 is kept as the default because it matches the chain
-// actually observed in the frontend container's access log (an `X-Forwarded-For` of
-// `<client>, <internal proxy>` arriving from a different internal address) — which works out to
-// exactly 2 trusted hops. That observation was made on the frontend hostname; the backend's own
-// hostname may be routed through a different server block and was never traced end to end.
+// Nginx on the same box. The real staging chain, confirmed 2026-07-31, is:
+//
+//   client -> Cloudflare -> cloudflared 192.168.10.250 -> NPM 192.168.10.251 -> Docker VM .5
+//
+// 2 is right for exactly that shape, and this is MEASURED, not reasoned: on 2026-08-01 a request
+// from a known public address was logged by morgan as that same address rather than as an
+// internal one. The two hops trusted are NPM (`.251` — the socket address the container sees)
+// and cloudflared (`.250` — what NPM appends to X-Forwarded-For), which leaves the genuine
+// client as the left-most XFF entry where req.ips[0] finds it.
+//
+// It follows that this number is a property of the DEPLOYMENT, not of the code: drop
+// cloudflared, add a load balancer ahead of NPM, or point NPM straight at the container, and 2
+// becomes wrong. See docs/staging-runbook.md §1.
 //
 // Getting this wrong is silent in both directions: too LOW and req.ips[0] resolves to an
 // internal proxy address, collapsing every client into a single login rate-limit bucket; too
