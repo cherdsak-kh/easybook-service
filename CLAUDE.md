@@ -45,19 +45,27 @@ npm run auth:hash-password -- 'pw'  # print an argon2id hash for a password (deb
 npm run options:seed              # seed baseline Department / PersonnelRole options (never writes isSystemReserved)
 ```
 
-Redis must be running for anything session-backed. There is still no `docker-compose.yml` — see
-the DOCKER-1 backlog item.
+Redis must be running for anything session-backed. A `Dockerfile` and a `docker-compose.staging.yml`
+exist, but both are *staging deploy* artifacts (the compose file declares only the app container and
+is driven by `.github/workflows/cd.yml`); there is still **no local-dev compose** — run Postgres and
+Redis yourself. See the DOCKER-1 backlog item.
 
 ## Architecture
 
 **Module wiring** (`src/app.module.ts`): `ConfigModule` (global, `validate: validateEnv`) →
 `PrismaModule` (global) → `RedisModule` (global) → `CsrfModule` (global) → `ThrottlerModule`
-(registered `global: true` so `LoginThrottleGuard` can resolve it) → `HealthModule` → `LineModule`
-→ `AuthModule` → `SystemUsersModule` → `OptionsModule`. `OptionsModule` (`src/options/`) exposes the
-admin-curated `Department` / `PersonnelRole` option tables via `DepartmentsController` /
-`PersonnelRolesController` — the same tables `SystemUser` and LINE registrations reference (see the
-`isSystemReserved` note below). Booking/Resource domain modules don't exist yet — they are added as
-their own future tasks; don't assume they're stubbed out anywhere.
+(registered `global: true` so `LoginThrottleGuard` can resolve it) → `HealthModule` →
+`RealtimeModule` → `LineModule` → `AuthModule` → `SystemUsersModule` → `OptionsModule`.
+`RealtimeModule` (`src/realtime/`) hosts the Socket.IO gateway on the **`/admin` namespace**,
+server→client only (zero `@SubscribeMessage`): `lineUser.created` / `.updated` / `.deleted`, plus
+`session.closed`. Its handshake reuses the express session (`SessionIoAdapter`, installed in
+`configureApp`) and namespace membership *is* the `SUPER_ADMIN|ADMIN` boundary — there are no rooms.
+`LineModule` imports it so `LineUserService` emits through the gateway directly.
+`OptionsModule` (`src/options/`) exposes the admin-curated `Department` / `PersonnelRole` option
+tables via `DepartmentsController` / `PersonnelRolesController` — the same tables `SystemUser` and
+LINE registrations reference (see the `isSystemReserved` note below). Booking/Resource domain
+modules don't exist yet — they are added as their own future tasks; don't assume they're stubbed
+out anywhere.
 `AuthModule` ↔ `SystemUsersModule` is a genuine circular reference resolved with `forwardRef` on both
 sides: `SystemUsersModule` needs the guards, and `AuthSystemController` needs `SystemUsersService`
 (which owns every `SystemUser` write — `PATCH /auth/system/me` and the avatar's `profilePictureUrl`
