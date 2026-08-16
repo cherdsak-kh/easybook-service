@@ -241,17 +241,17 @@ export class AuthSystemController {
 
   @Patch('me')
   @UseGuards(SessionGuard)
-  // NOT exempt from the gate — editing your name is not a prerequisite for escaping it.
+  // NOT exempt from the gate — editing your profile is not a prerequisite for escaping it.
   @ApiCookieAuth('session')
   @ApiOperation({
     summary: 'Update your own profile.',
     description:
-      'Self-service. Accepts EXACTLY `firstName`, `lastName`, `phoneNumber`, `profilePictureUrl`. `role`, `isActive`, `departmentId`, `personnelRoleId`, `email`, `password` and `lineUserId` are absent from the DTO, so any attempt to set one is a 400 — a SUPER_ADMIN manages those via PATCH /system-users/:id. An empty body is a 400. `phoneNumber`/`profilePictureUrl` accept an explicit null to clear them.',
+      'Self-service. Accepts EXACTLY `profilePictureUrl` — your avatar is the only part of your own profile you maintain. `firstName`, `lastName` and `phoneNumber` were removed on 2026-08-16: an administrator maintains them via PATCH /system-users/:id, which is what the padlock on the profile screen means. They join `role`, `isActive`, `departmentId`, `personnelRoleId`, `email`, `password` and `lineUserId` in being absent from the DTO, so any attempt to set one is a 400. An explicit null clears the avatar; an empty body is a 200 that changes nothing.',
   })
   @ApiHeader({ name: 'x-csrf-token', required: true })
   @ApiOkResponse({ description: 'Updated.', type: SystemUserResponseDto })
   @ApiBadRequestResponse({
-    description: 'Empty body, a forbidden key, or a bad value.',
+    description: 'A forbidden key, or a bad value.',
     type: ErrorResponseDto,
   })
   @ApiUnauthorizedResponse({
@@ -283,7 +283,7 @@ export class AuthSystemController {
   @ApiOperation({
     summary: 'Change your own password (forced or voluntary).',
     description:
-      'Requires `currentPassword`: without it a hijacked session becomes a permanent account takeover in one request. A WRONG current password is a 400, never a 401 — the session is valid, only the re-auth failed, and a 401 would log you out for a typo. The new password must be >= 12 chars and differ from the current one. On success `mustChangePassword` clears and the very NEXT request to any previously-gated route succeeds on the same cookie — no re-login, because SessionGuard re-reads the user every request. The session is deliberately NOT destroyed.',
+      'Requires `currentPassword`: without it a hijacked session becomes a permanent account takeover in one request. A WRONG current password is a 400, never a 401 — the session is valid, only the re-auth failed, and a 401 would log you out for a typo. The new password must be >= 8 chars, contain an uppercase letter, a lowercase letter, a digit and a special character, and differ from the current one — the same five rules the portal shows as a live checklist. On success `mustChangePassword` clears and the very NEXT request to any previously-gated route succeeds on the same cookie — no re-login, because SessionGuard re-reads the user every request. The session is deliberately NOT destroyed.',
   })
   @ApiHeader({ name: 'x-csrf-token', required: true })
   @ApiOkResponse({
