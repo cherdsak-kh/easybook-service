@@ -25,7 +25,7 @@ jest.setTimeout(120_000);
 
 const SU_PREFIX = 'e2e-lusu-';
 const LU_PREFIX = 'e2e-lu-';
-const PASSWORD = 'e2e-correct-horse-battery';
+const PASSWORD = 'E2e-correct-horse-battery-1';
 
 const SUPER = `${SU_PREFIX}super@easybook.local`;
 const ADMIN = `${SU_PREFIX}admin@easybook.local`;

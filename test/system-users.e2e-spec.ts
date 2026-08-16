@@ -19,7 +19,7 @@ import {
 jest.setTimeout(120_000);
 
 const PREFIX = 'e2e-su-';
-const PASSWORD = 'e2e-correct-horse-battery';
+const PASSWORD = 'E2e-correct-horse-battery-1';
 
 const SUPER = `${PREFIX}super@easybook.local`;
 const SUPER_2 = `${PREFIX}super2@easybook.local`;

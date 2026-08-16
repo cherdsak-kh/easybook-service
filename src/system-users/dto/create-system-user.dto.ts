@@ -83,13 +83,22 @@ export class CreateSystemUserDto {
   // Deliberately NOT @IsPhoneNumber('TH'): libphonenumber rejects the office formats back-office
   // staff actually have (extensions, internal short numbers, foreign numbers). The field is
   // display-only — not a lookup key, not unique, not a notification channel.
-  @ApiPropertyOptional({ example: '02-123-4567 ext. 101', maxLength: 20 })
+  @ApiPropertyOptional({ example: '02-123-4567 ต่อ 101', maxLength: 30 })
   @IsOptional()
   @Transform(trim)
   @IsString()
-  @MaxLength(20)
-  @Matches(/^[0-9+\-\s()#.]{6,20}$/, {
-    message: 'phoneNumber contains unsupported characters.',
+  @MaxLength(30)
+  // ⚠️ THE EXTENSION SUFFIX IS THAI, and that is the whole point of this shape (STAFF-PHONE-1).
+  // "02-123-4567 ต่อ 101" is how a Thai office number is written, and the old charset-only regex
+  // answered 400 for it with a message naming no character. A person then retypes the number
+  // without the extension — the data is lost at the keyboard, quietly.
+  //
+  // A GRAMMAR, not a widened charset: a phone-shaped prefix, then OPTIONALLY a marker and digits.
+  // Adding Thai letters to the character class would accept "โทรหาผมสิ" as a phone number. It is
+  // this grammar that lets `toPhoneDigits` split on the marker and trust what is on each side.
+  @Matches(/^[0-9+\-\s()#.]{6,20}(?:\s*(?:ต่อ|ext\.?)\s*\d{1,6})?$/, {
+    message:
+      'phoneNumber must be digits and separators, optionally followed by ต่อ or ext and an extension.',
   })
   phoneNumber?: string;
 

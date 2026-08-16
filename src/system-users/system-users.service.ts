@@ -454,7 +454,9 @@ export class SystemUsersService {
    * set (enforced by `forbidNonWhitelisted` at the pipe), there is no target but self, and no field
    * here bears an invariant. A single-row update with no cross-row read needs no ceremony.
    *
-   * Field by field, never `{...dto}` — same discipline as `update()`.
+   * Field by field, never `{...dto}` — same discipline as `update()`. With the DTO down to one
+   * field (2026-08-16) that discipline costs nothing and still matters: a spread would silently
+   * start writing whatever the DTO gains next.
    */
   async updateOwnProfile(
     id: string,
@@ -462,12 +464,7 @@ export class SystemUsersService {
   ): Promise<SystemUserResponseDto> {
     const updated = await this.prisma.systemUser.update({
       where: { id },
-      data: {
-        firstName: patch.firstName,
-        lastName: patch.lastName,
-        phoneNumber: patch.phoneNumber,
-        profilePictureUrl: patch.profilePictureUrl,
-      },
+      data: { profilePictureUrl: patch.profilePictureUrl },
       select: PUBLIC_FIELDS,
     });
     return toSystemUserDto(updated);
