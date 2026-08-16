@@ -25,7 +25,7 @@ const SUPER = `${PREFIX}super@easybook.local`;
 const SUPER_2 = `${PREFIX}super2@easybook.local`;
 const ADMIN = `${PREFIX}admin@easybook.local`;
 const ADMIN_2 = `${PREFIX}admin2@easybook.local`;
-const STAFF = `${PREFIX}staff@easybook.local`;
+const VIEWER = `${PREFIX}staff@easybook.local`;
 
 const url = (path: string) => `${API_BASE_PATH}${path}`;
 
@@ -71,7 +71,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       [SUPER_2, 'E2E', 'Super Two', SystemRole.SUPER_ADMIN],
       [ADMIN, 'E2E', 'Admin', SystemRole.ADMIN],
       [ADMIN_2, 'E2E', 'Admin Two', SystemRole.ADMIN],
-      [STAFF, 'E2E', 'Staff', SystemRole.STAFF],
+      [VIEWER, 'E2E', 'Staff', SystemRole.VIEWER],
     ] as Array<[string, string, string, SystemRole]>) {
       const created = await prisma.systemUser.create({
         data: { email, firstName, lastName, role, ...base },
@@ -99,13 +99,13 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     await app.close();
   });
 
-  // ─────────────────────── unauthenticated / STAFF ───────────────────────
+  // ─────────────────────── unauthenticated / VIEWER ───────────────────────
 
   it('AC-42 — with no session, all six /system-users routes return 401', async () => {
     const anon = request.agent(server());
     const csrf = await anon.get(url('/auth/system/csrf')).expect(200);
     const token = (csrf.body as { csrfToken: string }).csrfToken;
-    const id = ids[STAFF];
+    const id = ids[VIEWER];
 
     await anon.get(url('/system-users')).expect(401);
     await anon.get(url(`/system-users/${id}`)).expect(401);
@@ -129,8 +129,8 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       .expect(401);
   });
 
-  it('AC-45 — STAFF gets 403 on every /system-users route, with no DB read', async () => {
-    const { agent, token } = await login(STAFF);
+  it('AC-45 — VIEWER gets 403 on every /system-users route, with no DB read', async () => {
+    const { agent, token } = await login(VIEWER);
     const id = ids[ADMIN];
 
     await agent.get(url('/system-users')).expect(403);
@@ -149,7 +149,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       .set('x-csrf-token', token)
       .expect(403);
 
-    // A STAFF caller cannot even distinguish a real id from an invented one.
+    // A VIEWER caller cannot even distinguish a real id from an invented one.
     await agent.get(url('/system-users/does-not-exist')).expect(403);
   });
 
@@ -157,7 +157,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     const { agent, token } = await login(ADMIN);
 
     await agent
-      .delete(url(`/system-users/${ids[STAFF]}`))
+      .delete(url(`/system-users/${ids[VIEWER]}`))
       .set('x-csrf-token', token)
       .expect(403);
     await agent
@@ -165,7 +165,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       .set('x-csrf-token', token)
       .expect(403);
     await agent
-      .post(url(`/system-users/${ids[STAFF]}/restore`))
+      .post(url(`/system-users/${ids[VIEWER]}/restore`))
       .set('x-csrf-token', token)
       .expect(403);
   });
@@ -208,7 +208,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     it('AC-41 — GET /:id on an unknown id is a 404 identical to the soft-deleted case', async () => {
       const sa = await login(SUPER);
       await sa.agent
-        .delete(url(`/system-users/${ids[STAFF]}`))
+        .delete(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', sa.token)
         .expect(204);
 
@@ -216,7 +216,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         .get(url('/system-users/never-existed'))
         .expect(404);
       const deleted = await sa.agent
-        .get(url(`/system-users/${ids[STAFF]}`))
+        .get(url(`/system-users/${ids[VIEWER]}`))
         .expect(404);
 
       expect(deleted.body).toEqual(unknown.body);
@@ -270,7 +270,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       // seeded first SUPER_ADMIN, which is exactly why the DTO field is nullable.
       const { agent } = await login(SUPER);
       const res = await agent
-        .get(url(`/system-users/${ids[STAFF]}`))
+        .get(url(`/system-users/${ids[VIEWER]}`))
         .expect(200);
       expect((res.body as { createdBy: unknown }).createdBy).toBeNull();
       expect(typeof (res.body as { updatedAt: unknown }).updatedAt).toBe(
@@ -288,7 +288,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       };
 
       await sa.agent
-        .delete(url(`/system-users/${ids[STAFF]}`))
+        .delete(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', sa.token)
         .expect(204);
 
@@ -299,7 +299,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         meta: { total: number };
       };
       expect(after.meta.total).toBe(before.meta.total - 1);
-      expect(after.data.map((u) => u.email)).not.toContain(STAFF);
+      expect(after.data.map((u) => u.email)).not.toContain(VIEWER);
     });
   });
 
@@ -329,7 +329,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
 
       expect(res.body).toMatchObject({
         email: newUser.email,
-        role: SystemRole.STAFF,
+        role: SystemRole.VIEWER,
         isActive: true,
         lineUserId: null,
         mustChangePassword: true, // the server issued a temp password
@@ -478,7 +478,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       );
 
       // Step 5 fires before the ADMIN branch, so the reason is the SELF one — not
-      // 'An ADMIN may only modify STAFF users.' The frontend and this suite both assert it.
+      // 'An ADMIN may only modify VIEWER users.' The frontend and this suite both assert it.
       const role = await agent
         .patch(self)
         .set('x-csrf-token', token)
@@ -505,41 +505,41 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         .send({ departmentId })
         .expect(403);
       expect((res.body as { message: string }).message).toBe(
-        'An ADMIN may only modify STAFF users.',
+        'An ADMIN may only modify VIEWER users.',
       );
     });
 
-    it('AC-44 — an ADMIN sending any valid role value → 403, including a no-op role on a STAFF target', async () => {
+    it('AC-44 — an ADMIN sending any valid role value → 403, including a no-op role on a VIEWER target', async () => {
       const { agent, token } = await login(ADMIN);
 
       for (const role of Object.values(SystemRole)) {
         await agent
-          .patch(url(`/system-users/${ids[STAFF]}`))
+          .patch(url(`/system-users/${ids[VIEWER]}`))
           .set('x-csrf-token', token)
           .send({ role })
           .expect(403);
       }
 
       const row = await prisma.systemUser.findUnique({
-        where: { id: ids[STAFF] },
+        where: { id: ids[VIEWER] },
         select: { role: true },
       });
-      expect(row?.role).toBe(SystemRole.STAFF);
+      expect(row?.role).toBe(SystemRole.VIEWER);
     });
 
     it('AC-62 — an ADMIN sending `{"role": null}` gets 400 at validation, not 403 at the policy', async () => {
       const { agent, token } = await login(ADMIN);
       await agent
-        .patch(url(`/system-users/${ids[STAFF]}`))
+        .patch(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .send({ role: null })
         .expect(400);
     });
 
-    it('an ADMIN may patch a STAFF target, including isActive', async () => {
+    it('an ADMIN may patch a VIEWER target, including isActive', async () => {
       const { agent, token } = await login(ADMIN);
       await agent
-        .patch(url(`/system-users/${ids[STAFF]}`))
+        .patch(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .send({ firstName: 'Renamed Staff', isActive: false })
         .expect(200)
@@ -558,7 +558,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       await agent
         .patch(self)
         .set('x-csrf-token', token)
-        .send({ role: SystemRole.STAFF })
+        .send({ role: SystemRole.VIEWER })
         .expect(403);
       await agent
         .patch(self)
@@ -603,7 +603,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       const { agent, token } = await login(SUPER);
       const patch = (body: Record<string, unknown>) =>
         agent
-          .patch(url(`/system-users/${ids[STAFF]}`))
+          .patch(url(`/system-users/${ids[VIEWER]}`))
           .set('x-csrf-token', token)
           .send(body);
 
@@ -626,18 +626,18 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     it('AC-61 — an empty body is a 400 and updatedAt is not bumped', async () => {
       const { agent, token } = await login(SUPER);
       const before = await prisma.systemUser.findUnique({
-        where: { id: ids[STAFF] },
+        where: { id: ids[VIEWER] },
         select: { updatedAt: true },
       });
 
       await agent
-        .patch(url(`/system-users/${ids[STAFF]}`))
+        .patch(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .send({})
         .expect(400);
 
       const after = await prisma.systemUser.findUnique({
-        where: { id: ids[STAFF] },
+        where: { id: ids[VIEWER] },
         select: { updatedAt: true },
       });
       expect(after?.updatedAt.getTime()).toBe(before?.updatedAt.getTime());
@@ -645,7 +645,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
 
     it('AC-62 — an explicit null clears the nullable columns; null on a NOT NULL column is 400', async () => {
       const { agent, token } = await login(SUPER);
-      const target = url(`/system-users/${ids[STAFF]}`);
+      const target = url(`/system-users/${ids[VIEWER]}`);
 
       await agent
         .patch(target)
@@ -678,7 +678,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     it('PATCH requires a CSRF token', async () => {
       const { agent } = await login(SUPER);
       await agent
-        .patch(url(`/system-users/${ids[STAFF]}`))
+        .patch(url(`/system-users/${ids[VIEWER]}`))
         .send({ firstName: 'X' })
         .expect(403);
     });
@@ -686,11 +686,11 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     it('AC-53 — PATCH on a soft-deleted id → 404', async () => {
       const { agent, token } = await login(SUPER);
       await agent
-        .delete(url(`/system-users/${ids[STAFF]}`))
+        .delete(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .expect(204);
       await agent
-        .patch(url(`/system-users/${ids[STAFF]}`))
+        .patch(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .send({ firstName: 'X' })
         .expect(404);
@@ -721,7 +721,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       const countBefore = await physicalRows();
 
       const res = await agent
-        .delete(url(`/system-users/${ids[STAFF]}`))
+        .delete(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .expect(204);
       expect(res.text).toBe('');
@@ -730,7 +730,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       // Soft delete: `SELECT count(*)` is unchanged — the row is still physically present.
       await expect(physicalRows()).resolves.toBe(countBefore);
       const row = await prisma.systemUser.findUnique({
-        where: { id: ids[STAFF] },
+        where: { id: ids[VIEWER] },
         select: { deletedAt: true },
       });
       expect(row?.deletedAt).not.toBeNull();
@@ -739,12 +739,12 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     it('AC-53 — a second DELETE, and a DELETE of an id that never existed, are byte-identical 404s', async () => {
       const { agent, token } = await login(SUPER);
       await agent
-        .delete(url(`/system-users/${ids[STAFF]}`))
+        .delete(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .expect(204);
 
       const second = await agent
-        .delete(url(`/system-users/${ids[STAFF]}`))
+        .delete(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .expect(404);
       const never = await agent
@@ -762,7 +762,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     it('AC-54 — after deletion, re-creating that email is a 409 forever (the burn)', async () => {
       const { agent, token } = await login(SUPER);
       await agent
-        .delete(url(`/system-users/${ids[STAFF]}`))
+        .delete(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .expect(204);
 
@@ -770,7 +770,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         .post(url('/system-users'))
         .set('x-csrf-token', token)
         .send({
-          email: STAFF,
+          email: VIEWER,
           firstName: 'Impostor',
           lastName: 'User',
           ...(await ensureE2eOptions(prisma)),
@@ -786,27 +786,27 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     it('AC-55 — restore returns exactly 200, clears the deletion, and the user reappears in the list', async () => {
       const { agent, token } = await login(SUPER);
       const before = await prisma.systemUser.findUnique({
-        where: { id: ids[STAFF] },
+        where: { id: ids[VIEWER] },
       });
 
       await agent
-        .delete(url(`/system-users/${ids[STAFF]}`))
+        .delete(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .expect(204);
       const res = await agent
-        .post(url(`/system-users/${ids[STAFF]}/restore`))
+        .post(url(`/system-users/${ids[VIEWER]}/restore`))
         .set('x-csrf-token', token)
         .expect(200);
 
       expect(res.body).toMatchObject({
-        id: ids[STAFF],
-        email: STAFF,
-        role: SystemRole.STAFF,
+        id: ids[VIEWER],
+        email: VIEWER,
+        role: SystemRole.VIEWER,
       });
       expect(JSON.stringify(res.body)).not.toContain('deletedAt');
 
       const after = await prisma.systemUser.findUnique({
-        where: { id: ids[STAFF] },
+        where: { id: ids[VIEWER] },
       });
       expect(after?.deletedAt).toBeNull();
       expect(after?.createdAt.getTime()).toBe(before?.createdAt.getTime());
@@ -818,23 +818,23 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         .body as {
         data: Array<{ email: string }>;
       };
-      expect(list.data.map((u) => u.email)).toContain(STAFF);
+      expect(list.data.map((u) => u.email)).toContain(VIEWER);
     });
 
     it('AC-55 — a user suspended before deletion comes back suspended (the flags are orthogonal)', async () => {
       const { agent, token } = await login(SUPER);
       await agent
-        .patch(url(`/system-users/${ids[STAFF]}`))
+        .patch(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .send({ isActive: false })
         .expect(200);
       await agent
-        .delete(url(`/system-users/${ids[STAFF]}`))
+        .delete(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .expect(204);
 
       const res = await agent
-        .post(url(`/system-users/${ids[STAFF]}/restore`))
+        .post(url(`/system-users/${ids[VIEWER]}/restore`))
         .set('x-csrf-token', token)
         .expect(200);
       expect(res.body).toMatchObject({ isActive: false });
@@ -843,7 +843,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     it('AC-56 — restore on a live row → 409; on an unknown id → 404; as an ADMIN → 403', async () => {
       const sa = await login(SUPER);
       const live = await sa.agent
-        .post(url(`/system-users/${ids[STAFF]}/restore`))
+        .post(url(`/system-users/${ids[VIEWER]}/restore`))
         .set('x-csrf-token', sa.token)
         .expect(409);
       expect((live.body as { message: string }).message).toBe(
@@ -857,7 +857,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
 
       const ad = await login(ADMIN);
       await ad.agent
-        .post(url(`/system-users/${ids[STAFF]}/restore`))
+        .post(url(`/system-users/${ids[VIEWER]}/restore`))
         .set('x-csrf-token', ad.token)
         .expect(403);
     });
@@ -875,12 +875,12 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
 
   describe('session invalidation', () => {
     it('AC-58 — a user soft-deleted mid-session is rejected with 401 on their very next request', async () => {
-      const victim = await login(STAFF);
+      const victim = await login(VIEWER);
       await victim.agent.get(url('/auth/system/me')).expect(200);
 
       const sa = await login(SUPER);
       await sa.agent
-        .delete(url(`/system-users/${ids[STAFF]}`))
+        .delete(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', sa.token)
         .expect(204);
 
@@ -888,10 +888,10 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
     });
 
     it('AC-27 — a user deactivated mid-session is rejected on their next request, not at expiry', async () => {
-      const victim = await login(STAFF);
+      const victim = await login(VIEWER);
       const sa = await login(SUPER);
       await sa.agent
-        .patch(url(`/system-users/${ids[STAFF]}`))
+        .patch(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', sa.token)
         .send({ isActive: false })
         .expect(200);
@@ -907,7 +907,7 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       await sa.agent
         .patch(url(`/system-users/${ids[SUPER_2]}`))
         .set('x-csrf-token', sa.token)
-        .send({ role: SystemRole.STAFF })
+        .send({ role: SystemRole.VIEWER })
         .expect(200);
 
       await victim.agent.get(url('/system-users')).expect(403);

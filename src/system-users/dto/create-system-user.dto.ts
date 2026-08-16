@@ -52,7 +52,7 @@ export class CreateSystemUserDto {
   @MaxLength(120)
   lastName!: string;
 
-  @ApiPropertyOptional({ enum: SystemRole, default: SystemRole.STAFF })
+  @ApiPropertyOptional({ enum: SystemRole, default: SystemRole.VIEWER })
   @IsOptional()
   @IsEnum(SystemRole)
   role?: SystemRole;

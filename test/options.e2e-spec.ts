@@ -26,7 +26,7 @@ const PASSWORD = 'e2e-correct-horse-battery';
 
 const SUPER = `${SU_PREFIX}super@easybook.local`;
 const ADMIN = `${SU_PREFIX}admin@easybook.local`;
-const STAFF = `${SU_PREFIX}staff@easybook.local`;
+const VIEWER = `${SU_PREFIX}staff@easybook.local`;
 
 const url = (path: string) => `${API_BASE_PATH}${path}`;
 
@@ -87,7 +87,7 @@ describe('Registration options admin CRUD (e2e)', () => {
     for (const [email, role] of [
       [SUPER, SystemRole.SUPER_ADMIN],
       [ADMIN, SystemRole.ADMIN],
-      [STAFF, SystemRole.STAFF],
+      [VIEWER, SystemRole.VIEWER],
     ] as Array<[string, SystemRole]>) {
       await prisma.systemUser.create({
         data: { email, firstName: 'E2E', lastName: role, role, ...base },
@@ -131,8 +131,8 @@ describe('Registration options admin CRUD (e2e)', () => {
         .expect(401);
     });
 
-    it('SC-B3/B4 — STAFF is 403 on read and write (SUPER_ADMIN/ADMIN only)', async () => {
-      const { agent, token } = await login(STAFF);
+    it('SC-B3/B4 — VIEWER is 403 on read and write (SUPER_ADMIN/ADMIN only)', async () => {
+      const { agent, token } = await login(VIEWER);
       await agent.get(url(base)).expect(403);
       await agent
         .post(url(base))
@@ -329,14 +329,14 @@ describe('Registration options admin CRUD (e2e)', () => {
       .expect(201);
     expect((created.body as OptionBody).name).toBe(`${OPT_PREFIX}ADMIN`);
 
-    // It lands in personnel_roles, NOT in the SystemUser/role space — the STAFF whose role would
+    // It lands in personnel_roles, NOT in the SystemUser/role space — the VIEWER whose role would
     // "match" still cannot touch the options surface (RBAC is unaffected by option data).
     const roleRow = await prisma.personnelRole.findFirst({
       where: { name: `${OPT_PREFIX}ADMIN` },
       select: { id: true },
     });
     expect(roleRow).not.toBeNull();
-    const staffSession = await login(STAFF);
+    const staffSession = await login(VIEWER);
     await staffSession.agent.get(url('/personnel-roles')).expect(403);
 
     // The same name may exist independently as a Department — separate tables, no collision.
@@ -353,7 +353,7 @@ describe('Registration options admin CRUD (e2e)', () => {
   // are now adjacent fields on one model, so `if (user.personnelRole.name === 'ADMIN')` is typeable.
   // This is the load-bearing guard for D-2 — it must fail the build the day someone writes that.
 
-  it('AC-X3 — a STAFF user ASSIGNED a PersonnelRole named "ADMIN" still has ZERO privilege', async () => {
+  it('AC-X3 — a VIEWER user ASSIGNED a PersonnelRole named "ADMIN" still has ZERO privilege', async () => {
     const roleName = `${OPT_PREFIX}ADMIN`;
     const deptName = `${OPT_PREFIX}SUPER_ADMIN`;
 
@@ -367,7 +367,7 @@ describe('Registration options admin CRUD (e2e)', () => {
       select: { id: true },
     });
 
-    // A STAFF user wearing both inert labels.
+    // A VIEWER user wearing both inert labels.
     const email = `${SU_PREFIX}impostor@easybook.local`;
     const impostor = await prisma.systemUser.create({
       data: {
@@ -375,7 +375,7 @@ describe('Registration options admin CRUD (e2e)', () => {
         passwordHash: await new PasswordService().hash(PASSWORD),
         firstName: 'E2E',
         lastName: 'Impostor',
-        role: SystemRole.STAFF, // the ONLY thing that grants privilege
+        role: SystemRole.VIEWER, // the ONLY thing that grants privilege
         departmentId: department.id,
         personnelRoleId: personnelRole.id,
       },
@@ -383,13 +383,13 @@ describe('Registration options admin CRUD (e2e)', () => {
     });
 
     const other = await prisma.systemUser.findFirstOrThrow({
-      where: { email: STAFF },
+      where: { email: VIEWER },
       select: { id: true },
     });
 
     const { agent, token } = await login(email);
 
-    // The job title changed NOTHING: STAFF is denied the whole admin surface.
+    // The job title changed NOTHING: VIEWER is denied the whole admin surface.
     await agent.get(url('/system-users')).expect(403);
     await agent
       .patch(url(`/system-users/${other.id}`))
@@ -408,7 +408,7 @@ describe('Registration options admin CRUD (e2e)', () => {
       department: { name: string };
     };
     expect(body.id).toBe(impostor.id);
-    expect(body.role).toBe('STAFF');
+    expect(body.role).toBe('VIEWER');
     expect(body.personnelRole.name).toBe(roleName);
     expect(body.department.name).toBe(deptName);
     // Same body, two "ADMIN"s, zero privilege.

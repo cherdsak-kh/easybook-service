@@ -322,7 +322,7 @@ describe('RealtimeGateway', () => {
     ['the user was hard-deleted / vanished', null],
     ['soft-deleted', { ...liveRow, deletedAt: new Date() }],
     ['suspended', { ...liveRow, isActive: false }],
-    ['demoted to STAFF', { ...liveRow, role: SystemRole.STAFF }],
+    ['demoted to VIEWER', { ...liveRow, role: SystemRole.VIEWER }],
     [
       'forced to change their password',
       { ...liveRow, mustChangePassword: true },

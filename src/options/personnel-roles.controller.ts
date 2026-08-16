@@ -50,10 +50,10 @@ const actorOf = (user: AuthenticatedSystemUser): Actor => ({
  * Admin CRUD for the `PersonnelRole` registration options. Route prefix: `/api/v1/personnel-roles`.
  *
  * `PersonnelRole` is the LINE end-user's self-declared role (Teacher, Support Staff, …) — admin-
- * curated DATA. It is NOT `SystemRole` (SUPER_ADMIN/ADMIN/STAFF), the back-office RBAC enum: they
+ * curated DATA. It is NOT `SystemRole` (SUPER_ADMIN/ADMIN/VIEWER), the back-office RBAC enum: they
  * share no table, enum, or endpoint. Creating a PersonnelRole named e.g. "ADMIN" grants no privilege.
  *
- * Session-guarded (`SUPER_ADMIN`/`ADMIN`; `STAFF` denied), keyed on the auto-increment integer
+ * Session-guarded (`SUPER_ADMIN`/`ADMIN`; `VIEWER` denied), keyed on the auto-increment integer
  * `PersonnelRole.id`. Mutations require `x-csrf-token`. `DELETE` is a soft delete. `:id` is parsed
  * with `ParseIntPipe`, so a non-numeric id is a `400` before the service is reached.
  */
@@ -80,7 +80,7 @@ export class PersonnelRolesController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF has no access.',
+    description: 'VIEWER has no access.',
     type: ErrorResponseDto,
   })
   @ApiServiceUnavailableResponse({
@@ -112,7 +112,7 @@ export class PersonnelRolesController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF, or CSRF failure.',
+    description: 'VIEWER, or CSRF failure.',
     type: ErrorResponseDto,
   })
   @ApiConflictResponse({
@@ -143,7 +143,7 @@ export class PersonnelRolesController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF, or CSRF failure.',
+    description: 'VIEWER, or CSRF failure.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
@@ -180,7 +180,7 @@ export class PersonnelRolesController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF, or CSRF failure.',
+    description: 'VIEWER, or CSRF failure.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({

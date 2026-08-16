@@ -288,7 +288,7 @@ describe('SystemUsersService', () => {
   // ───────────────────────── reset-password ─────────────────────────
 
   describe('resetPassword', () => {
-    const target = { id: 'sa-2', role: SystemRole.STAFF };
+    const target = { id: 'sa-2', role: SystemRole.VIEWER };
 
     it('AC-B7 — issues a new temp password, sets mustChangePassword, returns the plaintext once', async () => {
       runInteractiveTx();
@@ -423,7 +423,7 @@ describe('SystemUsersService', () => {
   describe('update', () => {
     beforeEach(() => {
       runInteractiveTx();
-      txFindFirst.mockResolvedValue({ id: 'staff-1', role: SystemRole.STAFF });
+      txFindFirst.mockResolvedValue({ id: 'staff-1', role: SystemRole.VIEWER });
       txUpdate.mockResolvedValue(row);
       txCount.mockResolvedValue(1);
     });
@@ -443,8 +443,8 @@ describe('SystemUsersService', () => {
 
     // ────── system-reserved options: W4, the attack path this feature closes (AC-B6) ──────
 
-    it('AC-B6 — an ADMIN patching a STAFF may NOT assign a reserved option: 400, never 403', async () => {
-      // Without this guard an ADMIN could assign the System Developer department to a STAFF they
+    it('AC-B6 — an ADMIN patching a VIEWER may NOT assign a reserved option: 400, never 403', async () => {
+      // Without this guard an ADMIN could assign the System Developer department to a VIEWER they
       // already control. The reserved row is filtered out of the lookup, so it misses and 400s
       // EXACTLY as an unknown id would — byte-identical body, no existence oracle.
       txDepartmentFindFirst.mockResolvedValue(null);
@@ -526,7 +526,7 @@ describe('SystemUsersService', () => {
     //
     // Before the canPatch amendment the 403 fired first, so this whole path was unreachable for an
     // ADMIN on their own row. It is reachable for the first time, and the existence-oracle rule
-    // must hold on it exactly as it does on a STAFF target.
+    // must hold on it exactly as it does on a VIEWER target.
 
     describe('an ADMIN patching their OWN row (SELF-PROFILE-2)', () => {
       beforeEach(() => {
@@ -667,7 +667,7 @@ describe('SystemUsersService', () => {
     });
 
     it.each([
-      ['role', { role: SystemRole.STAFF }],
+      ['role', { role: SystemRole.VIEWER }],
       ['isActive', { isActive: false }],
     ])(
       'runs a patch containing `%s` at Serializable and checks the invariant',
@@ -705,7 +705,7 @@ describe('SystemUsersService', () => {
 
     // AC-50 — unreachable end to end by design (§6.4), so it is proven here.
     it.each([
-      ['demoting', { role: SystemRole.STAFF }],
+      ['demoting', { role: SystemRole.VIEWER }],
       ['deactivating', { isActive: false }],
     ])(
       '%s the last active SUPER_ADMIN is a 409 and rolls back (AC-50)',
@@ -773,7 +773,7 @@ describe('SystemUsersService', () => {
   describe('softDelete', () => {
     beforeEach(() => {
       runInteractiveTx();
-      txFindFirst.mockResolvedValue({ id: 'staff-1', role: SystemRole.STAFF });
+      txFindFirst.mockResolvedValue({ id: 'staff-1', role: SystemRole.VIEWER });
       txUpdate.mockResolvedValue({ id: 'staff-1' });
       txCount.mockResolvedValue(1);
     });

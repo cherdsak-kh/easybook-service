@@ -26,7 +26,7 @@ const PASSWORD = 'e2e-correct-horse-battery';
 
 const SUPER = `${SU_PREFIX}super@easybook.local`;
 const ADMIN = `${SU_PREFIX}admin@easybook.local`;
-const STAFF = `${SU_PREFIX}staff@easybook.local`;
+const VIEWER = `${SU_PREFIX}staff@easybook.local`;
 
 const url = (path: string) => `${API_BASE_PATH}${path}`;
 
@@ -176,7 +176,7 @@ describe('LINE Users management (e2e)', () => {
     for (const [email, role] of [
       [SUPER, SystemRole.SUPER_ADMIN],
       [ADMIN, SystemRole.ADMIN],
-      [STAFF, SystemRole.STAFF],
+      [VIEWER, SystemRole.VIEWER],
     ] as Array<[string, SystemRole]>) {
       await prisma.systemUser.create({
         data: { email, firstName: 'E2E', lastName: role, role, ...base },
@@ -256,8 +256,8 @@ describe('LINE Users management (e2e)', () => {
       .expect(401);
   });
 
-  it('AC-B7 — STAFF gets 403 on both routes (not 401)', async () => {
-    const { agent, token } = await login(STAFF);
+  it('AC-B7 — VIEWER gets 403 on both routes (not 401)', async () => {
+    const { agent, token } = await login(VIEWER);
     await agent.get(url('/line-users')).expect(403);
     await agent
       .patch(url(`/line-users/${luIds[`${LU_PREFIX}pending`]}`))
@@ -855,8 +855,8 @@ describe('LINE Users management (e2e)', () => {
       expect((await regRowOf('allowed'))?.firstName).toBe('Bob');
     });
 
-    it('AC-B2 — STAFF is 403 and no session is 401', async () => {
-      const staff = await login(STAFF);
+    it('AC-B2 — VIEWER is 403 and no session is 401', async () => {
+      const staff = await login(VIEWER);
       await staff.agent
         .patch(regUrl('allowed'))
         .set('x-csrf-token', staff.token)

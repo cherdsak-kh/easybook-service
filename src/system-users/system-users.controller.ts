@@ -50,8 +50,8 @@ const actorOf = (user: AuthenticatedSystemUser): Actor => ({
  * Back-office user management. Route prefix: `/api/v1/system-users`.
  *
  * `@Roles(...)` is the **coarse** gate. Target-dependent authorization ("an ADMIN may only patch
- * a STAFF", the three self-mutation rules) lives in `system-users.policy.ts` and runs inside the
- * service's write transaction. Guards run before pipes, so a STAFF caller sending a malformed body
+ * a VIEWER", the three self-mutation rules) lives in `system-users.policy.ts` and runs inside the
+ * service's write transaction. Guards run before pipes, so a VIEWER caller sending a malformed body
  * gets `403`, not `400` — that ordering is correct: authorization must never be decided after a
  * validation error has already told the caller something about the schema.
  *
@@ -123,7 +123,7 @@ export class SystemUsersController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF has no access to this collection.',
+    description: 'VIEWER has no access to this collection.',
     type: ErrorResponseDto,
   })
   @ApiServiceUnavailableResponse({
@@ -149,7 +149,7 @@ export class SystemUsersController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF has no access to this collection.',
+    description: 'VIEWER has no access to this collection.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
@@ -179,7 +179,7 @@ export class SystemUsersController {
   })
   @ApiForbiddenResponse({
     description:
-      'STAFF; CSRF failure; a self-mutation rule; or a policy denial.',
+      'VIEWER; CSRF failure; a self-mutation rule; or a policy denial.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({

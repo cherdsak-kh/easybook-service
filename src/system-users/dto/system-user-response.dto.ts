@@ -28,7 +28,7 @@ export class SystemUserResponseDto {
 
   @ApiProperty({
     enum: SystemRole,
-    example: SystemRole.STAFF,
+    example: SystemRole.VIEWER,
     description:
       'Back-office RBAC. The ONLY field that grants privilege — never `personnelRole`.',
   })

@@ -1,6 +1,6 @@
 import { SystemRole } from '@prisma/client';
 import {
-  ADMIN_MAY_ONLY_MODIFY_STAFF,
+  ADMIN_MAY_ONLY_MODIFY_VIEWER,
   Actor,
   CANNOT_CHANGE_OWN_ACTIVE_STATUS,
   CANNOT_CHANGE_OWN_ROLE,
@@ -18,7 +18,7 @@ import {
 const ROLES = [
   SystemRole.SUPER_ADMIN,
   SystemRole.ADMIN,
-  SystemRole.STAFF,
+  SystemRole.VIEWER,
 ] as const;
 
 const actor = (role: SystemRole, id = 'actor'): Actor => ({ id, role });
@@ -30,13 +30,13 @@ const PROFILE_ONLY: Patch = {};
 const PATCH_PROFILE_MATRIX: Array<[SystemRole, SystemRole, boolean]> = [
   [SystemRole.SUPER_ADMIN, SystemRole.SUPER_ADMIN, true],
   [SystemRole.SUPER_ADMIN, SystemRole.ADMIN, true],
-  [SystemRole.SUPER_ADMIN, SystemRole.STAFF, true],
+  [SystemRole.SUPER_ADMIN, SystemRole.VIEWER, true],
   [SystemRole.ADMIN, SystemRole.SUPER_ADMIN, false],
   [SystemRole.ADMIN, SystemRole.ADMIN, false],
-  [SystemRole.ADMIN, SystemRole.STAFF, true],
-  [SystemRole.STAFF, SystemRole.SUPER_ADMIN, false],
-  [SystemRole.STAFF, SystemRole.ADMIN, false],
-  [SystemRole.STAFF, SystemRole.STAFF, false],
+  [SystemRole.ADMIN, SystemRole.VIEWER, true],
+  [SystemRole.VIEWER, SystemRole.SUPER_ADMIN, false],
+  [SystemRole.VIEWER, SystemRole.ADMIN, false],
+  [SystemRole.VIEWER, SystemRole.VIEWER, false],
 ];
 
 describe('system-users.policy', () => {
@@ -50,22 +50,22 @@ describe('system-users.policy', () => {
       },
     );
 
-    it('an ADMIN patching a non-STAFF target is denied with the ADMIN-scope reason (AC-43)', () => {
+    it('an ADMIN patching a non-VIEWER target is denied with the ADMIN-scope reason (AC-43)', () => {
       for (const targetRole of [SystemRole.SUPER_ADMIN, SystemRole.ADMIN]) {
         expect(
           canPatch(actor(SystemRole.ADMIN), target(targetRole), PROFILE_ONLY),
         ).toEqual({
           allowed: false,
-          reason: ADMIN_MAY_ONLY_MODIFY_STAFF,
+          reason: ADMIN_MAY_ONLY_MODIFY_VIEWER,
         });
       }
     });
 
-    it('STAFF is denied even though RolesGuard already rejected them (defence in depth)', () => {
+    it('VIEWER is denied even though RolesGuard already rejected them (defence in depth)', () => {
       expect(
         canPatch(
-          actor(SystemRole.STAFF),
-          target(SystemRole.STAFF),
+          actor(SystemRole.VIEWER),
+          target(SystemRole.VIEWER),
           PROFILE_ONLY,
         ),
       ).toEqual({
@@ -77,7 +77,7 @@ describe('system-users.policy', () => {
 
   describe('canPatch — `role` is SUPER_ADMIN-write-only, denied on KEY PRESENCE (§6.2, AC-44)', () => {
     // Every valid enum value, every target role — including the "harmless no-op".
-    const nonSuperAdmins = [SystemRole.ADMIN, SystemRole.STAFF] as const;
+    const nonSuperAdmins = [SystemRole.ADMIN, SystemRole.VIEWER] as const;
 
     for (const actorRole of nonSuperAdmins) {
       for (const targetRole of ROLES) {
@@ -94,10 +94,10 @@ describe('system-users.policy', () => {
       }
     }
 
-    it('specifically: an ADMIN sending a no-op role="STAFF" to a STAFF target → 403 (AC-44)', () => {
+    it('specifically: an ADMIN sending a no-op role="VIEWER" to a VIEWER target → 403 (AC-44)', () => {
       expect(
-        canPatch(actor(SystemRole.ADMIN), target(SystemRole.STAFF), {
-          role: SystemRole.STAFF,
+        canPatch(actor(SystemRole.ADMIN), target(SystemRole.VIEWER), {
+          role: SystemRole.VIEWER,
         }).allowed,
       ).toBe(false);
     });
@@ -106,7 +106,7 @@ describe('system-users.policy', () => {
       'a SUPER_ADMIN may set role="%s" on another user',
       (value) => {
         expect(
-          canPatch(actor(SystemRole.SUPER_ADMIN), target(SystemRole.STAFF), {
+          canPatch(actor(SystemRole.SUPER_ADMIN), target(SystemRole.VIEWER), {
             role: value,
           }),
         ).toEqual({ allowed: true });
@@ -115,7 +115,7 @@ describe('system-users.policy', () => {
 
     it('an absent `role` key is not a role write (undefined ≠ present)', () => {
       expect(
-        canPatch(actor(SystemRole.ADMIN), target(SystemRole.STAFF), {
+        canPatch(actor(SystemRole.ADMIN), target(SystemRole.VIEWER), {
           role: undefined,
         }).allowed,
       ).toBe(true);
@@ -123,9 +123,9 @@ describe('system-users.policy', () => {
   });
 
   describe('canPatch — `isActive`', () => {
-    it('an ADMIN may toggle isActive on a STAFF target', () => {
+    it('an ADMIN may toggle isActive on a VIEWER target', () => {
       expect(
-        canPatch(actor(SystemRole.ADMIN), target(SystemRole.STAFF), {
+        canPatch(actor(SystemRole.ADMIN), target(SystemRole.VIEWER), {
           isActive: false,
         }).allowed,
       ).toBe(true);
@@ -201,7 +201,7 @@ describe('system-users.policy', () => {
           actor(SystemRole.SUPER_ADMIN, SELF),
           target(SystemRole.SUPER_ADMIN, SELF),
           {
-            role: SystemRole.STAFF,
+            role: SystemRole.VIEWER,
             isActive: false,
           },
         ),
@@ -219,7 +219,7 @@ describe('system-users.policy', () => {
     });
 
     // INVERTED on 2026-07-26 (SELF-PROFILE-2, 02_design_log.md §1.8). This test previously asserted
-    // `{ allowed: false, reason: ADMIN_MAY_ONLY_MODIFY_STAFF }` under the name "an ADMIN may NOT
+    // `{ allowed: false, reason: ADMIN_MAY_ONLY_MODIFY_VIEWER }` under the name "an ADMIN may NOT
     // patch their own profile — their target is an ADMIN (SELF-PROFILE-1)". That 403 was collateral:
     // the ADMIN rule exists to stop ADMIN -> ADMIN LATERAL edits, and catching the actor's own row
     // was never its purpose. The PO approved the exception, which also removes an asymmetry with
@@ -290,7 +290,7 @@ describe('system-users.policy', () => {
           target(SystemRole.ADMIN, 'b'),
           PROFILE_ONLY,
         ),
-      ).toEqual({ allowed: false, reason: ADMIN_MAY_ONLY_MODIFY_STAFF });
+      ).toEqual({ allowed: false, reason: ADMIN_MAY_ONLY_MODIFY_VIEWER });
     });
 
     it('T5 — an ADMIN may NOT patch a SUPER_ADMIN, self-exception or not', () => {
@@ -300,15 +300,15 @@ describe('system-users.policy', () => {
           target(SystemRole.SUPER_ADMIN, 'b'),
           PROFILE_ONLY,
         ),
-      ).toEqual({ allowed: false, reason: ADMIN_MAY_ONLY_MODIFY_STAFF });
+      ).toEqual({ allowed: false, reason: ADMIN_MAY_ONLY_MODIFY_VIEWER });
     });
 
-    it('T6 — regression: an ADMIN may still patch a STAFF target, isActive included', () => {
+    it('T6 — regression: an ADMIN may still patch a VIEWER target, isActive included', () => {
       for (const patch of [PROFILE_ONLY, { isActive: false }]) {
         expect(
           canPatch(
             actor(SystemRole.ADMIN, 'a'),
-            target(SystemRole.STAFF, 'b'),
+            target(SystemRole.VIEWER, 'b'),
             patch,
           ),
         ).toEqual({ allowed: true });
@@ -325,15 +325,15 @@ describe('system-users.policy', () => {
       ).toEqual({ allowed: true });
     });
 
-    it('T8 — a STAFF actor on their OWN id is still INSUFFICIENT_ROLE (the default: arm keeps its net)', () => {
+    it('T8 — a VIEWER actor on their OWN id is still INSUFFICIENT_ROLE (the default: arm keeps its net)', () => {
       // The whole reason the exception is scoped INSIDE `case ADMIN` rather than hoisted above the
-      // switch. If it were hoisted, a future @Roles(...) widening to STAFF would silently grant
-      // STAFF self-assignment of departmentId/personnelRoleId, and the defence-in-depth arm that
+      // switch. If it were hoisted, a future @Roles(...) widening to VIEWER would silently grant
+      // VIEWER self-assignment of departmentId/personnelRoleId, and the defence-in-depth arm that
       // exists to catch that widening would never run.
       expect(
         canPatch(
-          actor(SystemRole.STAFF, SELF),
-          target(SystemRole.STAFF, SELF),
+          actor(SystemRole.VIEWER, SELF),
+          target(SystemRole.VIEWER, SELF),
           PROFILE_ONLY,
         ),
       ).toEqual({ allowed: false, reason: INSUFFICIENT_ROLE });
@@ -345,7 +345,7 @@ describe('system-users.policy', () => {
           actor(SystemRole.SUPER_ADMIN, 'a'),
           target(SystemRole.SUPER_ADMIN, 'b'),
           {
-            role: SystemRole.STAFF,
+            role: SystemRole.VIEWER,
           },
         ),
       ).toEqual({ allowed: true });
@@ -360,11 +360,11 @@ describe('system-users.policy', () => {
       });
     });
 
-    it('the self rule fires before the role check — a STAFF self-delete is the self reason', () => {
+    it('the self rule fires before the role check — a VIEWER self-delete is the self reason', () => {
       expect(
         canDelete(
-          actor(SystemRole.STAFF, 'self'),
-          target(SystemRole.STAFF, 'self'),
+          actor(SystemRole.VIEWER, 'self'),
+          target(SystemRole.VIEWER, 'self'),
         ).allowed,
       ).toBe(false);
     });
@@ -377,10 +377,10 @@ describe('system-users.policy', () => {
       });
     });
 
-    it.each([SystemRole.ADMIN, SystemRole.STAFF])(
+    it.each([SystemRole.ADMIN, SystemRole.VIEWER])(
       '%s may not delete anyone (unreachable — @Roles(SUPER_ADMIN) fires first)',
       (actorRole) => {
-        expect(canDelete(actor(actorRole), target(SystemRole.STAFF))).toEqual({
+        expect(canDelete(actor(actorRole), target(SystemRole.VIEWER))).toEqual({
           allowed: false,
           reason: ONLY_SUPER_ADMIN_MAY_DELETE,
         });
@@ -397,7 +397,7 @@ describe('system-users.policy', () => {
       );
     });
 
-    it.each([SystemRole.ADMIN, SystemRole.STAFF])(
+    it.each([SystemRole.ADMIN, SystemRole.VIEWER])(
       'AC-B13 — %s may not',
       (actorRole) => {
         expect(mayUseSystemReservedOptions(actor(actorRole))).toBe(false);

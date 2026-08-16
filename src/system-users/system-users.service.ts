@@ -291,7 +291,7 @@ export class SystemUsersService {
    * Target load, policy, write and invariant, all inside ONE transaction (DD-8) — so the
    * authorization decision and the write see the same snapshot. A guard that fetched the target
    * would read it outside the write's transaction, leaving a window in which a concurrent
-   * `STAFF → ADMIN` promotion lets an `ADMIN` patch an `ADMIN`.
+   * `VIEWER → ADMIN` promotion lets an `ADMIN` patch an `ADMIN`.
    */
   async update(
     actor: Actor,
@@ -302,7 +302,7 @@ export class SystemUsersService {
     // SUPER_ADMIN count, so a profile-only patch needs neither the invariant nor Serializable.
     // Running every update at Serializable would be actively harmful: the invariant's `count()`
     // predicate seq-scans `system_users`, so Postgres SSI escalates to a page/relation predicate
-    // lock, and two operators editing two unrelated STAFF profiles would 409 each other.
+    // lock, and two operators editing two unrelated VIEWER profiles would 409 each other.
     const touchesInvariant =
       patch.role !== undefined || patch.isActive !== undefined;
 

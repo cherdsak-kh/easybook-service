@@ -53,7 +53,7 @@ const actorOf = (user: AuthenticatedSystemUser): Actor => ({
 /**
  * Admin CRUD for the `Department` registration options. Route prefix: `/api/v1/departments`.
  *
- * Session-guarded (`SUPER_ADMIN`/`ADMIN`; `STAFF` denied), keyed on the auto-increment integer
+ * Session-guarded (`SUPER_ADMIN`/`ADMIN`; `VIEWER` denied), keyed on the auto-increment integer
  * `Department.id`. Same guard stack as `/system-users` — NOT the LINE ID-token guard. Mutations
  * require `x-csrf-token` (enforced by the global CSRF middleware; documented per-route with
  * `@ApiHeader`). `DELETE` is a soft delete. `:id` is parsed with `ParseIntPipe`, so a non-numeric id
@@ -79,7 +79,7 @@ export class DepartmentsController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF has no access.',
+    description: 'VIEWER has no access.',
     type: ErrorResponseDto,
   })
   @ApiServiceUnavailableResponse({
@@ -108,7 +108,7 @@ export class DepartmentsController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF, or CSRF failure.',
+    description: 'VIEWER, or CSRF failure.',
     type: ErrorResponseDto,
   })
   @ApiConflictResponse({
@@ -137,7 +137,7 @@ export class DepartmentsController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF, or CSRF failure.',
+    description: 'VIEWER, or CSRF failure.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
@@ -175,7 +175,7 @@ export class DepartmentsController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF, or CSRF failure.',
+    description: 'VIEWER, or CSRF failure.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({

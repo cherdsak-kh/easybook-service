@@ -276,9 +276,9 @@ describe('scripts/create-super-admin', () => {
       ).rejects.toThrow(NOT_A_SUPER_ADMIN_MESSAGE);
     });
 
-    it('AC-B18 — refuses an existing STAFF too', async () => {
+    it('AC-B18 — refuses an existing VIEWER too', async () => {
       prisma.systemUser.findUnique.mockResolvedValue({
-        role: SystemRole.STAFF,
+        role: SystemRole.VIEWER,
       });
       await expect(
         assertTargetIsSuperAdminOrAbsent(asClient(prisma), 'x@y.local'),

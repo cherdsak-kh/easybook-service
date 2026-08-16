@@ -25,7 +25,7 @@ jest.setTimeout(120_000);
 const PREFIX = 'e2e-auth-';
 const PASSWORD = 'e2e-correct-horse-battery';
 const SUPER = `${PREFIX}super@easybook.local`;
-const STAFF = `${PREFIX}staff@easybook.local`;
+const VIEWER = `${PREFIX}staff@easybook.local`;
 const SUSPENDED = `${PREFIX}suspended@easybook.local`;
 const DELETED = `${PREFIX}deleted@easybook.local`;
 
@@ -73,17 +73,17 @@ describe('Auth — /auth/system (e2e)', () => {
           ...base,
         },
         {
-          email: STAFF,
+          email: VIEWER,
           firstName: 'E2E',
           lastName: 'Staff',
-          role: SystemRole.STAFF,
+          role: SystemRole.VIEWER,
           ...base,
         },
         {
           email: SUSPENDED,
           firstName: 'E2E',
           lastName: 'Suspended',
-          role: SystemRole.STAFF,
+          role: SystemRole.VIEWER,
           isActive: false,
           ...base,
         },
@@ -91,7 +91,7 @@ describe('Auth — /auth/system (e2e)', () => {
           email: DELETED,
           firstName: 'E2E',
           lastName: 'Deleted',
-          role: SystemRole.STAFF,
+          role: SystemRole.VIEWER,
           deletedAt: new Date(),
           ...base,
         },
@@ -370,7 +370,7 @@ describe('Auth — /auth/system (e2e)', () => {
       expect(Object.keys(res.body as object).sort()).toEqual(
         [
           'createdAt',
-          // Audit provenance — a nested { id, firstName, lastName } or null. Present for STAFF too:
+          // Audit provenance — a nested { id, firstName, lastName } or null. Present for VIEWER too:
           // the Profile page hides the Audit Trail card from them, but the BODY is the contract and
           // is uniform across roles. Making the select role-conditional would put a role branch
           // into SessionGuard's select, which is a far worse trade.
@@ -470,8 +470,8 @@ describe('Auth — /auth/system (e2e)', () => {
       await agent.post(url('/auth/system/logout')).expect(403);
     });
 
-    it('AC-25 — STAFF calling POST /system-users → 403; no session → 401', async () => {
-      const { agent, token } = await loggedInAgent(STAFF);
+    it('AC-25 — VIEWER calling POST /system-users → 403; no session → 401', async () => {
+      const { agent, token } = await loggedInAgent(VIEWER);
 
       await agent
         .post(url('/system-users'))

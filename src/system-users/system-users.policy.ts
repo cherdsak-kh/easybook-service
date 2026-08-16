@@ -38,8 +38,8 @@ export const CANNOT_CHANGE_OWN_ACTIVE_STATUS =
 export const CANNOT_DELETE_OWN_ACCOUNT = 'You cannot delete your own account.';
 export const ONLY_SUPER_ADMIN_MAY_CHANGE_ROLE =
   'Only a SUPER_ADMIN may change a role.';
-export const ADMIN_MAY_ONLY_MODIFY_STAFF =
-  'An ADMIN may only modify STAFF users.';
+export const ADMIN_MAY_ONLY_MODIFY_VIEWER =
+  'An ADMIN may only modify VIEWER users.';
 export const ONLY_SUPER_ADMIN_MAY_DELETE =
   'Only a SUPER_ADMIN may delete a user.';
 export const INSUFFICIENT_ROLE = 'Insufficient role.';
@@ -87,7 +87,7 @@ export function canPatch(
 
   // ── Step 6: the matrix. `role` is SUPER_ADMIN-write-only, rejected on KEY PRESENCE. ──
   // `patch.role !== undefined` is an exact presence test because `{"role": null}` already 400'd
-  // at the pipe (DD-11). There is no harmless no-op probe: `role: "STAFF"` on a STAFF target,
+  // at the pipe (DD-11). There is no harmless no-op probe: `role: "VIEWER"` on a VIEWER target,
   // sent by an ADMIN, is denied here before the target's role is even consulted (AC-44).
   if (patch.role !== undefined && actor.role !== SystemRole.SUPER_ADMIN) {
     return deny(ONLY_SUPER_ADMIN_MAY_CHANGE_ROLE);
@@ -97,8 +97,8 @@ export function canPatch(
     case SystemRole.SUPER_ADMIN:
       return allow();
     case SystemRole.ADMIN:
-      // An ADMIN may address a STAFF target — which already implies "may write isActive on a
-      // STAFF target only", so a second explicit check would be the duplicated authz that
+      // An ADMIN may address a VIEWER target — which already implies "may write isActive on a
+      // VIEWER target only", so a second explicit check would be the duplicated authz that
       // drifts — OR their OWN row (SELF-PROFILE-2, PO-approved; it removes an asymmetry with
       // `case SUPER_ADMIN`, which has always permitted a self-patch).
       //
@@ -108,7 +108,7 @@ export function canPatch(
       //     (or a SUPER_ADMIN) is still denied — there is no ADMIN -> ADMIN lateral widening.
       //  2. It stays scoped INSIDE this case. Hoisting `if (actor.id === target.id) allow()`
       //     above the switch would place it in front of `default:`, so a future @Roles(...)
-      //     widening to STAFF would silently hand STAFF a self-edit capability while the
+      //     widening to VIEWER would silently hand VIEWER a self-edit capability while the
       //     defence-in-depth arm that exists to catch that widening never ran.
       //  3. It does NOT re-check `role` / `isActive`. Step 5 runs FIRST and already denied a
       //     self-patch carrying either key, so this branch is unreachable for them. A second
@@ -119,11 +119,11 @@ export function canPatch(
       // `assertOptionsAssignable`, where a SYSTEM-RESERVED departmentId/personnelRoleId is the
       // same 400 as an unknown id — never a 403. That boundary is unchanged; it is simply
       // reachable for the first time.
-      return target.role === SystemRole.STAFF || actor.id === target.id
+      return target.role === SystemRole.VIEWER || actor.id === target.id
         ? allow()
-        : deny(ADMIN_MAY_ONLY_MODIFY_STAFF);
+        : deny(ADMIN_MAY_ONLY_MODIFY_VIEWER);
     default:
-      // Unreachable: RolesGuard already rejected STAFF. Defence in depth against a future
+      // Unreachable: RolesGuard already rejected VIEWER. Defence in depth against a future
       // @Roles(...) widening, and cheap. The spec covers it by calling the policy directly.
       return deny(INSUFFICIENT_ROLE);
   }

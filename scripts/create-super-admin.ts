@@ -35,7 +35,7 @@
  * resetting the credential IS the request. What that reversal must NOT drag along, and does not:
  *   - `role` is untouched in the `update` branch, AND an existing non-SUPER_ADMIN at that address is
  *     REFUSED outright (see `assertTargetIsSuperAdminOrAbsent`). Otherwise `--force` on a typo'd
- *     address would reset an ordinary ADMIN/STAFF user's password and flip their `isActive` /
+ *     address would reset an ordinary ADMIN/VIEWER user's password and flip their `isActive` /
  *     `deletedAt` — privilege-adjacent damage by typo.
  *   - `lineUserId` stays untouched. It is a notification address, not a credential.
  *   - The email burn + restore contract still holds: `upsert` on `email` returns the SAME row,
@@ -322,7 +322,7 @@ export const NOT_A_SUPER_ADMIN_MESSAGE =
  *
  * Necessary because `role` is absent from the `upsert`'s `update` block, which prevents a silent
  * PROMOTION but does not prevent the damage: without this check, `--force` on a typo'd address would
- * blindly reset an ordinary ADMIN/STAFF user's `passwordHash`, clear their forced-reset gate, and
+ * blindly reset an ordinary ADMIN/VIEWER user's `passwordHash`, clear their forced-reset gate, and
  * flip `isActive` / `deletedAt`. Absence from `update` is necessary but NOT sufficient.
  *
  * Deliberately looks past `deletedAt`: a soft-deleted ADMIN at that address is still that ADMIN's

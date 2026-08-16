@@ -46,7 +46,7 @@ describe('RolesGuard', () => {
     getAllAndOverride.mockReturnValue([SystemRole.SUPER_ADMIN]);
     const req = {
       systemUser: userWithRole(SystemRole.SUPER_ADMIN),
-      session: { role: SystemRole.STAFF },
+      session: { role: SystemRole.VIEWER },
     } as unknown as RequestWithSystemUser;
 
     expect(guard.canActivate(contextFor(req))).toBe(true);
@@ -55,10 +55,10 @@ describe('RolesGuard', () => {
   it.each([
     [SystemRole.SUPER_ADMIN, [SystemRole.SUPER_ADMIN], true],
     [SystemRole.ADMIN, [SystemRole.SUPER_ADMIN], false],
-    [SystemRole.STAFF, [SystemRole.SUPER_ADMIN], false],
+    [SystemRole.VIEWER, [SystemRole.SUPER_ADMIN], false],
     [SystemRole.SUPER_ADMIN, [SystemRole.SUPER_ADMIN, SystemRole.ADMIN], true],
     [SystemRole.ADMIN, [SystemRole.SUPER_ADMIN, SystemRole.ADMIN], true],
-    [SystemRole.STAFF, [SystemRole.SUPER_ADMIN, SystemRole.ADMIN], false],
+    [SystemRole.VIEWER, [SystemRole.SUPER_ADMIN, SystemRole.ADMIN], false],
   ])(
     'actor %s against @Roles(%s) → allowed=%s',
     (actorRole, required, allowed) => {

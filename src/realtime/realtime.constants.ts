@@ -58,7 +58,7 @@ export const REALTIME_EVENTS = {
 export const REALTIME_ERRORS = {
   /** 401's analogue: no cookie, expired session, user gone, soft-deleted, or suspended. */
   unauthenticated: 'UNAUTHENTICATED',
-  /** 403's analogue: `STAFF`, or `mustChangePassword`. */
+  /** 403's analogue: `VIEWER`, or `mustChangePassword`. */
   forbidden: 'FORBIDDEN',
   /** 503's analogue: the session store errored. The client should keep retrying. */
   sessionStoreUnavailable: 'SESSION_STORE_UNAVAILABLE',

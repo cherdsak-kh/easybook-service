@@ -149,11 +149,11 @@ model Department {
 /// role; (2) back-office staff job titles (SystemUser.personnelRoleId, the former free-text
 /// `position` column). One curated vocabulary, two readers.
 ///
-/// CRITICAL: `PersonnelRole` is NOT `SystemRole`. `SystemRole` (SUPER_ADMIN | ADMIN | STAFF, on
+/// CRITICAL: `PersonnelRole` is NOT `SystemRole`. `SystemRole` (SUPER_ADMIN | ADMIN | VIEWER, on
 /// SystemUser) is the back-office RBAC enum and the only grantor of privilege. They share NO table,
 /// enum, type, endpoint, or seed, and never cross a code path. A `SystemUser` now holds BOTH: only
 /// `SystemRole` grants privilege, and a `PersonnelRole` named "ADMIN" is a string — an inert label
-/// on a STAFF user who still gets 403 everywhere. Never compare, map, or fall back between them.
+/// on a VIEWER user who still gets 403 everywhere. Never compare, map, or fall back between them.
 /// Soft-deleted, name reusable (partial unique index — same as Department). Holds no PII.
 model PersonnelRole {
   id        Int       @id @default(autoincrement())
@@ -182,10 +182,15 @@ model PersonnelRole {
 }
 
 /// Back-office operator role. Distinct from AppAccess (LINE consumer domain) by design.
+///
+/// The third value is VIEWER, not STAFF. "เจ้าหน้าที่" is what the portal calls every operator in
+/// it — all three roles — so naming one of the three STAFF made the least privileged role sound
+/// like the category containing the other two. VIEWER says what the role can actually do: read.
+/// Renamed 2026-08-16, before the first migration, while the value was still free to change.
 enum SystemRole {
   SUPER_ADMIN
   ADMIN
-  STAFF
+  VIEWER
 }
 
 /// A back-office operator. NOT a LINE end-customer — see LineUser.
@@ -207,7 +212,7 @@ model SystemUser {
 
   firstName String
   lastName  String
-  role      SystemRole @default(STAFF)
+  role      SystemRole @default(VIEWER)
 
   /// Forced-reset flag. TRUE from the moment a temp password is issued (POST /system-users,
   /// POST /system-users/:id/reset-password); cleared ONLY by a successful POST /auth/system/password.
@@ -235,7 +240,7 @@ model SystemUser {
   /// FK -> PersonnelRole.id — the staff member's JOB TITLE ("Teacher", "Director"). The former
   /// free-text `position` column; "position" is the UI label, `personnelRole` is the model.
   ///
-  /// CRITICAL: this is NOT `role` above. `role` is SystemRole (SUPER_ADMIN | ADMIN | STAFF) — the
+  /// CRITICAL: this is NOT `role` above. `role` is SystemRole (SUPER_ADMIN | ADMIN | VIEWER) — the
   /// back-office RBAC enum and the ONLY thing that grants privilege. `personnelRole` is an
   /// admin-curated label that grants ZERO privilege, and a PersonnelRole named "ADMIN" is just a
   /// string. A SystemUser holds BOTH. They are never interchangeable, never compared, and never

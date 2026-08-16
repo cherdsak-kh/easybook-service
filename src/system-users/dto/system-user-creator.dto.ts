@@ -13,8 +13,8 @@ import { ApiProperty } from '@nestjs/swagger';
  * `createdById: actor.id` on every other row).
  *
  * **Deliberately carries no `email` and no `role`.** An `email` is a login identifier, and exposing
- * an admin's to every STAFF user who reads their own `/auth/system/me` is a targeted-phishing
- * surface; `role` tells a STAFF user which colleague is a SUPER_ADMIN, which is reconnaissance with
+ * an admin's to every VIEWER user who reads their own `/auth/system/me` is a targeted-phishing
+ * surface; `role` tells a VIEWER user which colleague is a SUPER_ADMIN, which is reconnaissance with
  * zero UI use. `deletedAt`, `isActive` and `profilePictureUrl` are excluded too — the first by the
  * standing AC-32 rule, the rest for want of a consumer.
  *

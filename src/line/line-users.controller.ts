@@ -69,7 +69,7 @@ export class LineUsersController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF has no access to this collection.',
+    description: 'VIEWER has no access to this collection.',
     type: ErrorResponseDto,
   })
   @ApiServiceUnavailableResponse({
@@ -104,7 +104,7 @@ export class LineUsersController {
   })
   @ApiForbiddenResponse({
     description:
-      'STAFF; CSRF failure; or an access transition not permitted for ADMIN.',
+      'VIEWER; CSRF failure; or an access transition not permitted for ADMIN.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
@@ -147,7 +147,7 @@ export class LineUsersController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF, or a CSRF failure.',
+    description: 'VIEWER, or a CSRF failure.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({

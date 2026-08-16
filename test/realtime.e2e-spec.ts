@@ -60,7 +60,7 @@ const PASSWORD = 'e2e-correct-horse-battery';
 
 const SUPER = `${SU_PREFIX}super@easybook.local`;
 const ADMIN = `${SU_PREFIX}admin@easybook.local`;
-const STAFF = `${SU_PREFIX}staff@easybook.local`;
+const VIEWER = `${SU_PREFIX}staff@easybook.local`;
 
 const url = (path: string) => `${API_BASE_PATH}${path}`;
 
@@ -267,7 +267,7 @@ describe('Realtime gateway (e2e)', () => {
     for (const [email, role] of [
       [SUPER, SystemRole.SUPER_ADMIN],
       [ADMIN, SystemRole.ADMIN],
-      [STAFF, SystemRole.STAFF],
+      [VIEWER, SystemRole.VIEWER],
     ] as Array<[string, SystemRole]>) {
       await prisma.systemUser.update({
         where: { email },
@@ -294,7 +294,7 @@ describe('Realtime gateway (e2e)', () => {
     for (const [email, role] of [
       [SUPER, SystemRole.SUPER_ADMIN],
       [ADMIN, SystemRole.ADMIN],
-      [STAFF, SystemRole.STAFF],
+      [VIEWER, SystemRole.VIEWER],
     ] as Array<[string, SystemRole]>) {
       await prisma.systemUser.create({
         data: { email, firstName: 'E2E', lastName: role, role, ...base },
@@ -458,8 +458,8 @@ describe('Realtime gateway (e2e)', () => {
       expect(events).toEqual([]);
     });
 
-    it('AC-B4 — a STAFF session is FORBIDDEN, not UNAUTHENTICATED', async () => {
-      const { cookie } = await login(STAFF);
+    it('AC-B4 — a VIEWER session is FORBIDDEN, not UNAUTHENTICATED', async () => {
+      const { cookie } = await login(VIEWER);
       const socket = connectSocket({ cookie });
 
       const error = await waitForConnectError(socket);
@@ -642,7 +642,7 @@ describe('Realtime gateway (e2e)', () => {
     const dbRevocations: Array<[string, Record<string, unknown>]> = [
       ['deletion (deletedAt)', { deletedAt: new Date() }],
       ['suspension (isActive: false)', { isActive: false }],
-      ['demotion (role: STAFF)', { role: SystemRole.STAFF }],
+      ['demotion (role: VIEWER)', { role: SystemRole.VIEWER }],
       ['forced reset (mustChangePassword)', { mustChangePassword: true }],
     ];
 
