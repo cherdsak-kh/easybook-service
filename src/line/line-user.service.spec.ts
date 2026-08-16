@@ -845,6 +845,7 @@ describe('LineUserService', () => {
               personnelRoleId: 2,
               department: { name: 'Computer Science' },
               personnelRole: { name: 'Teacher' },
+              createdAt: new Date('2026-07-09T04:30:00.000Z'),
             },
           },
         ],
@@ -863,6 +864,9 @@ describe('LineUserService', () => {
         department: 'Computer Science',
         personnelRoleId: 2,
         personnelRole: 'Teacher',
+        // Serialised from the registration's own createdAt — NOT `followedAt`, which this fixture
+        // deliberately sets to a different day (2026-07-07) so the two cannot be confused.
+        createdAt: '2026-07-09T04:30:00.000Z',
       });
     });
 
@@ -1562,6 +1566,7 @@ describe('LineUserService', () => {
         personnelRoleId: 4,
         department: { name: 'New Dept' },
         personnelRole: { name: 'New Role' },
+        createdAt: new Date('2026-07-09T04:30:00.000Z'),
       },
     };
 

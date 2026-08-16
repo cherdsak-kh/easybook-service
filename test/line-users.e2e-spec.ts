@@ -54,6 +54,7 @@ interface RegistrationSummary {
   department: string;
   personnelRoleId: number;
   personnelRole: string;
+  createdAt: string;
 }
 
 interface LineUserBody {
@@ -363,7 +364,11 @@ describe('LINE Users management (e2e)', () => {
         department: DEPT_NAME,
         personnelRoleId: optionIds.personnelRoleId,
         personnelRole: ROLE_NAME,
+        // LU-REGDATE-1: the submission date, which the screen shows as `วันที่ลงทะเบียน`.
+        // `toEqual` is exact, so this assertion is also what stops the field being dropped again.
+        createdAt: allowed?.registration?.createdAt,
       });
+      expect(allowed?.registration?.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 
       // A follower with no registration renders gracefully as null (AC-F7 backend half).
       const pending = rows.find((u) => u.lineUserId === `${LU_PREFIX}pending`);

@@ -128,6 +128,9 @@ export const LINE_USER_PUBLIC_FIELDS = {
       personnelRoleId: true,
       department: { select: { name: true } },
       personnelRole: { select: { name: true } },
+      // The `วันที่ลงทะเบียน` column, and the key BOTH date sort modes order by. Not interchangeable
+      // with `followedAt` above: that is the day they added the OA as a friend (LU-REGDATE-1).
+      createdAt: true,
     },
   },
 } as const;
@@ -900,6 +903,7 @@ export class LineUserService {
             department: user.registration.department.name,
             personnelRoleId: user.registration.personnelRoleId,
             personnelRole: user.registration.personnelRole.name,
+            createdAt: user.registration.createdAt.toISOString(),
           }
         : null,
     };
