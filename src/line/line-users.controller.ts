@@ -31,7 +31,20 @@ import { LineUserResponseDto } from './dto/line-user-response.dto';
 import { ListLineUsersQueryDto } from './dto/list-line-users-query.dto';
 import { PaginatedLineUsersResponseDto } from './dto/paginated-line-users-response.dto';
 import { UpdateLineUserAccessDto } from './dto/update-line-user-access.dto';
+import type { AdminActor } from './line-user.service';
 import { LineUserService } from './line-user.service';
+
+/**
+ * The acting operator, for the policy AND for the realtime event (REALTIME-1).
+ *
+ * `name` is the display name a colleague already sees on the staff screen — no email, no role,
+ * nothing an event needs to be an audit record rather than a "who just did that?" answer.
+ */
+const actorOf = (user: AuthenticatedSystemUser): AdminActor => ({
+  id: user.id,
+  name: `${user.firstName} ${user.lastName}`.trim(),
+  role: user.role,
+});
 
 /**
  * Back-office management of LINE end-users. Route prefix: `/api/v1/line-users`.
@@ -121,7 +134,7 @@ export class LineUsersController {
     @Body() dto: UpdateLineUserAccessDto,
     @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<LineUserResponseDto> {
-    return this.users.updateAccess(id, dto.access, user.role, dto.reason);
+    return this.users.updateAccess(id, dto.access, actorOf(user), dto.reason);
   }
 
   // Two path segments (`:id/registration`) — cannot collide with the single-segment admin `:id` or
@@ -164,6 +177,6 @@ export class LineUsersController {
     @Body() dto: AdminUpdateLineUserRegistrationDto,
     @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<LineUserResponseDto> {
-    return this.users.updateRegistrationByAdmin(id, dto, user.role);
+    return this.users.updateRegistrationByAdmin(id, dto, actorOf(user));
   }
 }

@@ -35,13 +35,31 @@ export const REALTIME_NAMESPACE_ALLOWLIST: readonly string[] = [
   REALTIME_ADMIN_NAMESPACE,
 ];
 
+/**
+ * Who performed the change an event describes, or `null` when no operator did — a LINE user
+ * following the account, or registering/editing their own details through the LIFF app.
+ *
+ * ⚠️ THIS IS OPERATIONAL PROVENANCE, NOT AN AUDIT TRAIL, and the difference is worth defending.
+ * It answers the one question a row changing under your cursor raises — "who just did that?" — for
+ * people who can already see the entire directory. It is not retained, not queryable, and not
+ * evidence. A real audit log is its own table and its own screen (`reports/activity`), and neither
+ * exists; adding fields here until it resembles one would produce a log that is neither.
+ *
+ * `name` is the display name an operator already sees on the staff screen. No email, no role, no
+ * id beyond what is needed to recognise a colleague.
+ */
+export interface RealtimeActor {
+  id: string;
+  name: string;
+}
+
 /** Server → client events. There are no client → server events (zero `@SubscribeMessage`). */
 export const REALTIME_EVENTS = {
-  /** This row now exists (or re-exists) in the operator's list. Payload: `LineUserResponseDto`. */
+  /** This row now exists (or re-exists). Payload: `{ user, actor }`. */
   lineUserCreated: 'lineUser.created',
-  /** This row's contents changed. Payload: `LineUserResponseDto`. */
+  /** This row's contents changed. Payload: `{ user, actor }`. */
   lineUserUpdated: 'lineUser.updated',
-  /** This row left the operator's list (soft delete). Payload: `{ id }`. */
+  /** This row left the operator's list (soft delete). Payload: `{ id, actor }`. */
   lineUserDeleted: 'lineUser.deleted',
   /** Control plane — emitted immediately before the sweeper disconnects a socket. */
   sessionClosed: 'session.closed',

@@ -17,6 +17,7 @@ import { LineService } from './line.service';
 // Asserted against the shared constant, not a restated literal: these fixtures
 // silently went stale when the TYPE_1 artwork changed from 2500x843 to 2500x1686.
 import { RICH_MENU_SPECS } from './rich-menu.constants';
+import type { AdminActor } from './line-user.service';
 import {
   ACCESS_NOTIFICATION_MESSAGES,
   accessToRichMenuType,
@@ -75,6 +76,23 @@ const OWNER_REGISTRATION_ROW = {
   createdAt: new Date('2026-07-14T10:00:00.000Z'),
   updatedAt: new Date('2026-07-14T10:00:00.000Z'),
 };
+
+/**
+ * The acting operator for the two admin write paths. The identity half is fixed and only the role
+ * varies, because every existing assertion in this file is about the ROLE — the id and name exist
+ * so the realtime event can name who acted (REALTIME-1).
+ */
+const ADMIN_ACTOR: AdminActor = {
+  id: 'op-1',
+  name: 'วีระ ทองดี',
+  role: SystemRole.ADMIN,
+};
+
+const actorOf = (role: SystemRole): AdminActor => ({
+  id: 'op-1',
+  name: 'วีระ ทองดี',
+  role,
+});
 
 describe('LineUserService', () => {
   let service: LineUserService;
@@ -210,7 +228,8 @@ describe('LineUserService', () => {
     await service.softDeleteByLineUserId('U123');
 
     expect(realtime.emitLineUserDeleted).toHaveBeenCalledTimes(1);
-    expect(realtime.emitLineUserDeleted).toHaveBeenCalledWith('lu-1');
+    // An unfollow has no operator — the person did it themselves, on LINE.
+    expect(realtime.emitLineUserDeleted).toHaveBeenCalledWith('lu-1', null);
   });
 
   it('unfollow of an absent/already-deleted row writes nothing and emits nothing', async () => {
@@ -1050,7 +1069,7 @@ describe('LineUserService', () => {
       const result = await service.updateAccess(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
       );
 
       expect(lineUser.findUnique).toHaveBeenCalledWith({
@@ -1086,7 +1105,11 @@ describe('LineUserService', () => {
       });
       line.findRichMenuId.mockResolvedValue('rm-type1');
 
-      await service.updateAccess('lu-1', AppAccess.BLOCKED, SystemRole.ADMIN);
+      await service.updateAccess(
+        'lu-1',
+        AppAccess.BLOCKED,
+        actorOf(SystemRole.ADMIN),
+      );
 
       expect(lineUser.update).toHaveBeenCalledWith({
         where: { id: 'lu-1' },
@@ -1117,7 +1140,7 @@ describe('LineUserService', () => {
       await service.updateAccess(
         'lu-1',
         AppAccess.PENDING,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
 
       expect(line.push).toHaveBeenCalledWith('U123', [
@@ -1137,7 +1160,7 @@ describe('LineUserService', () => {
       await service.updateAccess(
         'lu-1',
         AppAccess.UNREGISTERED,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
 
       expect(line.push).not.toHaveBeenCalled();
@@ -1161,7 +1184,7 @@ describe('LineUserService', () => {
       const result = await service.updateAccess(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
       );
 
       expect(result.access).toBe(AppAccess.ALLOWED);
@@ -1183,7 +1206,11 @@ describe('LineUserService', () => {
       line.linkRichMenuToUser.mockRejectedValue(new Error('LINE 500'));
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.ALLOWED,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).rejects.toBeInstanceOf(BadGatewayException);
       // The DB write happened BEFORE the failing LINE call — source of truth is correct.
       expect(lineUser.update).toHaveBeenCalledWith({
@@ -1212,12 +1239,16 @@ describe('LineUserService', () => {
         .mockResolvedValueOnce(undefined);
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.ALLOWED,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).rejects.toBeInstanceOf(BadGatewayException);
       const retry = await service.updateAccess(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
       );
       expect(retry.access).toBe(AppAccess.ALLOWED);
       expect(retry.richMenuType).toBe('TYPE_2');
@@ -1228,7 +1259,7 @@ describe('LineUserService', () => {
 
       for (const role of [SystemRole.ADMIN, SystemRole.SUPER_ADMIN]) {
         await expect(
-          service.updateAccess('gone', AppAccess.ALLOWED, role),
+          service.updateAccess('gone', AppAccess.ALLOWED, actorOf(role)),
         ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
       }
       expect(lineUser.update).not.toHaveBeenCalled();
@@ -1258,7 +1289,11 @@ describe('LineUserService', () => {
         });
         line.findRichMenuId.mockResolvedValue('rm-x');
 
-        const result = await service.updateAccess('lu-1', to, SystemRole.ADMIN);
+        const result = await service.updateAccess(
+          'lu-1',
+          to,
+          actorOf(SystemRole.ADMIN),
+        );
 
         expect(result.access).toBe(to);
         expect(lineUser.update).toHaveBeenCalledWith({
@@ -1294,7 +1329,7 @@ describe('LineUserService', () => {
         primeRead(from);
 
         await expect(
-          service.updateAccess('lu-1', to, SystemRole.ADMIN),
+          service.updateAccess('lu-1', to, actorOf(SystemRole.ADMIN)),
         ).rejects.toBeInstanceOf(ForbiddenException);
         expect(lineUser.update).not.toHaveBeenCalled();
         expect(line.findRichMenuId).not.toHaveBeenCalled();
@@ -1306,7 +1341,11 @@ describe('LineUserService', () => {
     it('AC-3.2 — the 403 carries the forbidden-transition message', async () => {
       primeRead(AppAccess.ALLOWED);
       await expect(
-        service.updateAccess('lu-1', AppAccess.PENDING, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.PENDING,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).rejects.toThrow(
         new ForbiddenException(LINE_USER_ACCESS_TRANSITION_FORBIDDEN),
       );
@@ -1335,7 +1374,7 @@ describe('LineUserService', () => {
         const result = await service.updateAccess(
           'lu-1',
           to,
-          SystemRole.SUPER_ADMIN,
+          actorOf(SystemRole.SUPER_ADMIN),
         );
 
         expect(result.access).toBe(to);
@@ -1351,7 +1390,11 @@ describe('LineUserService', () => {
       primeRead(AppAccess.PENDING, new Date());
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.PENDING, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.PENDING,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
       expect(lineUser.update).not.toHaveBeenCalled();
       expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
@@ -1361,7 +1404,11 @@ describe('LineUserService', () => {
       primeRead(AppAccess.PENDING, new Date());
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.ALLOWED,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
       expect(lineUser.update).not.toHaveBeenCalled();
     });
@@ -1379,7 +1426,7 @@ describe('LineUserService', () => {
       const result = await service.updateAccess(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
 
       // DB persisted with the derived rich menu (source of truth), no LINE side-effects, no 502/500.
@@ -1410,12 +1457,12 @@ describe('LineUserService', () => {
       const first = await service.updateAccess(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
       const second = await service.updateAccess(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
 
       expect(first.access).toBe(AppAccess.ALLOWED);
@@ -1438,7 +1485,7 @@ describe('LineUserService', () => {
       const result = await service.updateAccess(
         'lu-1',
         AppAccess.REJECTED,
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
         'phone is wrong',
       );
 
@@ -1482,7 +1529,7 @@ describe('LineUserService', () => {
           service.updateAccess(
             'lu-1',
             AppAccess.REJECTED,
-            SystemRole.ADMIN,
+            actorOf(SystemRole.ADMIN),
             reason,
           ),
         ).rejects.toThrow(new BadRequestException(REJECTION_REASON_REQUIRED));
@@ -1498,7 +1545,7 @@ describe('LineUserService', () => {
         service.updateAccess(
           'lu-1',
           AppAccess.REJECTED,
-          SystemRole.ADMIN,
+          actorOf(SystemRole.ADMIN),
           'whatever',
         ),
       ).rejects.toThrow(
@@ -1515,7 +1562,7 @@ describe('LineUserService', () => {
         service.updateAccess(
           'lu-1',
           AppAccess.REJECTED,
-          SystemRole.SUPER_ADMIN,
+          actorOf(SystemRole.SUPER_ADMIN),
           'whatever',
         ),
       ).rejects.toThrow(new BadRequestException(CANNOT_REJECT_UNREGISTERED));
@@ -1535,7 +1582,7 @@ describe('LineUserService', () => {
         });
         line.findRichMenuId.mockResolvedValue('rm-x');
 
-        await service.updateAccess('lu-1', to, SystemRole.ADMIN);
+        await service.updateAccess('lu-1', to, actorOf(SystemRole.ADMIN));
 
         // The write clears the prior rejection — the invariant's non-REJECTED branch.
         expect(lineUser.update).toHaveBeenCalledWith({
@@ -1571,7 +1618,7 @@ describe('LineUserService', () => {
       const result = await service.updateAccess(
         'lu-1',
         AppAccess.REJECTED,
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
         'incomplete documents',
       );
 
@@ -1591,7 +1638,7 @@ describe('LineUserService', () => {
       const result = await service.updateAccess(
         'lu-1',
         AppAccess.REJECTED,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
         'account under review',
       );
 
@@ -1687,7 +1734,7 @@ describe('LineUserService', () => {
         const result = await service.updateRegistrationByAdmin(
           'lu-1',
           ADMIN_EDIT_DTO,
-          role,
+          actorOf(role),
         );
 
         // `access` is NOT selected on the existence read — the edit is not PENDING-gated (AC-B10).
@@ -1724,7 +1771,7 @@ describe('LineUserService', () => {
       await service.updateRegistrationByAdmin(
         'lu-1',
         ADMIN_EDIT_DTO,
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
       );
 
       // Orthogonal to Item 3: `access`/`richMenuType` are never written and no LINE call fires.
@@ -1739,7 +1786,7 @@ describe('LineUserService', () => {
       await service.updateRegistrationByAdmin(
         'lu-1',
         ADMIN_EDIT_DTO,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
       const firstSelect = (
         lineUser.findUnique.mock.calls[0] as [
@@ -1768,7 +1815,11 @@ describe('LineUserService', () => {
         );
 
         await expect(
-          service.updateRegistrationByAdmin('lu-1', ADMIN_EDIT_DTO, role),
+          service.updateRegistrationByAdmin(
+            'lu-1',
+            ADMIN_EDIT_DTO,
+            actorOf(role),
+          ),
         ).rejects.toThrow(new BadRequestException(INVALID_DEPARTMENT));
         // The role-blind guard hardcodes isSystemReserved: false — SUPER_ADMIN gets no carve-out here.
         expect(tx.department.findFirst).toHaveBeenCalledWith({
@@ -1797,7 +1848,11 @@ describe('LineUserService', () => {
         );
 
         await expect(
-          service.updateRegistrationByAdmin('lu-1', ADMIN_EDIT_DTO, role),
+          service.updateRegistrationByAdmin(
+            'lu-1',
+            ADMIN_EDIT_DTO,
+            actorOf(role),
+          ),
         ).rejects.toThrow(new BadRequestException(INVALID_PERSONNEL_ROLE));
         expect(tx.personnelRole.findFirst).toHaveBeenCalledWith({
           where: { id: 4, deletedAt: null, isSystemReserved: false },
@@ -1826,7 +1881,7 @@ describe('LineUserService', () => {
         service.updateRegistrationByAdmin(
           'lu-1',
           ADMIN_EDIT_DTO,
-          SystemRole.ADMIN,
+          actorOf(SystemRole.ADMIN),
         ),
       ).rejects.toThrow(new BadRequestException(INVALID_DEPARTMENT));
       expect(tx.lineUserRegistration.update).not.toHaveBeenCalled();
@@ -1843,7 +1898,7 @@ describe('LineUserService', () => {
         service.updateRegistrationByAdmin(
           'lu-1',
           ADMIN_EDIT_DTO,
-          SystemRole.ADMIN,
+          actorOf(SystemRole.ADMIN),
         ),
       ).rejects.toThrow(
         new NotFoundException(LINE_USER_REGISTRATION_NOT_FOUND),
@@ -1856,7 +1911,11 @@ describe('LineUserService', () => {
         jest.clearAllMocks();
         lineUser.findUnique.mockResolvedValueOnce(null);
         await expect(
-          service.updateRegistrationByAdmin('gone', ADMIN_EDIT_DTO, role),
+          service.updateRegistrationByAdmin(
+            'gone',
+            ADMIN_EDIT_DTO,
+            actorOf(role),
+          ),
         ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
         expect(lineUserRegistration.findFirst).not.toHaveBeenCalled();
       }
@@ -1872,7 +1931,7 @@ describe('LineUserService', () => {
         service.updateRegistrationByAdmin(
           'lu-1',
           ADMIN_EDIT_DTO,
-          SystemRole.ADMIN,
+          actorOf(SystemRole.ADMIN),
         ),
       ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
       // 404 wins before the registration gate — never leaks that the row exists but is deleted.
@@ -1886,7 +1945,7 @@ describe('LineUserService', () => {
       const result = await service.updateRegistrationByAdmin(
         'lu-1',
         ADMIN_EDIT_DTO,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
 
       expect(tx.lineUserRegistration.update).toHaveBeenCalled();
@@ -1928,7 +1987,11 @@ describe('LineUserService', () => {
       line.findRichMenuId.mockResolvedValue('rm-type2');
       lineUser.findFirst.mockResolvedValue(publicRow);
 
-      await service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN);
+      await service.updateAccess(
+        'lu-1',
+        AppAccess.ALLOWED,
+        actorOf(SystemRole.ADMIN),
+      );
 
       expect(lineUser.findFirst).toHaveBeenCalledWith({
         where: { id: 'lu-1', deletedAt: null },
@@ -1950,10 +2013,18 @@ describe('LineUserService', () => {
       line.findRichMenuId.mockResolvedValue('rm-type2');
       lineUser.findFirst.mockResolvedValue(publicRow);
 
-      await service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN);
+      await service.updateAccess(
+        'lu-1',
+        AppAccess.ALLOWED,
+        actorOf(SystemRole.ADMIN),
+      );
 
       expect(realtime.emitLineUserUpdated).toHaveBeenCalledTimes(1);
-      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(expectedDto);
+      // The operator who approved, so the screen can name them instead of saying "someone".
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(
+        expectedDto,
+        ADMIN_ACTOR,
+      );
       expect(realtime.emitLineUserCreated).not.toHaveBeenCalled();
       // Ordering: rich menu -> emit -> push. Broadcasting before the menu applied would advertise a
       // state we might still 502 on; emitting after the push would put LINE's latency on the socket.
@@ -1978,7 +2049,11 @@ describe('LineUserService', () => {
       line.findRichMenuId.mockResolvedValue(null); // menu missing on LINE -> 502
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.ALLOWED,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).rejects.toThrow(BadGatewayException);
 
       expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
@@ -2019,7 +2094,7 @@ describe('LineUserService', () => {
         prime();
 
         await expect(
-          service.updateAccess('lu-1', target, role),
+          service.updateAccess('lu-1', target, actorOf(role)),
         ).rejects.toThrow();
 
         expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
@@ -2044,7 +2119,7 @@ describe('LineUserService', () => {
       await service.updateAccess(
         'lu-1',
         AppAccess.BLOCKED,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
 
       expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
@@ -2058,7 +2133,11 @@ describe('LineUserService', () => {
       await service.upsertOnFollow({ lineUserId: 'U123' });
 
       expect(realtime.emitLineUserCreated).toHaveBeenCalledTimes(1);
-      expect(realtime.emitLineUserCreated).toHaveBeenCalledWith(expectedDto);
+      // A follow has no operator.
+      expect(realtime.emitLineUserCreated).toHaveBeenCalledWith(
+        expectedDto,
+        null,
+      );
     });
 
     it('B11 — register() emits CREATED when the transaction created the LineUser row', async () => {
@@ -2119,7 +2198,11 @@ describe('LineUserService', () => {
       await service.updateRegistration('U123', { ...VALID_DTO });
 
       expect(realtime.emitLineUserUpdated).toHaveBeenCalledTimes(1);
-      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(expectedDto);
+      // The LINE user edited their own registration — no operator.
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(
+        expectedDto,
+        null,
+      );
     });
 
     it('B9 — the admin registration edit emits ONE lineUser.updated', async () => {
@@ -2147,7 +2230,7 @@ describe('LineUserService', () => {
           departmentId: 3,
           personnelRoleId: 4,
         },
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
       );
 
       expect(realtime.emitLineUserUpdated).toHaveBeenCalledTimes(1);
@@ -2172,7 +2255,11 @@ describe('LineUserService', () => {
 
       // The write already committed — the mutation must still succeed.
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.ALLOWED,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).resolves.toMatchObject({ id: 'lu-1' });
 
       expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
@@ -2205,7 +2292,11 @@ describe('LineUserService', () => {
       lineUser.findFirst.mockResolvedValue(publicRow);
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.ALLOWED,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).resolves.toMatchObject({ id: 'lu-1' });
     });
   });

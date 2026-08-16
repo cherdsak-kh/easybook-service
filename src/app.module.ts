@@ -19,6 +19,7 @@ import { HealthModule } from './health/health.module';
 import { LineModule } from './line/line.module';
 import { OptionsModule } from './options/options.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { SystemModule } from './system/system.module';
 import { RealtimeModule } from './realtime/realtime.module';
 import { RedisThrottlerStorage } from './redis/redis-throttler.storage';
 import { REDIS_CLIENT } from './redis/redis.constants';
@@ -78,6 +79,7 @@ const throttlerModule: DynamicModule = {
     AuthModule,
     SystemUsersModule,
     OptionsModule,
+    SystemModule,
     // Domain modules (ResourceModule, BookingModule, ...) are added in their own tasks.
   ],
   controllers: [AppController],

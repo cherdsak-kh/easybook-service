@@ -16,6 +16,7 @@ import {
   DEFAULT_WS_REVALIDATE_INTERVAL_MS,
   REALTIME_ADMIN_NAMESPACE,
   REALTIME_EVENTS,
+  type RealtimeActor,
   SESSION_CLOSED_REASONS,
   WS_SWEEP_BUDGET_MS,
   type SessionClosedReason,
@@ -121,19 +122,32 @@ export class RealtimeGateway
 
   // ───────────────────────────────── emit surface ─────────────────────────────────
 
-  /** Broadcasts a row that now exists (or re-exists) in the operator's list. */
-  emitLineUserCreated(dto: LineUserResponseDto): void {
-    this.emit(REALTIME_EVENTS.lineUserCreated, dto, dto.id);
+  /**
+   * Broadcasts a row that now exists (or re-exists) in the operator's list.
+   *
+   * ⚠️ `actor` is REQUIRED at the call site and nullable in value. Making it optional would let a
+   * future emit site forget it and silently ship an event that says what changed but not who
+   * changed it — which is the gap REALTIME-1 exists to close. `null` is a real answer: nobody
+   * operated, a LINE user followed or edited their own registration.
+   */
+  emitLineUserCreated(
+    dto: LineUserResponseDto,
+    actor: RealtimeActor | null,
+  ): void {
+    this.emit(REALTIME_EVENTS.lineUserCreated, { user: dto, actor }, dto.id);
   }
 
   /** Broadcasts a row whose contents changed. */
-  emitLineUserUpdated(dto: LineUserResponseDto): void {
-    this.emit(REALTIME_EVENTS.lineUserUpdated, dto, dto.id);
+  emitLineUserUpdated(
+    dto: LineUserResponseDto,
+    actor: RealtimeActor | null,
+  ): void {
+    this.emit(REALTIME_EVENTS.lineUserUpdated, { user: dto, actor }, dto.id);
   }
 
   /** Broadcasts a row that left the operator's list (unfollow → soft delete). */
-  emitLineUserDeleted(id: string): void {
-    this.emit(REALTIME_EVENTS.lineUserDeleted, { id }, id);
+  emitLineUserDeleted(id: string, actor: RealtimeActor | null): void {
+    this.emit(REALTIME_EVENTS.lineUserDeleted, { id, actor }, id);
   }
 
   /**

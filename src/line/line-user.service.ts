@@ -10,6 +10,7 @@ import {
 import { AppAccess, Prisma, SystemRole } from '@prisma/client';
 import type { LineUser, RichMenuType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import type { RealtimeActor } from '../realtime/realtime.constants';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { canAdminSetAccess } from './line-access.policy';
 import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
@@ -35,6 +36,21 @@ import {
   REJECTION_REASON_REQUIRED,
 } from './line-users.errors';
 import { RICH_MENU_SPECS } from './rich-menu.constants';
+
+/**
+ * Who is performing an admin write. Replaces the bare `role` parameter the two admin methods used
+ * to take.
+ *
+ * ⚠️ It is a REPLACEMENT and not an extra argument, deliberately. An added optional parameter is
+ * one a future route forgets, and the failure is silent: the write succeeds, the event fans out,
+ * and it simply says nobody did it. Widening the existing parameter makes the type checker name
+ * every call site instead.
+ *
+ * `role` is still the only thing `canAdminSetAccess` reads — the identity half is for the event.
+ */
+export interface AdminActor extends RealtimeActor {
+  role: SystemRole;
+}
 
 /** Profile fields captured when a user follows the OA (all best-effort). */
 export interface LineProfileInput {
@@ -259,6 +275,7 @@ export class LineUserService {
   private async publish(
     kind: 'created' | 'updated',
     id: string,
+    actor: RealtimeActor | null,
   ): Promise<void> {
     try {
       const row = await this.prisma.lineUser.findFirst({
@@ -268,8 +285,8 @@ export class LineUserService {
       // Soft-deleted or gone → no event, by design.
       if (!row) return;
       const dto = this.toDto(row);
-      if (kind === 'created') this.realtime.emitLineUserCreated(dto);
-      else this.realtime.emitLineUserUpdated(dto);
+      if (kind === 'created') this.realtime.emitLineUserCreated(dto, actor);
+      else this.realtime.emitLineUserUpdated(dto, actor);
     } catch (error) {
       // PII discipline: id + kind only. Never the DTO, never a name or phone.
       this.logger.warn(
@@ -301,7 +318,8 @@ export class LineUserService {
     // Emit site 1. A re-follow after an unfollow re-surfaces the row, so `created` is correct; the
     // client's `created` handler is an upsert, so a plain profile refresh is harmless.
     // `LineWebhookService` stays unchanged — the emit belongs to the service that owns the model.
-    await this.publish('created', user.id);
+    // No operator: a LINE user added the Official Account themselves.
+    await this.publish('created', user.id, null);
     return user;
   }
 
@@ -326,7 +344,8 @@ export class LineUserService {
     });
 
     // Emit site 6. "Deleted" means "left the list you are looking at" — the physical row survives.
-    this.realtime.emitLineUserDeleted(row.id);
+    // No operator: the user unfollowed.
+    this.realtime.emitLineUserDeleted(row.id, null);
     return { count: 1 };
   }
 
@@ -571,7 +590,8 @@ export class LineUserService {
 
       // Emit site 2 — after the commit, BEFORE the LINE push (a best-effort HTTP call that can take
       // a second or more; the socket path must not sit behind it).
-      await this.publish(wasCreated ? 'created' : 'updated', userId);
+      // No operator: the LINE user submitted their own registration through the LIFF app.
+      await this.publish(wasCreated ? 'created' : 'updated', userId, null);
 
       // Best-effort "we received your registration" push (PENDING copy). Outside the transaction
       // so a push failure can never roll back the committed registration/access change.
@@ -658,7 +678,8 @@ export class LineUserService {
     this.logger.log(`LineUser registration edited. id=${user.id}`);
 
     // Emit site 3 — after the `$transaction` resolves, before the conditional PENDING push.
-    await this.publish('updated', user.id);
+    // No operator: the LINE user edited their own registration.
+    await this.publish('updated', user.id, null);
 
     // A REJECTED resubmit re-enters review → send the existing PENDING ack, AFTER the transaction
     // commits (fail-soft) so a push failure can't roll back the committed resubmit. A PENDING edit
@@ -762,9 +783,10 @@ export class LineUserService {
   async updateAccess(
     id: string,
     access: AppAccess,
-    role: SystemRole,
+    actor: AdminActor,
     reason?: string,
   ): Promise<LineUserResponseDto> {
+    const { role } = actor;
     const row = await this.prisma.lineUser.findUnique({
       where: { id },
       select: { id: true, access: true, deletedAt: true },
@@ -845,7 +867,7 @@ export class LineUserService {
     // raises a retryable 502 above, and NO event is emitted on that path: broadcasting a row whose
     // LINE-side state we know is inconsistent, from a request that answers 502, is worse than being
     // briefly stale, and the retry re-emits (the operation is idempotent).
-    await this.publish('updated', updated.id);
+    await this.publish('updated', updated.id, actor);
 
     // Best-effort notification, only after BOTH the DB write and the rich-menu apply succeeded.
     // Pushed to the LINE-side U… id (updated.lineUserId), never the cuid. A push failure here does
@@ -890,8 +912,9 @@ export class LineUserService {
   async updateRegistrationByAdmin(
     id: string,
     dto: AdminUpdateLineUserRegistrationDto,
-    role: SystemRole,
+    actor: AdminActor,
   ): Promise<LineUserResponseDto> {
+    const { role } = actor;
     // Plain reads outside the tx (mirrors updateRegistration). `access` is NOT selected — the edit is
     // orthogonal to the access matrix and is not PENDING-gated.
     const row = await this.prisma.lineUser.findUnique({
@@ -945,7 +968,7 @@ export class LineUserService {
     // Emit site 5 — after the `$transaction` and the re-read, before returning. A SUPER_ADMIN may
     // reach a soft-deleted row here; `publish`'s `deletedAt: null` filter is what stops that row
     // from being broadcast.
-    await this.publish('updated', row.id);
+    await this.publish('updated', row.id, actor);
 
     return this.toDto(updated!);
   }

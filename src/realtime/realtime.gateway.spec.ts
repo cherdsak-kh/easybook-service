@@ -159,29 +159,32 @@ describe('RealtimeGateway', () => {
     expect(namespace.use).toHaveBeenCalledTimes(3);
   });
 
+  /** REALTIME-1: who did it. `null` is the other legal value — a LINE-side or self-service change. */
+  const ACTOR = { id: 'op-1', name: 'วีระ ทองดี' };
+
   // ───────────────────────────── emit surface ─────────────────────────────
 
   it('emits the three domain events on the namespace (no rooms — membership IS the boundary)', () => {
     const namespace = boot();
 
-    gateway.emitLineUserCreated(dto);
-    gateway.emitLineUserUpdated(dto);
-    gateway.emitLineUserDeleted('lu-9');
+    gateway.emitLineUserCreated(dto, ACTOR);
+    gateway.emitLineUserUpdated(dto, ACTOR);
+    gateway.emitLineUserDeleted('lu-9', ACTOR);
 
     expect(namespace.emit).toHaveBeenNthCalledWith(
       1,
       REALTIME_EVENTS.lineUserCreated,
-      dto,
+      { user: dto, actor: ACTOR },
     );
     expect(namespace.emit).toHaveBeenNthCalledWith(
       2,
       REALTIME_EVENTS.lineUserUpdated,
-      dto,
+      { user: dto, actor: ACTOR },
     );
     expect(namespace.emit).toHaveBeenNthCalledWith(
       3,
       REALTIME_EVENTS.lineUserDeleted,
-      { id: 'lu-9' },
+      { id: 'lu-9', actor: ACTOR },
     );
   });
 
@@ -190,9 +193,9 @@ describe('RealtimeGateway', () => {
       .spyOn(Logger.prototype, 'warn')
       .mockImplementation(() => undefined);
 
-    expect(() => gateway.emitLineUserCreated(dto)).not.toThrow();
-    expect(() => gateway.emitLineUserUpdated(dto)).not.toThrow();
-    expect(() => gateway.emitLineUserDeleted('lu-9')).not.toThrow();
+    expect(() => gateway.emitLineUserCreated(dto, ACTOR)).not.toThrow();
+    expect(() => gateway.emitLineUserUpdated(dto, ACTOR)).not.toThrow();
+    expect(() => gateway.emitLineUserDeleted('lu-9', ACTOR)).not.toThrow();
     expect(warn).toHaveBeenCalledTimes(3);
 
     warn.mockRestore();
@@ -207,7 +210,7 @@ describe('RealtimeGateway', () => {
       throw new Error('transport down');
     });
 
-    expect(() => gateway.emitLineUserUpdated(dto)).not.toThrow();
+    expect(() => gateway.emitLineUserUpdated(dto, ACTOR)).not.toThrow();
     expect(warn).toHaveBeenCalled();
 
     warn.mockRestore();
@@ -222,8 +225,8 @@ describe('RealtimeGateway', () => {
       throw new Error('transport down');
     });
 
-    gateway.emitLineUserUpdated(dto);
-    gateway.emitLineUserDeleted('lu-9');
+    gateway.emitLineUserUpdated(dto, ACTOR);
+    gateway.emitLineUserDeleted('lu-9', ACTOR);
 
     for (const [message] of warn.mock.calls) {
       const text = String(message);
