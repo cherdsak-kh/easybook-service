@@ -203,7 +203,7 @@ describe('LINE Users management (e2e)', () => {
 
     // The ALLOWED fixture carries a registration so the list-embed can be asserted; the others
     // deliberately have none (registration: null in the row).
-    await prisma.lineUserRegistration.create({
+    const reg = await prisma.lineUserRegistration.create({
       data: {
         lineUserId: luIds[`${LU_PREFIX}allowed`],
         firstName: 'Bob',
@@ -213,6 +213,16 @@ describe('LINE Users management (e2e)', () => {
         departmentId: optionIds.departmentId,
         personnelRoleId: optionIds.personnelRoleId,
       },
+    });
+
+    // ⚠️ `registeredAt` lives on the LineUser and `register()` writes it in the same transaction
+    // as the row above. This fixture writes straight to the database, so it has to do that half
+    // itself — otherwise it builds a state the service cannot produce: a registration exists while
+    // the row says the person never registered. That is the standing cost of the denormalised
+    // column, and it lands on anything that bypasses the service.
+    await prisma.lineUser.update({
+      where: { id: luIds[`${LU_PREFIX}allowed`] },
+      data: { registeredAt: reg.createdAt },
     });
   };
 
@@ -300,7 +310,9 @@ describe('LINE Users management (e2e)', () => {
       await agent.get(url('/line-users?limit=101')).expect(400);
       await agent.get(url('/line-users?limit=0')).expect(400);
       await agent.get(url('/line-users?page=0')).expect(400);
-      await agent.get(url('/line-users?sort=name')).expect(400);
+      // Was `sort=name`, which became a REAL parameter on 2026-08-16 — at which point this
+      // line asserted that a supported feature is rejected.
+      await agent.get(url('/line-users?nonsenseParam=x')).expect(400);
     });
 
     it('AC-B3 — a page beyond the last is 200 with empty data and truthful meta', async () => {

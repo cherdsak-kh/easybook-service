@@ -7,6 +7,10 @@ import type { App } from 'supertest/types';
 import { AppModule } from '../src/app.module';
 import { configureApp } from '../src/app.setup';
 import { PrismaService } from '../src/prisma/prisma.service';
+import {
+  TOMBSTONE_DEPARTMENT_NAME,
+  TOMBSTONE_PERSONNEL_ROLE_NAME,
+} from '../src/options/options.constants';
 import { REDIS_CLIENT } from '../src/redis/redis.constants';
 
 /**
@@ -103,6 +107,50 @@ export async function ensureE2eOptions(
       select: { id: true },
     }));
   return { departmentId: department.id, personnelRoleId: personnelRole.id };
+}
+
+/**
+ * The TOMBSTONE rows an option delete re-points its holders to (OPT-FALLBACK-1).
+ *
+ * ⚠️ A suite that deletes an option NEEDS these, and their absence is a 500 by design — the
+ * service refuses to strand live rows on a soft-deleted option rather than deleting anyway. In
+ * production `create-super-admin` makes them; here the suite has to, because the e2e database is
+ * migrated but never bootstrapped.
+ *
+ * Resolve-or-create by name and reserved-flag, exactly as `OptionsService.resolveTombstoneId`
+ * looks them up, so a rename on one side fails loudly here instead of silently missing.
+ */
+export async function ensureTombstoneOptions(
+  prisma: PrismaService,
+): Promise<void> {
+  // Spelled out per table rather than through a shared delegate: a union of the two (heavily
+  // overloaded) Prisma delegates is not callable in TypeScript. Same fact `OptionsService` works
+  // around with its hand-written `OptionDelegate`.
+  const where = (name: string) => ({
+    name,
+    deletedAt: null,
+    isSystemReserved: true,
+  });
+
+  const dept = await prisma.department.findFirst({
+    where: where(TOMBSTONE_DEPARTMENT_NAME),
+    select: { id: true },
+  });
+  if (!dept) {
+    await prisma.department.create({
+      data: { name: TOMBSTONE_DEPARTMENT_NAME, isSystemReserved: true },
+    });
+  }
+
+  const role = await prisma.personnelRole.findFirst({
+    where: where(TOMBSTONE_PERSONNEL_ROLE_NAME),
+    select: { id: true },
+  });
+  if (!role) {
+    await prisma.personnelRole.create({
+      data: { name: TOMBSTONE_PERSONNEL_ROLE_NAME, isSystemReserved: true },
+    });
+  }
 }
 
 export const readCookie = (

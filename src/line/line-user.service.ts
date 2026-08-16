@@ -285,8 +285,14 @@ export class LineUserService {
       // Soft-deleted or gone → no event, by design.
       if (!row) return;
       const dto = this.toDto(row);
-      if (kind === 'created') this.realtime.emitLineUserCreated(dto, actor);
-      else this.realtime.emitLineUserUpdated(dto, actor);
+      // ⚠️ NARROWED EXPLICITLY, and it has to be. `AdminActor` extends `RealtimeActor` with
+      // `role`, and a structural type does not strip the extra property at runtime — passing the
+      // actor straight through put the operator's ROLE on the wire, which is exactly what this
+      // payload's doc comment says it does not carry. Caught by the e2e socket assertion, which
+      // reads the real JSON rather than the declared type.
+      const who = actor ? { id: actor.id, name: actor.name } : null;
+      if (kind === 'created') this.realtime.emitLineUserCreated(dto, who);
+      else this.realtime.emitLineUserUpdated(dto, who);
     } catch (error) {
       // PII discipline: id + kind only. Never the DTO, never a name or phone.
       this.logger.warn(

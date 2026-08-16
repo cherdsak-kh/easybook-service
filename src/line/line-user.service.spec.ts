@@ -2020,11 +2020,13 @@ describe('LineUserService', () => {
       );
 
       expect(realtime.emitLineUserUpdated).toHaveBeenCalledTimes(1);
-      // The operator who approved, so the screen can name them instead of saying "someone".
-      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(
-        expectedDto,
-        ADMIN_ACTOR,
-      );
+      // The operator who approved, so the screen can name them instead of saying "someone" —
+      // and ONLY id + name. `AdminActor` also carries `role`, which a structural type does not
+      // strip at runtime; this exact assertion is what keeps it off the wire.
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(expectedDto, {
+        id: ADMIN_ACTOR.id,
+        name: ADMIN_ACTOR.name,
+      });
       expect(realtime.emitLineUserCreated).not.toHaveBeenCalled();
       // Ordering: rich menu -> emit -> push. Broadcasting before the menu applied would advertise a
       // state we might still 502 on; emitting after the push would put LINE's latency on the socket.

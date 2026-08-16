@@ -13,6 +13,7 @@ import {
   createE2eApp,
   prismaOf,
   ensureE2eOptions,
+  ensureTombstoneOptions,
   purgeE2eUsers,
   redisOf,
   waitForRedis,
@@ -79,6 +80,8 @@ describe('Registration options admin CRUD (e2e)', () => {
     const passwordHash = await new PasswordService().hash(PASSWORD);
     // mustChangePassword: false — these fixtures are already-onboarded users. The model default
     // is TRUE (deny by default), so omitting it would gate every fixture into a 403.
+    // The delete path re-points holders to the tombstone rows, and refuses to run without them.
+    await ensureTombstoneOptions(prisma);
     const base = {
       passwordHash,
       mustChangePassword: false,

@@ -96,6 +96,8 @@ const LINE_USER_DTO_KEYS = [
   'richMenuType',
   'access',
   'followedAt',
+  // Beside followedAt on purpose: the submission date, null for a follower who never registered.
+  'registeredAt',
   'registration',
 ].sort();
 
@@ -106,12 +108,19 @@ interface Session {
   cookie: string;
 }
 
+/**
+ * The wire shape since REALTIME-1: the row, plus WHO changed it. `actor` is null when nobody
+ * operated — a LINE user following, or editing their own registration through LIFF.
+ */
 interface LineUserEvent {
-  id: string;
-  lineUserId: string;
-  access: AppAccess;
-  displayName: string | null;
-  registration: unknown;
+  user: {
+    id: string;
+    lineUserId: string;
+    access: AppAccess;
+    displayName: string | null;
+    registration: unknown;
+  };
+  actor: { id: string; name: string } | null;
 }
 
 /** engine.io-client surfaces an engine-level rejection as a transport error, not a namespace code. */
@@ -586,18 +595,31 @@ describe('Realtime gateway (e2e)', () => {
         onSuper,
       ]);
 
-      // The payload is the row, not a notification: byte-identical to the PATCH's own response.
-      expect(adminPayload).toEqual(res.body);
-      expect(adminPayload.id).toBe(lineUserId);
-      expect(adminPayload.lineUserId).toBe(`${LU_PREFIX}subject`);
-      expect(adminPayload.access).toBe(AppAccess.ALLOWED);
-      expect(adminPayload.registration).toBeNull();
+      // The payload wraps the row: `{ user, actor }` since REALTIME-1. `user` is still
+      // byte-identical to the PATCH's own response.
+      expect(adminPayload.user).toEqual(res.body);
+      expect(adminPayload.user.id).toBe(lineUserId);
+      expect(adminPayload.user.lineUserId).toBe(`${LU_PREFIX}subject`);
+      expect(adminPayload.user.access).toBe(AppAccess.ALLOWED);
+      expect(adminPayload.user.registration).toBeNull();
+
+      // REALTIME-1: who did it, end to end — the operator who sent the PATCH, by name, so the
+      // screen can say more than "someone".
+      // Asserted by SHAPE rather than with `expect.any`, which is typed `any` and trips the
+      // no-unsafe-assignment rule. The exact key set is the point anyway: the payload carries the
+      // operator's id and name and NOTHING else — not their role, which the service narrows away.
+      expect(Object.keys(adminPayload.actor ?? {}).sort()).toEqual([
+        'id',
+        'name',
+      ]);
+      expect(typeof adminPayload.actor?.id).toBe('string');
+      expect(adminPayload.actor?.name).toBe('E2E ADMIN');
 
       // X2: every admin in the namespace gets it — there are no rooms.
       expect(superPayload).toEqual(adminPayload);
 
       // AC-B13: the exact key set, so nothing that is not on the DTO can ever reach the wire.
-      expect(Object.keys(adminPayload).sort()).toEqual(LINE_USER_DTO_KEYS);
+      expect(Object.keys(adminPayload.user).sort()).toEqual(LINE_USER_DTO_KEYS);
       const serialised = JSON.stringify(adminPayload);
       expect(serialised).not.toContain('deletedAt');
       expect(serialised).not.toContain('rejectionReason');
@@ -734,7 +756,7 @@ describe('Realtime gateway (e2e)', () => {
         .set('x-csrf-token', admin.token)
         .send({ access: AppAccess.BLOCKED })
         .expect(200);
-      expect((await updated).access).toBe(AppAccess.BLOCKED);
+      expect((await updated).user.access).toBe(AppAccess.BLOCKED);
     });
   });
 });
