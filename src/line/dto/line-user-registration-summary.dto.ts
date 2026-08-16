@@ -38,20 +38,4 @@ export class LineUserRegistrationSummaryDto {
     description: 'Resolved personnel-role name.',
   })
   personnelRole!: string;
-
-  /**
-   * When the registration was SUBMITTED. ISO-8601.
-   *
-   * ⚠️ NOT `LineUser.followedAt`, which is the day they added the Official Account as a friend.
-   * The two differ by however long someone took to fill in the form, and the registration screen
-   * shows this one under `วันที่ลงทะเบียน`. That a row with no registration shows a dash there,
-   * rather than a date, is the visible proof they are different fields: everyone has a follow
-   * date, and only registered people have this one.
-   */
-  @ApiProperty({
-    example: '2026-08-06T09:15:00.000Z',
-    description:
-      'When the registration was submitted (NOT the LINE follow date).',
-  })
-  createdAt!: string;
 }

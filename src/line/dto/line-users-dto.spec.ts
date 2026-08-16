@@ -60,8 +60,28 @@ describe('ListLineUsersQueryDto (through the global ValidationPipe)', () => {
   });
 
   it('rejects an unknown query param (AC-B3)', async () => {
-    const messages = await messagesOf({ sort: 'name' });
-    expect(messages.join(' ')).toContain('property sort should not exist');
+    // This used to probe with `sort`, which became a REAL parameter on 2026-08-16 — at which point
+    // the test was asserting that a supported feature is rejected. Probing with a key nobody will
+    // ever implement keeps it testing forbidNonWhitelisted instead of the parameter list.
+    const messages = await messagesOf({ nonsenseParam: 'x' });
+    expect(messages.join(' ')).toContain(
+      'property nonsenseParam should not exist',
+    );
+  });
+
+  it.each(['new', 'old', 'name'])('accepts sort=%s', async (value) => {
+    await expect(validate({ sort: value })).resolves.toMatchObject({
+      sort: value,
+    });
+  });
+
+  it("defaults sort to 'new' when absent", async () => {
+    await expect(validate({})).resolves.toMatchObject({ sort: 'new' });
+  });
+
+  it('rejects an unknown sort value', async () => {
+    const messages = await messagesOf({ sort: 'sideways' });
+    expect(messages.join(' ')).toMatch(/sort/);
   });
 
   it('rejects an invalid access value (AC-B5)', async () => {

@@ -103,6 +103,75 @@ const EXTENSION_MARKER = /\s*(?:ต่อ|ext\.?|#)\s*/i;
 export const toPhoneDigits = (phone: string): string =>
   phone.split(EXTENSION_MARKER)[0].replace(/\D/g, '');
 
+/** Digits only, for comparing a typed query against `phoneDigits`. */
+const digitsOnly = (s: string): string => s.replace(/\D/g, '');
+
+/**
+ * The back-office list's search filter: ONE box, six fields (LU-SEARCH-1).
+ *
+ * The screen's placeholder names ชื่อ–สกุล, ชื่อไลน์, ตำแหน่ง, กลุ่ม/ฝ่าย and เบอร์โทรศัพท์, so all
+ * five are read here. A box that quietly ignores the field someone typed answers "not found" and
+ * sends them hunting for a record that is on the screen in front of them.
+ *
+ * The sixth is `phoneDigits`, and it is gated at THREE digits rather than one. An operator typing
+ * a name types letters, but "0" or "08" as a phone fragment matches almost every row and would
+ * bury the fields they actually meant. Three digits is the shortest query that carries intent.
+ */
+function buildSearchFilter(search?: string): Prisma.LineUserWhereInput {
+  const q = search?.trim();
+  if (!q) return {};
+
+  const like = { contains: q, mode: 'insensitive' } as const;
+  const OR: Prisma.LineUserWhereInput[] = [
+    { displayName: like },
+    { registration: { firstName: like } },
+    { registration: { lastName: like } },
+    { registration: { phone: like } },
+    { registration: { personnelRole: { name: like } } },
+    { registration: { department: { name: like } } },
+  ];
+
+  const digits = digitsOnly(q);
+  if (digits.length >= 3) {
+    OR.push({ registration: { phoneDigits: { contains: digits } } });
+  }
+  return { OR };
+}
+
+/**
+ * The three orderings the screen offers, plus the rule that makes them honest.
+ *
+ * ⚠️ ROWS WITH NO REGISTRATION SORT LAST IN BOTH DIRECTIONS. "Has no date" is not "is the oldest",
+ * and this is why `registeredAt` is a scalar on `LineUser` rather than a reach through the
+ * relation: Prisma accepts `nulls` only on a nullable scalar of the model being ordered. Ordering
+ * through the relation instead would leave Postgres's defaults in charge — NULLs FIRST on DESC —
+ * and `new` is the DEFAULT sort, so every follower who never registered would sit ABOVE the
+ * pending approval queue on the screen's opening view.
+ *
+ * The `id` tiebreak is MANDATORY on every branch: none of these keys is unique, and without it
+ * rows can repeat or vanish between pages.
+ */
+function buildOrderBy(
+  sort: 'new' | 'old' | 'name',
+): Prisma.LineUserOrderByWithRelationInput[] {
+  if (sort === 'name') {
+    // Ordered by the REGISTERED name, which is the name the screen shows — not `displayName`,
+    // which is whatever the person set on LINE. ⚠️ Thai collation is the database's to apply: a
+    // non-Thai collation files เชิดศักดิ์ under เ rather than ช, because leading vowels are
+    // written before the consonant they follow. ASC through the relation already puts the
+    // registration-less rows last, which is the rule above.
+    return [
+      { registration: { lastName: 'asc' } },
+      { registration: { firstName: 'asc' } },
+      { id: 'asc' },
+    ];
+  }
+  return [
+    { registeredAt: { sort: sort === 'old' ? 'asc' : 'desc', nulls: 'last' } },
+    { id: 'desc' },
+  ];
+}
+
 /**
  * THE one definition of "a publicly visible LineUser" — exactly the `LineUserResponseDto` fields.
  * Kept explicit so the DTO stays the response boundary (never `deletedAt`/`language`/audit columns),
@@ -119,6 +188,7 @@ export const LINE_USER_PUBLIC_FIELDS = {
   richMenuType: true,
   access: true,
   followedAt: true,
+  registeredAt: true,
   registration: {
     select: {
       firstName: true,
@@ -128,9 +198,6 @@ export const LINE_USER_PUBLIC_FIELDS = {
       personnelRoleId: true,
       department: { select: { name: true } },
       personnelRole: { select: { name: true } },
-      // The `วันที่ลงทะเบียน` column, and the key BOTH date sort modes order by. Not interchangeable
-      // with `followedAt` above: that is the day they added the OA as a friend (LU-REGDATE-1).
-      createdAt: true,
     },
   },
 } as const;
@@ -482,7 +549,10 @@ export class LineUserService {
 
           const updated = await tx.lineUser.update({
             where: { id: user.id },
-            data: { access: 'PENDING' },
+            // `registeredAt` is written HERE, in the same transaction as the registration row, so
+            // "has a registration" and "has a submission date" can never disagree. Written once:
+            // a later self-edit or admin correction does not move it.
+            data: { access: 'PENDING', registeredAt: created.createdAt },
             select: { access: true },
           });
 
@@ -630,14 +700,12 @@ export class LineUserService {
     limit,
     search,
     access,
+    sort = 'new',
   }: ListLineUsersQueryDto): Promise<PaginatedLineUsersResponseDto> {
-    const trimmed = search?.trim();
     const where: Prisma.LineUserWhereInput = {
       deletedAt: null, // AC-B6 — soft-deleted rows never appear, in data or in total.
       ...(access ? { access } : {}),
-      ...(trimmed
-        ? { displayName: { contains: trimmed, mode: 'insensitive' } }
-        : {}),
+      ...buildSearchFilter(search),
     };
 
     const [rows, total] = await this.prisma.$transaction(
@@ -645,9 +713,7 @@ export class LineUserService {
         this.prisma.lineUser.findMany({
           where,
           select: LINE_USER_PUBLIC_FIELDS,
-          // The `id` tiebreak is MANDATORY — `followedAt` is not unique, and without it rows can
-          // repeat or vanish across pages.
-          orderBy: [{ followedAt: 'desc' }, { id: 'desc' }],
+          orderBy: buildOrderBy(sort),
           skip: (page - 1) * limit,
           take: limit,
         }),
@@ -894,6 +960,7 @@ export class LineUserService {
       richMenuType: user.richMenuType,
       access: user.access,
       followedAt: user.followedAt.toISOString(),
+      registeredAt: user.registeredAt?.toISOString() ?? null,
       registration: user.registration
         ? {
             firstName: user.registration.firstName,
@@ -903,7 +970,6 @@ export class LineUserService {
             department: user.registration.department.name,
             personnelRoleId: user.registration.personnelRoleId,
             personnelRole: user.registration.personnelRole.name,
-            createdAt: user.registration.createdAt.toISOString(),
           }
         : null,
     };

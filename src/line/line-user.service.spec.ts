@@ -127,6 +127,9 @@ describe('LineUserService', () => {
     richMenuType: 'TYPE_1',
     access: AppAccess.PENDING,
     followedAt: new Date('2026-07-07T10:00:00.000Z'),
+    // No registration on this fixture, so no submission date — which is exactly the row the
+    // screen renders with a dash, and the row that must sort LAST in both date directions.
+    registeredAt: null,
     registration: null,
   };
 
@@ -378,7 +381,12 @@ describe('LineUserService', () => {
       );
       expect(tx.lineUser.update).toHaveBeenCalledWith({
         where: { id: 'lu-1' },
-        data: { access: AppAccess.PENDING },
+        // The submission date is stamped in the SAME transaction as the registration row, from the
+        // row's own createdAt — so "has a registration" and "has a date" cannot disagree.
+        data: {
+          access: AppAccess.PENDING,
+          registeredAt: OWNER_REGISTRATION_ROW.createdAt,
+        },
         select: { access: true },
       });
       expect(result.access).toBe(AppAccess.PENDING);
@@ -805,7 +813,13 @@ describe('LineUserService', () => {
       expect(lineUser.findMany).toHaveBeenCalledWith({
         where: { deletedAt: null },
         select: LINE_USER_PUBLIC_FIELDS,
-        orderBy: [{ followedAt: 'desc' }, { id: 'desc' }],
+        // Default sort = newest registration first, with the registration-less rows LAST.
+        // `nulls: 'last'` is the whole reason `registeredAt` is a scalar here: Postgres would
+        // otherwise put NULLs FIRST on DESC and float every unregistered follower above the queue.
+        orderBy: [
+          { registeredAt: { sort: 'desc', nulls: 'last' } },
+          { id: 'desc' },
+        ],
         skip: 20,
         take: 20,
       });
@@ -821,6 +835,7 @@ describe('LineUserService', () => {
         richMenuType: 'TYPE_1',
         access: AppAccess.PENDING,
         followedAt: '2026-07-07T10:00:00.000Z',
+        registeredAt: null,
         registration: null,
       });
       expect(result.meta).toEqual({
@@ -864,9 +879,6 @@ describe('LineUserService', () => {
         department: 'Computer Science',
         personnelRoleId: 2,
         personnelRole: 'Teacher',
-        // Serialised from the registration's own createdAt — NOT `followedAt`, which this fixture
-        // deliberately sets to a different day (2026-07-07) so the two cannot be confused.
-        createdAt: '2026-07-09T04:30:00.000Z',
       });
     });
 
@@ -878,17 +890,92 @@ describe('LineUserService', () => {
       });
     });
 
-    it('adds a case-insensitive displayName contains when search is a non-empty trimmed string (AC-B4)', async () => {
+    it('searches ALL five screen fields, case-insensitively, on a trimmed term (AC-B4/LU-SEARCH-1)', async () => {
       $transaction.mockResolvedValue([[], 0]);
 
       await service.findManyPaginated({ page: 1, limit: 20, search: '  ali ' });
 
+      const like = { contains: 'ali', mode: 'insensitive' };
       expect(lineUser.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: {
             deletedAt: null,
-            displayName: { contains: 'ali', mode: 'insensitive' },
+            // The screen's placeholder names five fields; a box that reads fewer answers
+            // "not found" for a record the operator can see.
+            OR: [
+              { displayName: like },
+              { registration: { firstName: like } },
+              { registration: { lastName: like } },
+              { registration: { phone: like } },
+              { registration: { personnelRole: { name: like } } },
+              { registration: { department: { name: like } } },
+            ],
           },
+        }),
+      );
+    });
+
+    it('a term of >= 3 digits ALSO matches the separator-free phone (LU-SEARCH-1)', async () => {
+      $transaction.mockResolvedValue([[], 0]);
+
+      await service.findManyPaginated({
+        page: 1,
+        limit: 20,
+        search: '081-234',
+      });
+
+      const [[args]] = lineUser.findMany.mock.calls as [
+        [{ where: { OR: Record<string, any>[] } }],
+      ];
+      expect(args.where.OR).toContainEqual({
+        registration: { phoneDigits: { contains: '081234' } },
+      });
+    });
+
+    it('a term of < 3 digits does NOT add the phoneDigits clause', async () => {
+      $transaction.mockResolvedValue([[], 0]);
+
+      // "08" matches nearly every Thai mobile number and would bury the fields the operator meant.
+      await service.findManyPaginated({ page: 1, limit: 20, search: '08' });
+
+      const [[args]] = lineUser.findMany.mock.calls as [
+        [{ where: { OR: Record<string, any>[] } }],
+      ];
+      expect(JSON.stringify(args.where.OR)).not.toContain('phoneDigits');
+    });
+
+    it.each([
+      ['old', { registeredAt: { sort: 'asc', nulls: 'last' } }],
+      ['new', { registeredAt: { sort: 'desc', nulls: 'last' } }],
+    ])(
+      'sort=%s orders by the registration date with the dateless rows LAST',
+      async (sort, first) => {
+        $transaction.mockResolvedValue([[], 0]);
+
+        await service.findManyPaginated({
+          page: 1,
+          limit: 20,
+          sort: sort as 'new' | 'old',
+        });
+
+        expect(lineUser.findMany).toHaveBeenCalledWith(
+          expect.objectContaining({ orderBy: [first, { id: 'desc' }] }),
+        );
+      },
+    );
+
+    it('sort=name orders by the REGISTERED name, not the LINE display name', async () => {
+      $transaction.mockResolvedValue([[], 0]);
+
+      await service.findManyPaginated({ page: 1, limit: 20, sort: 'name' });
+
+      expect(lineUser.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: [
+            { registration: { lastName: 'asc' } },
+            { registration: { firstName: 'asc' } },
+            { id: 'asc' },
+          ],
         }),
       );
     });
@@ -1823,6 +1910,7 @@ describe('LineUserService', () => {
       richMenuType: 'TYPE_1',
       access: AppAccess.PENDING,
       followedAt: '2026-07-07T10:00:00.000Z',
+      registeredAt: null,
       registration: null,
     };
 

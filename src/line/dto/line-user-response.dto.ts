@@ -32,6 +32,23 @@ export class LineUserResponseDto {
   @ApiProperty({ example: '2026-07-07T10:00:00.000Z' })
   followedAt!: string;
 
+  /**
+   * When the user SUBMITTED their registration, or `null` if they never did — which is what the
+   * back-office table renders as a dash under `วันที่ลงทะเบียน`.
+   *
+   * ⚠️ Read this and NOT `followedAt` for that column. `followedAt` is the day they added the
+   * Official Account as a friend, and every follower has one; only registered people have this.
+   * It is also the key the list's two date sort modes order by.
+   */
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    example: '2026-07-09T04:30:00.000Z',
+    description:
+      'Registration submission date, or null for a follower who never registered. NOT followedAt.',
+  })
+  registeredAt!: string | null;
+
   @ApiProperty({
     type: LineUserRegistrationSummaryDto,
     nullable: true,

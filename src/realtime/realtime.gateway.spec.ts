@@ -45,6 +45,9 @@ const dto: LineUserResponseDto = {
   richMenuType: 'TYPE_1',
   access: 'PENDING',
   followedAt: '2026-07-07T10:00:00.000Z',
+  // Deliberately a DIFFERENT day from followedAt: the payload carries the day the form was
+  // submitted, not the day they followed the OA.
+  registeredAt: '2026-07-09T04:30:00.000Z',
   registration: {
     firstName: 'Somchai',
     lastName: 'Jaidee',
@@ -53,9 +56,6 @@ const dto: LineUserResponseDto = {
     department: 'Computer Science',
     personnelRoleId: 2,
     personnelRole: 'Teacher',
-    // Deliberately NOT equal to `followedAt` above: the payload carries the day the form was
-    // submitted, not the day they followed the OA.
-    createdAt: '2026-07-09T04:30:00.000Z',
   },
 };
 

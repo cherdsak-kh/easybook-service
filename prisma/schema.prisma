@@ -53,6 +53,26 @@ model LineUser {
   rejectionReason String?
 
   followedAt    DateTime     @default(now())
+
+  /// When this user SUBMITTED their registration. NULL until they do — which is what makes the
+  /// registration screen show a dash under `วันที่ลงทะเบียน` for a follower who never registered.
+  ///
+  /// ⚠️ NOT `followedAt`. That is the day they added the OA as a friend; these differ by however
+  /// long someone took to fill in the form.
+  ///
+  /// Why it lives HERE and not just on `LineUserRegistration.createdAt` (which also records it):
+  /// the back-office list sorts by this, and rows without a registration must sort LAST in BOTH
+  /// directions — "has no date" is not "is the oldest". `NULLS LAST` is expressible in Prisma only
+  /// on a nullable SCALAR of the model being ordered, never through a to-one relation (verified
+  /// against the generated types). Without this column the DEFAULT ordering — newest first — would
+  /// put every unregistered follower ABOVE the pending approval queue, because Postgres sorts NULLs
+  /// FIRST on DESC. That is the exact opposite of what a queue is for.
+  ///
+  /// Written ONCE, in the same transaction that creates the registration and flips access to
+  /// PENDING. A self-edit or an admin correction does NOT move it: it is the submission date, not
+  /// the last-touched date.
+  registeredAt  DateTime?
+
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
   deletedAt     DateTime?
@@ -66,6 +86,8 @@ model LineUser {
   registration LineUserRegistration? @relation("LineUserToRegistration")
 
   @@index([deletedAt])
+  /// The list's default ordering key.
+  @@index([registeredAt])
   @@map("line_users")
 }
 
