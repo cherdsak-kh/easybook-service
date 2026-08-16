@@ -75,6 +75,27 @@ export const RESERVED_DEPARTMENT_NAME = 'ผู้พัฒนาระบบ (S
 export const RESERVED_PERSONNEL_ROLE_NAME =
   'ผู้ดูแลระบบระดับสูง (System Administrator)';
 
+/**
+ * The TOMBSTONE rows: where the holders of a deleted option are re-pointed (OPT-FALLBACK-1).
+ *
+ * `departmentId` and `personnelRoleId` are REQUIRED FKs on both `SystemUser` and
+ * `LineUserRegistration`, so "the option they held was deleted" is not a state the database can
+ * hold — there is no null to move them to. Something has to receive them, it has to exist before
+ * the first delete rather than be conjured during one, and it must never be assignable, or an
+ * admin could file a real person under "not found" from a dropdown.
+ *
+ * Reserved is exactly that property and it already exists, so these are ordinary reserved rows and
+ * this script stays the only writer of `isSystemReserved: true` in the codebase. They are seeded
+ * here and not in `options:seed` for the same reason the two above are: that command must never
+ * write the flag.
+ *
+ * ⚠️ The names are DELIBERATELY not a euphemism. An operator reading a staff row that says
+ * "ไม่พบตำแหน่ง" is being told the truth — the option that row pointed at was deleted — and any
+ * softer wording would read as a real job title and hide it.
+ */
+export const TOMBSTONE_DEPARTMENT_NAME = 'ไม่พบกลุ่ม/ฝ่าย';
+export const TOMBSTONE_PERSONNEL_ROLE_NAME = 'ไม่พบตำแหน่ง';
+
 /** Max re-prompts per field, so a non-interactive edge case cannot spin forever. */
 const MAX_ATTEMPTS = 3;
 
@@ -379,6 +400,16 @@ export async function createSuperAdmin(
   // uniqueness is a PARTIAL index (`WHERE deletedAt IS NULL`), which upsert cannot express.
   const personnelRoleId = await resolveOrCreateReservedPersonnelRole(prisma);
   const departmentId = await resolveOrCreateReservedDepartment(prisma);
+
+  // The tombstones (OPT-FALLBACK-1). Same helpers, different names — resolve-or-create is already
+  // idempotent, so running this script again adopts the existing rows rather than duplicating them.
+  // Seeded here rather than on first use because a delete that has to CREATE its own destination
+  // fails at the worst possible moment: mid-transaction, with holders already counted.
+  await resolveOrCreateReservedPersonnelRole(
+    prisma,
+    TOMBSTONE_PERSONNEL_ROLE_NAME,
+  );
+  await resolveOrCreateReservedDepartment(prisma, TOMBSTONE_DEPARTMENT_NAME);
 
   const isReset = existing > 0;
 
