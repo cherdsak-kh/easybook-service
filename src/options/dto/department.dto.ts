@@ -48,4 +48,20 @@ export class DepartmentResponseDto {
 
   @ApiProperty({ example: '2026-07-14T10:00:00.000Z' })
   updatedAt!: string;
+
+  /**
+   * How many people currently hold this option — back-office staff AND LINE registrations added
+   * together, because they draw from the same table and "who holds this" is one question.
+   *
+   * ⚠️ Soft-deleted holders are NOT counted, but they ARE re-pointed when the option is deleted.
+   * The number answers "how many people will an operator see move", which is what the delete
+   * confirmation needs; the re-point has to touch every referencing row regardless, because the
+   * foreign key is required whether or not a row is visible.
+   */
+  @ApiProperty({
+    example: 12,
+    description:
+      'Holders of this option (staff + registrations), excluding soft-deleted ones.',
+  })
+  holderCount!: number;
 }

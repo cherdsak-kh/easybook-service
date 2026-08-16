@@ -2,6 +2,7 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
+import { TOMBSTONE_ROW_MISSING } from './options.constants';
 import { OPTION_NAME_TAKEN, OPTION_NOT_FOUND } from './options.errors';
 import { OptionsService } from './options.service';
 
@@ -11,6 +12,9 @@ const ROW = {
   isSystemReserved: false,
   createdAt: new Date('2026-07-14T10:00:00.000Z'),
   updatedAt: new Date('2026-07-14T10:00:00.000Z'),
+  // BOTH populations: these tables are shared between back-office staff and LINE registrations,
+  // so a count of one understates a delete's blast radius by exactly the other.
+  _count: { systemUsers: 2, registrations: 3 },
 };
 
 const p2002 = () =>
@@ -34,6 +38,13 @@ describe('OptionsService', () => {
     create: jest.fn(),
     update: jest.fn(),
   };
+  const systemUser = { updateMany: jest.fn() };
+  const lineUserRegistration = { updateMany: jest.fn() };
+  // The interactive form: run the callback against the same mocks, so the assertions below see the
+  // statements the transaction would actually issue.
+  const $transaction = jest.fn((cb: (tx: unknown) => unknown) =>
+    cb({ department, personnelRole, systemUser, lineUserRegistration }),
+  );
 
   beforeEach(async () => {
     jest.clearAllMocks();
@@ -42,7 +53,13 @@ describe('OptionsService', () => {
         OptionsService,
         {
           provide: PrismaService,
-          useValue: { department, personnelRole },
+          useValue: {
+            department,
+            personnelRole,
+            systemUser,
+            lineUserRegistration,
+            $transaction,
+          },
         },
       ],
     }).compile();
@@ -65,6 +82,12 @@ describe('OptionsService', () => {
           isSystemReserved: true,
           createdAt: true,
           updatedAt: true,
+          _count: {
+            select: {
+              systemUsers: { where: { deletedAt: null } },
+              registrations: { where: { deletedAt: null } },
+            },
+          },
         },
         orderBy: { name: 'asc' },
       });
@@ -75,6 +98,9 @@ describe('OptionsService', () => {
           isSystemReserved: false,
           createdAt: '2026-07-14T10:00:00.000Z',
           updatedAt: '2026-07-14T10:00:00.000Z',
+          // OPT-COUNT-1: the two populations arrive as separate aggregates and reach the screen
+          // as ONE number, because "who holds this option" is one question.
+          holderCount: 5,
         },
       ]);
     });
@@ -101,6 +127,12 @@ describe('OptionsService', () => {
             isSystemReserved: true,
             createdAt: true,
             updatedAt: true,
+            _count: {
+              select: {
+                systemUsers: { where: { deletedAt: null } },
+                registrations: { where: { deletedAt: null } },
+              },
+            },
           },
         }),
       );
@@ -130,6 +162,12 @@ describe('OptionsService', () => {
           isSystemReserved: true,
           createdAt: true,
           updatedAt: true,
+          _count: {
+            select: {
+              systemUsers: { where: { deletedAt: null } },
+              registrations: { where: { deletedAt: null } },
+            },
+          },
         },
         orderBy: { name: 'asc' },
       });
@@ -147,6 +185,12 @@ describe('OptionsService', () => {
           isSystemReserved: true,
           createdAt: true,
           updatedAt: true,
+          _count: {
+            select: {
+              systemUsers: { where: { deletedAt: null } },
+              registrations: { where: { deletedAt: null } },
+            },
+          },
         },
         orderBy: { name: 'asc' },
       });
@@ -175,6 +219,12 @@ describe('OptionsService', () => {
           isSystemReserved: true,
           createdAt: true,
           updatedAt: true,
+          _count: {
+            select: {
+              systemUsers: { where: { deletedAt: null } },
+              registrations: { where: { deletedAt: null } },
+            },
+          },
         },
       });
       expect(result.name).toBe('Computer Science');
@@ -210,6 +260,12 @@ describe('OptionsService', () => {
           isSystemReserved: true,
           createdAt: true,
           updatedAt: true,
+          _count: {
+            select: {
+              systemUsers: { where: { deletedAt: null } },
+              registrations: { where: { deletedAt: null } },
+            },
+          },
         },
       });
       expect(result.name).toBe('Renamed');
@@ -250,14 +306,62 @@ describe('OptionsService', () => {
     });
 
     it('sets deletedAt (soft delete), never a hard delete', async () => {
-      personnelRole.findFirst.mockResolvedValue({ id: 1 });
+      personnelRole.findFirst
+        .mockResolvedValueOnce({ id: 1 }) // the target
+        .mockResolvedValueOnce({ id: 99 }); // the tombstone
       personnelRole.update.mockResolvedValue({ ...ROW });
+      systemUser.updateMany.mockResolvedValue({ count: 2 });
+      lineUserRegistration.updateMany.mockResolvedValue({ count: 3 });
+
       await service.softDelete('personnelRole', 1);
+
       const [arg] = personnelRole.update.mock.calls[0] as [
         { where: Record<string, unknown>; data: { deletedAt: unknown } },
       ];
       expect(arg.where).toEqual({ id: 1 });
       expect(arg.data.deletedAt).toBeInstanceOf(Date);
+    });
+
+    it('OPT-FALLBACK-1 — moves BOTH holder populations to the tombstone BEFORE deleting', async () => {
+      personnelRole.findFirst
+        .mockResolvedValueOnce({ id: 1 })
+        .mockResolvedValueOnce({ id: 99 });
+      personnelRole.update.mockResolvedValue({ ...ROW });
+      systemUser.updateMany.mockResolvedValue({ count: 2 });
+      lineUserRegistration.updateMany.mockResolvedValue({ count: 3 });
+
+      await service.softDelete('personnelRole', 1);
+
+      // Staff AND registrations — moving one and not the other is the same bug, half done.
+      expect(systemUser.updateMany).toHaveBeenCalledWith({
+        where: { personnelRoleId: 1 },
+        data: { personnelRoleId: 99 },
+      });
+      expect(lineUserRegistration.updateMany).toHaveBeenCalledWith({
+        where: { personnelRoleId: 1 },
+        data: { personnelRoleId: 99 },
+      });
+
+      // Order is the point: deleting first leaves rows pointing at a deleted option.
+      expect(systemUser.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+        personnelRole.update.mock.invocationCallOrder[0],
+      );
+      // ...and both statements are in ONE transaction, so a failure between them cannot persist.
+      expect($transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses to delete at all when the tombstone row is missing', async () => {
+      personnelRole.findFirst
+        .mockResolvedValueOnce({ id: 1 }) // the target exists
+        .mockResolvedValueOnce(null); // the seed never ran
+
+      await expect(service.softDelete('personnelRole', 1)).rejects.toThrow(
+        TOMBSTONE_ROW_MISSING,
+      );
+      // Deleting anyway would leave live rows pointing at a soft-deleted option, with no record
+      // of which ones they were.
+      expect(personnelRole.update).not.toHaveBeenCalled();
+      expect(systemUser.updateMany).not.toHaveBeenCalled();
     });
 
     it('AC-B8 — excludes reserved rows from the target lookup, so deleting one is a 404', async () => {

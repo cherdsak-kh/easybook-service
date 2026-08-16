@@ -56,6 +56,10 @@ import { Logger } from '@nestjs/common';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Prisma, PrismaClient, SystemRole } from '@prisma/client';
 import { PasswordService } from '../src/auth/password.service';
+import {
+  TOMBSTONE_DEPARTMENT_NAME,
+  TOMBSTONE_PERSONNEL_ROLE_NAME,
+} from '../src/options/options.constants';
 
 const logger = new Logger('CreateSuperAdmin');
 
@@ -93,8 +97,10 @@ export const RESERVED_PERSONNEL_ROLE_NAME =
  * "ไม่พบตำแหน่ง" is being told the truth — the option that row pointed at was deleted — and any
  * softer wording would read as a real job title and hide it.
  */
-export const TOMBSTONE_DEPARTMENT_NAME = 'ไม่พบกลุ่ม/ฝ่าย';
-export const TOMBSTONE_PERSONNEL_ROLE_NAME = 'ไม่พบตำแหน่ง';
+export {
+  TOMBSTONE_DEPARTMENT_NAME,
+  TOMBSTONE_PERSONNEL_ROLE_NAME,
+} from '../src/options/options.constants';
 
 /** Max re-prompts per field, so a non-interactive edge case cannot spin forever. */
 const MAX_ATTEMPTS = 3;
