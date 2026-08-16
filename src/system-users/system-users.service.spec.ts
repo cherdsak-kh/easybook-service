@@ -23,8 +23,16 @@ import { PUBLIC_FIELDS } from './system-users.fields';
 import { CANNOT_RESET_OWN_PASSWORD } from './system-users.policy';
 import type { Actor } from './system-users.policy';
 
-const SUPER_ADMIN_ACTOR: Actor = { id: 'sa-1', role: SystemRole.SUPER_ADMIN };
-const ADMIN_ACTOR: Actor = { id: 'ad-1', role: SystemRole.ADMIN };
+const SUPER_ADMIN_ACTOR: Actor = {
+  id: 'sa-1',
+  role: SystemRole.SUPER_ADMIN,
+  createdById: null,
+};
+const ADMIN_ACTOR: Actor = {
+  id: 'ad-1',
+  role: SystemRole.ADMIN,
+  createdById: null,
+};
 
 const row = {
   id: 'sa-2',

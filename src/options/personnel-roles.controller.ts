@@ -44,6 +44,9 @@ import { OptionsService } from './options.service';
 const actorOf = (user: AuthenticatedSystemUser): Actor => ({
   id: user.id,
   role: user.role,
+  // `createdBy` is the resolved object; the policy wants the id. It is selected WITHOUT any filter
+  // (DD-4), so a soft-deleted creator still resolves and STAFF-CREATOR-1 still fires for them.
+  createdById: user.createdBy?.id ?? null,
 });
 
 /**

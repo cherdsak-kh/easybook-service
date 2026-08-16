@@ -5,6 +5,7 @@ import {
   CANNOT_CHANGE_OWN_ACTIVE_STATUS,
   CANNOT_CHANGE_OWN_ROLE,
   CANNOT_DELETE_OWN_ACCOUNT,
+  CANNOT_MANAGE_OWN_CREATOR,
   INSUFFICIENT_ROLE,
   ONLY_SUPER_ADMIN_MAY_CHANGE_ROLE,
   ONLY_SUPER_ADMIN_MAY_DELETE,
@@ -12,6 +13,7 @@ import {
   Target,
   canDelete,
   canPatch,
+  canResetPassword,
   mayUseSystemReservedOptions,
 } from './system-users.policy';
 
@@ -21,7 +23,13 @@ const ROLES = [
   SystemRole.VIEWER,
 ] as const;
 
-const actor = (role: SystemRole, id = 'actor'): Actor => ({ id, role });
+// `createdById` defaults to null — nobody created this actor — so STAFF-CREATOR-1 never fires
+// by accident in the matrices below. The tests that DO exercise it pass one explicitly.
+const actor = (
+  role: SystemRole,
+  id = 'actor',
+  createdById: string | null = null,
+): Actor => ({ id, role, createdById });
 const target = (role: SystemRole, id = 'target'): Target => ({ id, role });
 
 const PROFILE_ONLY: Patch = {};
@@ -390,6 +398,51 @@ describe('system-users.policy', () => {
 
   // ─────────────── mayUseSystemReservedOptions (02_design_log.md §3.3) ───────────────
 
+  describe('STAFF-CREATOR-1 — you may not manage the account that created you', () => {
+    // วีระ, created by เชิดศักดิ์. Both SUPER_ADMIN, i.e. peers in every other respect — which is
+    // exactly the situation the rule exists for.
+    const weera = actor(SystemRole.SUPER_ADMIN, 'weera', 'cherdsak');
+    const cherdsak = target(SystemRole.SUPER_ADMIN, 'cherdsak');
+
+    it.each([
+      ['patch', () => canPatch(weera, cherdsak, PROFILE_ONLY)],
+      ['delete', () => canDelete(weera, cherdsak)],
+      ['reset-password', () => canResetPassword(weera, cherdsak)],
+    ])('denies %s against the creator', (_name, call) => {
+      expect(call()).toEqual({
+        allowed: false,
+        reason: CANNOT_MANAGE_OWN_CREATOR,
+      });
+    });
+
+    it('binds SUPER_ADMIN — the rule is about provenance, not privilege', () => {
+      // The same call would otherwise hit `case SUPER_ADMIN`, which is a bare allow().
+      expect(canPatch(weera, cherdsak, PROFILE_ONLY).allowed).toBe(false);
+    });
+
+    it('is ONE HOP: the creator of your creator is still manageable', () => {
+      // ธีรพงษ์ created เชิดศักดิ์ created วีระ. วีระ may manage ธีรพงษ์ — deliberately, so the
+      // consequence is visible rather than assumed away.
+      const teerapong = target(SystemRole.SUPER_ADMIN, 'teerapong');
+      expect(canPatch(weera, teerapong, PROFILE_ONLY).allowed).toBe(true);
+    });
+
+    it('never fires for the bootstrapped first SUPER_ADMIN (null creator)', () => {
+      // Nobody created them, so there is nothing to protect — and a null must not match a
+      // null-ish target id by accident.
+      const first = actor(SystemRole.SUPER_ADMIN, 'first', null);
+      expect(canDelete(first, target(SystemRole.ADMIN, 'anyone')).allowed).toBe(
+        true,
+      );
+    });
+
+    it('does not deny an unrelated target', () => {
+      expect(
+        canDelete(weera, target(SystemRole.ADMIN, 'someone')).allowed,
+      ).toBe(true);
+    });
+  });
+
   describe('mayUseSystemReservedOptions', () => {
     it('AC-B13 — a SUPER_ADMIN may see and assign system-reserved options', () => {
       expect(mayUseSystemReservedOptions(actor(SystemRole.SUPER_ADMIN))).toBe(
@@ -416,9 +469,17 @@ describe('system-users.policy', () => {
     it('AC-B13 — depends ONLY on the role, never on the actor id', () => {
       // Pure, per this file's charter: no I/O, no target, no row.
       expect(
-        mayUseSystemReservedOptions({ id: 'a', role: SystemRole.SUPER_ADMIN }),
+        mayUseSystemReservedOptions({
+          id: 'a',
+          role: SystemRole.SUPER_ADMIN,
+          createdById: null,
+        }),
       ).toBe(
-        mayUseSystemReservedOptions({ id: 'b', role: SystemRole.SUPER_ADMIN }),
+        mayUseSystemReservedOptions({
+          id: 'b',
+          role: SystemRole.SUPER_ADMIN,
+          createdById: 'someone',
+        }),
       );
     });
   });

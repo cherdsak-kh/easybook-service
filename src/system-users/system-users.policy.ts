@@ -13,6 +13,14 @@ import { SystemRole } from '@prisma/client';
 export interface Actor {
   id: string;
   role: SystemRole;
+  /**
+   * The id of the account that CREATED this actor, or `null` for the bootstrapped first
+   * SUPER_ADMIN. Read only by `mayNotManageOwnCreator` — see it for why the policy needs it.
+   *
+   * Comes from `PUBLIC_FIELDS`' `createdBy` select (which carries no filter, by DD-4, so a
+   * soft-deleted creator still resolves and the rule still fires).
+   */
+  createdById: string | null;
 }
 
 export interface Target {
@@ -45,6 +53,32 @@ export const ONLY_SUPER_ADMIN_MAY_DELETE =
 export const INSUFFICIENT_ROLE = 'Insufficient role.';
 export const CANNOT_RESET_OWN_PASSWORD =
   'You cannot reset your own password. Use the change-password endpoint instead.';
+export const CANNOT_MANAGE_OWN_CREATOR =
+  'You cannot manage the account that created yours.';
+
+/**
+ * STAFF-CREATOR-1 — **you may not manage the account that created you.**
+ *
+ * Two SUPER_ADMINs are peers in every other respect, which means the account that installed the
+ * system can be demoted, suspended, deleted or password-reset by an account it created minutes
+ * earlier. `canPatch`'s `case SUPER_ADMIN` was a bare `allow()`, and `canDelete` only ever asked
+ * "is this me?".
+ *
+ * ⚠️ ONE HOP, exactly as specified: your creator, not your creator's creator. So in a chain where
+ * ธีรพงษ์ created เชิดศักดิ์ who created วีระ, วีระ may still manage ธีรพงษ์. That consequence is
+ * deliberately visible on the designed screen rather than hidden, so the PO can decide whether the
+ * rule should eventually walk the whole ancestor chain — which is a different rule with different
+ * costs, not an obvious extension of this one.
+ *
+ * Binds EVERY role, SUPER_ADMIN included: a rule that the most privileged role can skip is not a
+ * rule about privilege, and this one is about provenance.
+ *
+ * A `null` creator (the bootstrapped first SUPER_ADMIN) never matches, which is correct — nobody
+ * created them, so there is nothing to protect.
+ */
+function mayNotManageOwnCreator(actor: Actor, target: Target): boolean {
+  return actor.createdById !== null && actor.createdById === target.id;
+}
 
 /**
  * May this actor see and assign the SYSTEM-RESERVED options (the System Developer department /
@@ -77,6 +111,11 @@ export function canPatch(
   target: Target,
   patch: Patch,
 ): PolicyResult {
+  // ── STAFF-CREATOR-1. Before the matrix, because it binds every role including SUPER_ADMIN. ──
+  if (mayNotManageOwnCreator(actor, target)) {
+    return deny(CANNOT_MANAGE_OWN_CREATOR);
+  }
+
   // ── Step 5: self-mutation. Binds EVERY role, including SUPER_ADMIN. Evaluated FIRST. ──
   if (actor.id === target.id) {
     // Compare ids, never emails.
@@ -131,6 +170,9 @@ export function canPatch(
 
 export function canDelete(actor: Actor, target: Target): PolicyResult {
   if (actor.id === target.id) return deny(CANNOT_DELETE_OWN_ACCOUNT);
+  if (mayNotManageOwnCreator(actor, target)) {
+    return deny(CANNOT_MANAGE_OWN_CREATOR);
+  }
   // Unreachable: @Roles(SUPER_ADMIN) fires before the target is even loaded.
   if (actor.role !== SystemRole.SUPER_ADMIN)
     return deny(ONLY_SUPER_ADMIN_MAY_DELETE);
@@ -148,6 +190,11 @@ export function canDelete(actor: Actor, target: Target): PolicyResult {
  */
 export function canResetPassword(actor: Actor, target: Target): PolicyResult {
   if (actor.id === target.id) return deny(CANNOT_RESET_OWN_PASSWORD);
+  // Resetting your creator's password is the sharpest form of the thing STAFF-CREATOR-1 stops:
+  // it hands you their account, since the reset returns a temporary password to YOU.
+  if (mayNotManageOwnCreator(actor, target)) {
+    return deny(CANNOT_MANAGE_OWN_CREATOR);
+  }
   // Unreachable: @Roles(SUPER_ADMIN) fires before the target is even loaded. Defence in depth.
   if (actor.role !== SystemRole.SUPER_ADMIN) return deny(INSUFFICIENT_ROLE);
   return allow();
