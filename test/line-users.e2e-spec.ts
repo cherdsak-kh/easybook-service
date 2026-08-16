@@ -5,7 +5,10 @@ import request from 'supertest';
 import type { App } from 'supertest/types';
 import { PasswordService } from '../src/auth/password.service';
 import { API_BASE_PATH } from '../src/common/api.constants';
-import { ACCESS_NOTIFICATION_MESSAGES } from '../src/line/line-user.service';
+import {
+  ACCESS_NOTIFICATION_MESSAGES,
+  toPhoneDigits,
+} from '../src/line/line-user.service';
 import { LineService } from '../src/line/line.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import {
@@ -205,6 +208,7 @@ describe('LINE Users management (e2e)', () => {
         firstName: 'Bob',
         lastName: 'Allowed',
         phone: '081-000-0000',
+        phoneDigits: toPhoneDigits('081-000-0000'),
         departmentId: optionIds.departmentId,
         personnelRoleId: optionIds.personnelRoleId,
       },
@@ -813,6 +817,7 @@ describe('LINE Users management (e2e)', () => {
           firstName: 'Ghost',
           lastName: 'User',
           phone: '082-222-2222',
+          phoneDigits: toPhoneDigits('082-222-2222'),
           departmentId: optionIds.departmentId,
           personnelRoleId: optionIds.personnelRoleId,
         },

@@ -84,7 +84,24 @@ model LineUserRegistration {
   lastName  String
 
   /// Loosely validated in the DTO (Thai formats), mirroring SystemUser.phoneNumber. Stored as given.
+  /// "As given" is right for DISPLAY and useless for SEARCH — see phoneDigits below.
   phone String
+
+  /// `phone` with every non-digit removed, written by the service on every write of `phone` and
+  /// never by a client (absent from every DTO, so `forbidNonWhitelisted` 400s any attempt to send
+  /// it — the same construction that protects `isSystemReserved`).
+  ///
+  /// The registration screen searches by phone, and an operator reads a number off a form as
+  /// "0812345678" while the row holds "081-234-5678". Matching those means comparing digits to
+  /// digits, and `phone` cannot be normalised in place without destroying the formatting the
+  /// operator submitted. Derived columns are a cost — two fields that can disagree — and the
+  /// alternative was worse: `regexp_replace` inside `$queryRaw`, which puts the most complex query
+  /// in the system beyond Prisma's type checking and beyond any index.
+  ///
+  /// ⚠️ EXTENSIONS ARE TRUNCATED, NOT INCLUDED. "02-123-4567 ต่อ 101" stores `021234567`, not
+  /// `021234567101` — otherwise searching "101" would surface every number whose extension happens
+  /// to be 101, and an operator searching a phone number does not mean the extension.
+  phoneDigits String
 
   /// FK -> Department.id (an auto-increment Int). Required: every registration picks a department
   /// option (SC-2.4/Q4). `onDelete: Restrict` refuses a stray hard delete of a referenced option —
@@ -108,6 +125,13 @@ model LineUserRegistration {
   @@index([deletedAt])
   @@index([departmentId])
   @@index([personnelRoleId])
+  /// The registration screen's search box reads these three; `createdAt` is its default sort AND
+  /// the `วันที่ลงทะเบียน` column. Added now for one reason only: on an empty table an index costs
+  /// nothing, and after the first migration it is a lock on a table people are using. One school's
+  /// data does not need them for speed today.
+  @@index([phoneDigits])
+  @@index([lastName, firstName])
+  @@index([createdAt])
   @@map("line_user_registrations")
 }
 
@@ -283,5 +307,12 @@ model SystemUser {
   @@index([createdById])
   @@index([departmentId])
   @@index([personnelRoleId])
+  /// The staff screen filters by role and by status, and status is derived from `isActive` and
+  /// `mustChangePassword` rather than stored (STAFF-QUERY-1). `email` already has @unique, which
+  /// is an index, so the search half needs only the name. Same reasoning as the registration
+  /// indexes above: free on an empty table, a lock on a populated one.
+  @@index([role])
+  @@index([isActive])
+  @@index([lastName, firstName])
   @@map("system_users")
 }

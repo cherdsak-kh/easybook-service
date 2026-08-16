@@ -367,7 +367,13 @@ describe('LineUserService', () => {
 
       expect(tx.lineUserRegistration.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: { lineUserId: 'lu-1', ...VALID_DTO },
+          // `phoneDigits` is NOT in the DTO — it is derived on write, so it is the one field
+          // a spread of the caller's payload can never account for. Asserted by value.
+          data: {
+            lineUserId: 'lu-1',
+            ...VALID_DTO,
+            phoneDigits: '0812345678',
+          },
         }),
       );
       expect(tx.lineUser.update).toHaveBeenCalledWith({
@@ -565,6 +571,7 @@ describe('LineUserService', () => {
             firstName: 'Somchai',
             lastName: 'Jaidee',
             phone: '081-234-5678',
+            phoneDigits: '0812345678',
             departmentId: 1,
             personnelRoleId: 2,
           },
@@ -1603,6 +1610,7 @@ describe('LineUserService', () => {
             firstName: 'Edited',
             lastName: 'Name',
             phone: '099-999-9999',
+            phoneDigits: '0999999999',
             departmentId: 3,
             personnelRoleId: 4,
           },

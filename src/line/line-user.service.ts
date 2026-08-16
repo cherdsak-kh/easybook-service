@@ -81,6 +81,28 @@ export const ACCESS_NOTIFICATION_MESSAGES: Record<AppAccess, string | null> = {
 export const buildRejectionMessage = (reason: string): string =>
   `ขออภัย การลงทะเบียนของคุณไม่ผ่านการอนุมัติ เนื่องจาก: ${reason} กรุณาเปิดแอปพลิเคชันเพื่อแก้ไขข้อมูลใหม่อีกครั้ง`;
 
+/** Where a phone number stops being a phone number and starts being an extension. */
+const EXTENSION_MARKER = /\s*(?:ต่อ|ext\.?|#)\s*/i;
+
+/**
+ * `LineUserRegistration.phone` -> `phoneDigits`. THE only writer of that column: call it wherever
+ * `phone` is written, in the same `data` object, so the two can never drift apart.
+ *
+ * Two rules, both of which exist because an operator typing into the registration search box is
+ * reading a number off a form and not off the screen:
+ *   1. Every non-digit is dropped, so "081-234-5678" and "0812345678" are the same query.
+ *   2. Anything after an extension marker is dropped ENTIRELY rather than concatenated.
+ *      "02-123-4567 ต่อ 101" is `021234567`; keeping the extension would make it `021234567101`,
+ *      and then searching "101" returns every number whose extension is 101 — which is never what
+ *      someone searching a phone number meant.
+ *
+ * ⚠️ A leading "+66" normalises to "66…", so an international-format row will not match a query
+ * typed in local "08…" form. Left alone deliberately: the registration form is filled in by Thai
+ * staff in local format, and a rewrite rule that guesses country codes fails in a much quieter way.
+ */
+export const toPhoneDigits = (phone: string): string =>
+  phone.split(EXTENSION_MARKER)[0].replace(/\D/g, '');
+
 /**
  * THE one definition of "a publicly visible LineUser" — exactly the `LineUserResponseDto` fields.
  * Kept explicit so the DTO stays the response boundary (never `deletedAt`/`language`/audit columns),
@@ -448,6 +470,7 @@ export class LineUserService {
               firstName: dto.firstName,
               lastName: dto.lastName,
               phone: dto.phone,
+              phoneDigits: toPhoneDigits(dto.phone),
               departmentId: dto.departmentId,
               personnelRoleId: dto.personnelRoleId,
             },
@@ -542,6 +565,7 @@ export class LineUserService {
           firstName: dto.firstName,
           lastName: dto.lastName,
           phone: dto.phone,
+          phoneDigits: toPhoneDigits(dto.phone),
           departmentId: dto.departmentId,
           personnelRoleId: dto.personnelRoleId,
         },
@@ -833,6 +857,7 @@ export class LineUserService {
           firstName: dto.firstName,
           lastName: dto.lastName,
           phone: dto.phone,
+          phoneDigits: toPhoneDigits(dto.phone),
           departmentId: dto.departmentId,
           personnelRoleId: dto.personnelRoleId,
         },
