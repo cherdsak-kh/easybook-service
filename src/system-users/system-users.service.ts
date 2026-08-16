@@ -13,12 +13,16 @@ import { mapTransactionError } from '../common/prisma-tx.util';
 import { PrismaService } from '../prisma/prisma.service';
 import type { UpdateOwnProfileDto } from '../auth/dto/update-own-profile.dto';
 import { CreateSystemUserDto } from './dto/create-system-user.dto';
-import { ListSystemUsersQueryDto } from './dto/list-system-users-query.dto';
+import {
+  ListSystemUsersQueryDto,
+  type StaffStatus,
+} from './dto/list-system-users-query.dto';
 import { PaginatedSystemUsersResponseDto } from './dto/paginated-system-users-response.dto';
 import { SystemUserResponseDto } from './dto/system-user-response.dto';
 import { SystemUserWithTemporaryPasswordDto } from './dto/system-user-with-temporary-password.dto';
 import { UpdateSystemUserDto } from './dto/update-system-user.dto';
 import {
+  DELETED_FILTER_IS_SUPER_ADMIN_ONLY,
   EMAIL_TAKEN,
   INVALID_DEPARTMENT,
   INVALID_PERSONNEL_ROLE,
@@ -87,6 +91,33 @@ async function assertOptionsAssignable(
       select: { id: true },
     });
     if (!ok) throw new BadRequestException(INVALID_PERSONNEL_ROLE);
+  }
+}
+
+/**
+ * The status filter, and it is a PRECEDENCE rather than four independent predicates — copied from
+ * the screen that renders the badge (`deleted` > `suspended` > `pending` > `active`).
+ *
+ * The one that is easy to get wrong is `pending`: a suspended user who also owes a password change
+ * shows `ระงับการใช้งาน`, so `pending` must exclude them. Otherwise filtering by one badge returns
+ * rows that visibly display another — which reads as a broken screen, not a broken query.
+ *
+ * ⚠️ EVERY branch carries its own `deletedAt` clause, including the default. This function owns
+ * that decision entirely, so nothing above it re-adds `deletedAt: null` and quietly makes
+ * `status=deleted` return nothing at all.
+ */
+function statusFilter(status?: StaffStatus): Prisma.SystemUserWhereInput {
+  switch (status) {
+    case 'deleted':
+      return { deletedAt: { not: null } };
+    case 'suspended':
+      return { deletedAt: null, isActive: false };
+    case 'pending':
+      return { deletedAt: null, isActive: true, mustChangePassword: true };
+    case 'active':
+      return { deletedAt: null, isActive: true, mustChangePassword: false };
+    default:
+      return { deletedAt: null }; // identity read → soft-deleted rows are invisible
   }
 }
 
@@ -249,11 +280,31 @@ export class SystemUsersService {
    * so `meta.total` could genuinely disagree with `data`. A read-only RepeatableRead transaction
    * can never abort.
    */
-  async findManyPaginated({
-    page,
-    limit,
-  }: ListSystemUsersQueryDto): Promise<PaginatedSystemUsersResponseDto> {
-    const where: Prisma.SystemUserWhereInput = { deletedAt: null }; // identity read → filter
+  async findManyPaginated(
+    { page, limit, search, role, status }: ListSystemUsersQueryDto,
+    actorRole: SystemRole,
+  ): Promise<PaginatedSystemUsersResponseDto> {
+    // ⚠️ The boundary, and it lives HERE rather than in a guard or a DTO: a guard runs before the
+    // pipe and cannot see `status`, and a DTO cannot see who is asking. The screen hides the
+    // option for other roles, which is UX — this is the control.
+    if (status === 'deleted' && actorRole !== SystemRole.SUPER_ADMIN) {
+      throw new ForbiddenException(DELETED_FILTER_IS_SUPER_ADMIN_ONLY);
+    }
+
+    const q = search?.trim();
+    const where: Prisma.SystemUserWhereInput = {
+      ...statusFilter(status), // carries the deletedAt clause — see the note there
+      ...(role ? { role } : {}),
+      ...(q
+        ? {
+            OR: [
+              { firstName: { contains: q, mode: 'insensitive' } },
+              { lastName: { contains: q, mode: 'insensitive' } },
+              { email: { contains: q, mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+    };
 
     const [rows, total] = await this.prisma.$transaction(
       [

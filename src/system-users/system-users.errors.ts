@@ -16,3 +16,13 @@ export const EMAIL_TAKEN = 'A system user with this email already exists.';
  */
 export const INVALID_DEPARTMENT = 'Department option not found.';
 export const INVALID_PERSONNEL_ROLE = 'Personnel role option not found.';
+
+/**
+ * `GET /system-users?status=deleted` asked by anyone but a SUPER_ADMIN.
+ *
+ * A 403 and not an empty list: the caller asked a question they are not allowed to ask, and
+ * answering "no results" would be a lie that also teaches them nothing. The screen hides the
+ * option for every other role, but hiding an `<option>` is UX — this is the boundary.
+ */
+export const DELETED_FILTER_IS_SUPER_ADMIN_ONLY =
+  'Only a SUPER_ADMIN may list deleted users.';

@@ -112,7 +112,7 @@ export class SystemUsersController {
   @ApiOperation({
     summary: 'List back-office users, paginated.',
     description:
-      'Soft-deleted rows are excluded from `data` and from `meta.total`. Ordered `createdAt DESC, id DESC`. A page beyond the last one is a 200 with an empty `data`, not a 404.',
+      'Search matches the first name, last name or email, case-insensitively. `role` and `status` narrow further; `status` is derived (`deleted` > `suspended` > `pending` > `active`), matching the badge the screen shows. Soft-deleted rows are excluded from `data` and from `meta.total` unless `status=deleted`, which is SUPER_ADMIN-only and is the only way to obtain the id a restore needs. Ordered `createdAt DESC, id DESC`. A page beyond the last one is a 200 with an empty `data`, not a 404.',
   })
   @ApiOkResponse({
     description: 'A page of users.',
@@ -123,7 +123,8 @@ export class SystemUsersController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'VIEWER has no access to this collection.',
+    description:
+      'VIEWER has no access to this collection; or `status=deleted` asked by a non-SUPER_ADMIN.',
     type: ErrorResponseDto,
   })
   @ApiServiceUnavailableResponse({
@@ -131,9 +132,12 @@ export class SystemUsersController {
     type: ErrorResponseDto,
   })
   list(
+    @CurrentUser() actor: AuthenticatedSystemUser,
     @Query() query: ListSystemUsersQueryDto,
   ): Promise<PaginatedSystemUsersResponseDto> {
-    return this.systemUsers.findManyPaginated(query);
+    // The role reaches the service because `status=deleted` is SUPER_ADMIN-only and `RolesGuard`
+    // runs before the pipe — it cannot see the query it would need to judge.
+    return this.systemUsers.findManyPaginated(query, actor.role);
   }
 
   @Get(':id')
