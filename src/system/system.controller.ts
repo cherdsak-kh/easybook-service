@@ -63,10 +63,28 @@ export class SystemController {
     // restarted with a new stamp must report the new one without a code change. `unknown` and
     // `null` are honest answers — a deploy that forgot to stamp the build should say so, not
     // invent a plausible-looking commit.
+    //
+    // ⚠️ `npm_package_version` is the DEV fallback, and it is not a nicety. npm sets it from this
+    // package's own `version` for anything launched with `npm run`, so a developer box reports the
+    // code it is actually running without anyone maintaining a second copy of the number in a
+    // `.env`. Without it every unstamped box answered `0.0.0`, and the version screen showed a
+    // permanent amber "the server is behind" — which is how a warning colour stops being read by
+    // the time a real mismatch appears. It is deliberately BELOW `APP_VERSION`: a container runs
+    // `node dist/main`, npm sets nothing, and the deploy's stamp must always win.
+    //
+    // ⚠️ `stamp()` treats EMPTY as unset, and `??` cannot: `.env.example` documents these three by
+    // listing them blank, so a copied `.env` sets each to `''` — which is a value, so `??` keeps
+    // it and the endpoint answers `version: ""`. That is worse than the fallback it was meant to
+    // avoid, and it appears only on a box configured exactly the way the docs say to.
+    const stamp = (v: string | undefined) =>
+      v && v.trim() ? v.trim() : undefined;
     return {
-      version: process.env.APP_VERSION ?? '0.0.0',
-      build: process.env.APP_BUILD ?? 'unknown',
-      releasedAt: process.env.APP_RELEASED_AT ?? null,
+      version:
+        stamp(process.env.APP_VERSION) ??
+        stamp(process.env.npm_package_version) ??
+        '0.0.0',
+      build: stamp(process.env.APP_BUILD) ?? 'unknown',
+      releasedAt: stamp(process.env.APP_RELEASED_AT) ?? null,
     };
   }
 }
