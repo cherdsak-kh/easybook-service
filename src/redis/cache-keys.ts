@@ -63,3 +63,22 @@ export const OPTION_CACHE_KEYS: readonly string[] = [
   ...OPTION_LIST_KEYS,
   LIFF_OPTIONS_KEY,
 ];
+
+/**
+ * A LINE user's own status view — the single call the LIFF client makes on open to decide which
+ * of the four screens to render.
+ *
+ * ⚠️ THE ARGUMENT IS THE LINE-SIDE `U…` SUB, NOT THE CUID. `LineUser.id` (cuid) and
+ * `LineUser.lineUserId` (`U…`) are both "the line user id" in conversation, and `SystemUser`
+ * carries a THIRD field spelled `lineUserId` that holds the cuid. Keying this with a cuid by
+ * mistake type-checks perfectly and produces a cache that is simply never hit, and never wrong —
+ * so nothing fails, it just quietly stops working. The parameter name is the only guard rail
+ * there is; keep it.
+ *
+ * ⚠️ THE CACHED PAYLOAD CONTAINS PII — the registrant's first name, last name and phone. That
+ * makes Redis a second store of personal data with its own 300s retention, alongside the R2
+ * avatar bucket, and puts it in `AUTH-ERASURE`'s scope. An erasure that clears PostgreSQL and
+ * forgets this key leaves the data readable for up to five more minutes.
+ */
+export const lineStatusKey = (lineSub: string): string =>
+  `line:status:${lineSub}`;

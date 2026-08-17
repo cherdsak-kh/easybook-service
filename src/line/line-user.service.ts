@@ -12,7 +12,11 @@ import type { LineUser, RichMenuType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { RealtimeActor } from '../realtime/realtime.constants';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
-import { LIFF_OPTIONS_KEY, OPTION_LIST_KEYS } from '../redis/cache-keys';
+import {
+  LIFF_OPTIONS_KEY,
+  OPTION_LIST_KEYS,
+  lineStatusKey,
+} from '../redis/cache-keys';
 import { RedisService } from '../redis/redis.service';
 import { canAdminSetAccess } from './line-access.policy';
 import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
@@ -329,6 +333,11 @@ export class LineUserService {
     // `LineWebhookService` stays unchanged — the emit belongs to the service that owns the model.
     // No operator: a LINE user added the Official Account themselves.
     await this.publish('created', user.id, null);
+
+    // A re-follow clears `deletedAt`, resurrecting the account the unfollow hid — the mirror of
+    // the drop in `softDeleteByLineUserId`, and the reason a plain profile refresh drops it too:
+    // `displayName` does not reach this payload today, but the row this key describes just moved.
+    await this.redis.del(lineStatusKey(profile.lineUserId));
     return user;
   }
 
@@ -355,6 +364,11 @@ export class LineUserService {
     // Emit site 6. "Deleted" means "left the list you are looking at" — the physical row survives.
     // No operator: the user unfollowed.
     this.realtime.emitLineUserDeleted(row.id, null);
+
+    // The row is now invisible to `getOrCreateByLineUserId`, so the next status read builds a
+    // FRESH UNREGISTERED row. A surviving key would keep serving the old account's registration —
+    // including its name and phone — to whoever re-opens the LIFF under that sub.
+    await this.redis.del(lineStatusKey(lineUserId));
     return { count: 1 };
   }
 
@@ -624,7 +638,8 @@ export class LineUserService {
 
       // A new registration is a new holder of both chosen options, so the admin option lists'
       // `holderCount` just moved. Only the ADMIN keys — the LIFF payload carries no count.
-      await this.redis.del(...OPTION_LIST_KEYS);
+      // The caller's own status changed too (UNREGISTERED → PENDING, registration now present).
+      await this.redis.del(...OPTION_LIST_KEYS, lineStatusKey(lineUserId));
 
       // A fresh registration is never REJECTED — no reason to surface.
       return this.toStatusDto(access, registration, null);
@@ -720,7 +735,9 @@ export class LineUserService {
     // The edit may have moved this holder from one option to another — two counts, one write.
     // Dropped unconditionally rather than only when the ids changed: comparing costs a branch that
     // can be wrong, and an unnecessary drop costs one miss.
-    await this.redis.del(...OPTION_LIST_KEYS);
+    // The status payload carries the edited fields verbatim, and a REJECTED resubmit also flipped
+    // `access` and cleared `rejectionReason` — so it goes too.
+    await this.redis.del(...OPTION_LIST_KEYS, lineStatusKey(lineUserId));
 
     // Both paths land on PENDING with the reason cleared (REJECTED resubmit) or already null (edit).
     return this.toStatusDto(AppAccess.PENDING, updated, null);
@@ -732,6 +749,19 @@ export class LineUserService {
    * a fresh `UNREGISTERED` row + `registration: null`.
    */
   async getStatus(lineUserId: string): Promise<LineUserStatusResponseDto> {
+    // Cache-aside (R1). Two queries, and this is the one call every LINE user makes every time
+    // they open the app.
+    //
+    // ⚠️ `access` IS IN THIS PAYLOAD, and a stale one shows a blocked user the allowed screen.
+    // That is tolerable ONLY because it is a routing hint and never an enforcement point: the
+    // rich menu is switched LINE-side, and `register`/`updateRegistration` re-read the row from
+    // PostgreSQL before writing anything (R5). Every write that can move `access` drops this key
+    // below — six of them. If a seventh is ever added and forgets, the failure is a user staring
+    // at the wrong screen for five minutes, not a user doing something they may not do.
+    const key = lineStatusKey(lineUserId);
+    const cached = await this.redis.getJson<LineUserStatusResponseDto>(key);
+    if (cached) return cached;
+
     const user = await this.getOrCreateByLineUserId(lineUserId);
     const registration = await this.prisma.lineUserRegistration.findFirst({
       where: { lineUserId: user.id, deletedAt: null },
@@ -739,7 +769,14 @@ export class LineUserService {
     });
     // `rejectionReason` is non-null only when access === REJECTED (invariant) — pass it straight
     // through so the LIFF RejectedScreen can render it.
-    return this.toStatusDto(user.access, registration, user.rejectionReason);
+    const dto = this.toStatusDto(
+      user.access,
+      registration,
+      user.rejectionReason,
+    );
+
+    await this.redis.setJson(key, dto);
+    return dto;
   }
 
   /**
@@ -915,6 +952,11 @@ export class LineUserService {
       await this.notifyAccessChange(updated.lineUserId, access);
     }
 
+    // THE invalidation that matters most on this surface: `access` is the field the LIFF routes
+    // its four screens off, and this is the only method that changes it. Same `U…` the push above
+    // was addressed to — if that one is right, this one is.
+    await this.redis.del(lineStatusKey(updated.lineUserId));
+
     return this.toDto(updated);
   }
 
@@ -1006,7 +1048,14 @@ export class LineUserService {
 
     // Same as the self-edit path: an admin correcting a typo can also move the holder between two
     // options, and the admin option lists count LINE registrations as well as staff.
-    await this.redis.del(...OPTION_LIST_KEYS);
+    //
+    // ⚠️ `updated.lineUserId` — the LINE-side `U…` — NOT `row.id`, which is the cuid this method
+    // is keyed on. The status cache is keyed the way the LIFF caller asks for it, not the way the
+    // admin addresses it, and the two are different strings on the same row.
+    await this.redis.del(
+      ...OPTION_LIST_KEYS,
+      lineStatusKey(updated!.lineUserId),
+    );
 
     return this.toDto(updated!);
   }
