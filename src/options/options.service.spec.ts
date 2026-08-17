@@ -2,6 +2,7 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
+import { RedisService } from '../redis/redis.service';
 import { TOMBSTONE_ROW_MISSING } from './options.constants';
 import { OPTION_NAME_TAKEN, OPTION_NOT_FOUND } from './options.errors';
 import { OptionsService } from './options.service';
@@ -59,6 +60,17 @@ describe('OptionsService', () => {
             systemUser,
             lineUserRegistration,
             $transaction,
+          },
+        },
+        // `getJson` resolving null is a permanent cache MISS, which is what keeps every
+        // assertion below about the Prisma calls true: a stub that returned a hit would make
+        // `list` skip the query entirely and the spec would pass while testing nothing.
+        {
+          provide: RedisService,
+          useValue: {
+            getJson: jest.fn().mockResolvedValue(null),
+            setJson: jest.fn(),
+            del: jest.fn(),
           },
         },
       ],

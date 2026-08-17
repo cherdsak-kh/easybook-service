@@ -11,6 +11,8 @@ import { PasswordService } from '../auth/password.service';
 import { normaliseEmail } from '../auth/login-throttle.key';
 import { mapTransactionError } from '../common/prisma-tx.util';
 import { PrismaService } from '../prisma/prisma.service';
+import { OPTION_LIST_KEYS } from '../redis/cache-keys';
+import { RedisService } from '../redis/redis.service';
 import type { UpdateOwnProfileDto } from '../auth/dto/update-own-profile.dto';
 import { CreateSystemUserDto } from './dto/create-system-user.dto';
 import {
@@ -159,7 +161,24 @@ export class SystemUsersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly password: PasswordService,
+    private readonly redis: RedisService,
   ) {}
+
+  /**
+   * Drop the admin option lists after a write that changed who holds which option.
+   *
+   * ⚠️ THE CALL SITES ARE EXACTLY FOUR: `create`, `update`, `softDelete`, `restore` — the writes
+   * that can add, remove or move a holder. `resetPassword`, `updateOwnProfile` and `setOwnAvatar`
+   * are deliberately NOT among them: neither `departmentId` nor `personnelRoleId` nor `deletedAt`
+   * is reachable from any of the three, so they cannot move a count, and calling this on every
+   * avatar upload would evict a list that every admin screen reads.
+   *
+   * `holderCount` is why this exists at all. The option NAMES change a few times a year; the
+   * counts change every time anybody hires, edits, deletes or restores a person.
+   */
+  private dropOptionCounts(): Promise<void> {
+    return this.redis.del(...OPTION_LIST_KEYS);
+  }
 
   /**
    * The only creation path besides the offline seed script.
@@ -219,6 +238,7 @@ export class SystemUsersService {
 
       // `id=`-only, exactly as before. NEVER log the DTO or the temp password (AC-B7).
       this.logger.log(`SystemUser created. id=${created.id} by=${actor.id}`);
+      await this.dropOptionCounts();
       return { ...toSystemUserDto(created), temporaryPassword };
     } catch (error) {
       if (
@@ -410,6 +430,9 @@ export class SystemUsersService {
           ? { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
           : undefined,
       );
+      // Unconditional, not "only if departmentId/personnelRoleId was in the patch": the cheap
+      // wrong answer is an extra miss, the expensive one is a stale count nobody traces back.
+      await this.dropOptionCounts();
       return toSystemUserDto(updated);
     } catch (error) {
       mapTransactionError(error); // rethrows; P2034 / 40001 / 40P01 → 409, never 500
@@ -451,6 +474,8 @@ export class SystemUsersService {
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
       });
       this.logger.log(`SystemUser soft-deleted. id=${id} by=${actor.id}`);
+      // A soft-deleted holder leaves the count — `HOLDER_COUNT` filters `deletedAt: null`.
+      await this.dropOptionCounts();
     } catch (error) {
       mapTransactionError(error);
     }
@@ -479,7 +504,7 @@ export class SystemUsersService {
    * `null`. The end state is identical and correct; that is not worth a Serializable transaction.
    */
   async restore(id: string): Promise<SystemUserResponseDto> {
-    return this.prisma.$transaction(async (tx) => {
+    const dto = await this.prisma.$transaction(async (tx) => {
       const target = await tx.systemUser.findUnique({
         where: { id },
         select: { id: true, deletedAt: true },
@@ -496,6 +521,10 @@ export class SystemUsersService {
       this.logger.log(`SystemUser restored. id=${restored.id}`);
       return toSystemUserDto(restored);
     });
+
+    // A restored holder re-enters the count, so this is the mirror of `softDelete`'s drop.
+    await this.dropOptionCounts();
+    return dto;
   }
 
   /**

@@ -12,6 +12,8 @@ import type { LineUser, RichMenuType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { RealtimeActor } from '../realtime/realtime.constants';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { LIFF_OPTIONS_KEY, OPTION_LIST_KEYS } from '../redis/cache-keys';
+import { RedisService } from '../redis/redis.service';
 import { canAdminSetAccess } from './line-access.policy';
 import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
@@ -254,6 +256,7 @@ export class LineUserService {
     private readonly prisma: PrismaService,
     private readonly line: LineService,
     private readonly realtime: RealtimeGateway,
+    private readonly redis: RedisService,
   ) {}
 
   /**
@@ -470,6 +473,19 @@ export class LineUserService {
    * LINE caller can never see a reserved option under any circumstance.
    */
   async getRegistrationOptions(): Promise<RegistrationOptionsResponseDto> {
+    // Cache-aside (R1). Two queries per registration-form open, on the surface with the most
+    // users and the least predictable traffic — and this payload is the one that genuinely
+    // "changes rarely": no `holderCount`, no reserved rows, so only an option write disturbs it.
+    //
+    // This route is also session-EXEMPT (bearer LINE ID token), which makes the fallback matter
+    // here in a way it does not on the admin side: with Redis down the admin surface already
+    // answers 503 at the session middleware, but this one keeps serving straight from PostgreSQL.
+    const cached =
+      await this.redis.getJson<RegistrationOptionsResponseDto>(
+        LIFF_OPTIONS_KEY,
+      );
+    if (cached) return cached;
+
     const [departments, personnelRoles] = await Promise.all([
       this.prisma.department.findMany({
         where: { deletedAt: null, isSystemReserved: false },
@@ -482,7 +498,10 @@ export class LineUserService {
         orderBy: { name: 'asc' },
       }),
     ]);
-    return { departments, personnelRoles };
+
+    const payload = { departments, personnelRoles };
+    await this.redis.setJson(LIFF_OPTIONS_KEY, payload);
+    return payload;
   }
 
   /**
@@ -603,6 +622,10 @@ export class LineUserService {
       // so a push failure can never roll back the committed registration/access change.
       await this.notifyAccessChange(lineUserId, access);
 
+      // A new registration is a new holder of both chosen options, so the admin option lists'
+      // `holderCount` just moved. Only the ADMIN keys — the LIFF payload carries no count.
+      await this.redis.del(...OPTION_LIST_KEYS);
+
       // A fresh registration is never REJECTED — no reason to surface.
       return this.toStatusDto(access, registration, null);
     } catch (error) {
@@ -693,6 +716,11 @@ export class LineUserService {
     if (wasRejected) {
       await this.notifyAccessChange(lineUserId, AppAccess.PENDING);
     }
+
+    // The edit may have moved this holder from one option to another — two counts, one write.
+    // Dropped unconditionally rather than only when the ids changed: comparing costs a branch that
+    // can be wrong, and an unnecessary drop costs one miss.
+    await this.redis.del(...OPTION_LIST_KEYS);
 
     // Both paths land on PENDING with the reason cleared (REJECTED resubmit) or already null (edit).
     return this.toStatusDto(AppAccess.PENDING, updated, null);
@@ -975,6 +1003,10 @@ export class LineUserService {
     // reach a soft-deleted row here; `publish`'s `deletedAt: null` filter is what stops that row
     // from being broadcast.
     await this.publish('updated', row.id, actor);
+
+    // Same as the self-edit path: an admin correcting a typo can also move the holder between two
+    // options, and the admin option lists count LINE registrations as well as staff.
+    await this.redis.del(...OPTION_LIST_KEYS);
 
     return this.toDto(updated!);
   }

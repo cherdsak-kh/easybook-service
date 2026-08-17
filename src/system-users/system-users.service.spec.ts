@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { Prisma, SystemRole } from '@prisma/client';
 import { PasswordService } from '../auth/password.service';
+import { RedisService } from '../redis/redis.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { SystemUsersService } from './system-users.service';
 import type { StaffStatus } from './dto/list-system-users-query.dto';
@@ -135,6 +136,10 @@ describe('SystemUsersService', () => {
     generateTemporaryPassword,
   } as unknown as PasswordService;
 
+  // The cache is invalidation-only on this service — it never reads. A no-op `del` keeps every
+  // existing assertion about the DB writes exactly as it was.
+  const redis = { del: jest.fn() } as unknown as RedisService;
+
   /** Runs the interactive-transaction callback, capturing its isolation options. */
   const runInteractiveTx = () =>
     $transaction.mockImplementation(
@@ -150,7 +155,7 @@ describe('SystemUsersService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    service = new SystemUsersService(prisma, password);
+    service = new SystemUsersService(prisma, password, redis);
   });
 
   // ───────────────────────────── create ─────────────────────────────

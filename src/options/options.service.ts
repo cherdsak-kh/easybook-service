@@ -7,6 +7,8 @@ import {
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { RedisService } from '../redis/redis.service';
+import { OPTION_CACHE_KEYS, optionListKey } from '../redis/cache-keys';
 import {
   TOMBSTONE_DEPARTMENT_NAME,
   TOMBSTONE_PERSONNEL_ROLE_NAME,
@@ -146,7 +148,10 @@ const toDto = (row: OptionRow): OptionResponse => ({
 export class OptionsService {
   private readonly logger = new Logger(OptionsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly redis: RedisService,
+  ) {}
 
   private delegate(model: OptionModel): OptionDelegate {
     return model === 'department'
@@ -169,11 +174,29 @@ export class OptionsService {
    * The filter is a WHERE clause, not a post-fetch drop, on purpose: the controller must never hold a
    * row it is not allowed to return. Filtering after the read would be one `console.log`, one future
    * `find()`, one debug-endpoint reuse away from a leak.
+   *
+   * ─────────────────────────────────────────────────────────────────────────
+   * CACHE-ASIDE (R1). This is the heaviest read on the admin surface and the one every screen with
+   * a dropdown makes: `HOLDER_COUNT` is two correlated aggregates PER ROW, over two tables, and it
+   * runs again on every page open even though the answer changes a few times a week.
+   *
+   * `includeReserved` goes into the key via the SAME variable that builds the WHERE clause below,
+   * so the cached view and the queried view provably match. Do not "tidy" that into two
+   * expressions.
+   *
+   * The cached value is `OptionResponse[]`, whose dates are already ISO **strings** — so the
+   * JSON round trip is lossless. If a `Date` ever reaches this payload, a cache hit would return a
+   * string where a miss returns a `Date`, and every consumer would work until the first hit.
    */
   async list(
     model: OptionModel,
     opts: { includeReserved: boolean },
   ): Promise<OptionResponse[]> {
+    const key = optionListKey(model, opts.includeReserved);
+
+    const cached = await this.redis.getJson<OptionResponse[]>(key);
+    if (cached) return cached;
+
     const rows = await this.delegate(model).findMany({
       where: opts.includeReserved
         ? { deletedAt: null }
@@ -181,7 +204,10 @@ export class OptionsService {
       select: PUBLIC_SELECT,
       orderBy: { name: 'asc' },
     });
-    return rows.map(toDto);
+    const dto = rows.map(toDto);
+
+    await this.redis.setJson(key, dto);
+    return dto;
   }
 
   /**
@@ -195,6 +221,9 @@ export class OptionsService {
         select: PUBLIC_SELECT,
       });
       this.logger.log(`Option created. model=${model} id=${created.id}`);
+      // AFTER the commit, never before: dropping first leaves a window where a concurrent read
+      // refills the key from the pre-write state and then nothing drops it again for 300s.
+      await this.redis.del(...OPTION_CACHE_KEYS);
       return toDto(created);
     } catch (error) {
       throw this.mapWriteError(error);
@@ -229,6 +258,7 @@ export class OptionsService {
         select: PUBLIC_SELECT,
       });
       this.logger.log(`Option renamed. model=${model} id=${updated.id}`);
+      await this.redis.del(...OPTION_CACHE_KEYS);
       return toDto(updated);
     } catch (error) {
       throw this.mapWriteError(error);
@@ -301,6 +331,11 @@ export class OptionsService {
           `movedStaff=${staff.count} movedRegistrations=${registrations.count}`,
       );
     });
+
+    // Outside the transaction, so it can only run once the move + delete actually committed.
+    // This one write moves TWO counts — the deleted option's holders all land on the tombstone —
+    // which is why the whole family goes, not one key.
+    await this.redis.del(...OPTION_CACHE_KEYS);
   }
 
   /**

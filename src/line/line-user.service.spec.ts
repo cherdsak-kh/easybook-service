@@ -10,6 +10,7 @@ import { AppAccess, Prisma, SystemRole } from '@prisma/client';
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { RedisService } from '../redis/redis.service';
 import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
@@ -168,6 +169,16 @@ describe('LineUserService', () => {
         },
         { provide: LineService, useValue: line },
         { provide: RealtimeGateway, useValue: realtime },
+        // Permanent cache miss — see the note in `options.service.spec.ts`. A hit would let
+        // `getRegistrationOptions` skip Prisma and silently hollow out its assertions.
+        {
+          provide: RedisService,
+          useValue: {
+            getJson: jest.fn().mockResolvedValue(null),
+            setJson: jest.fn(),
+            del: jest.fn(),
+          },
+        },
       ],
     }).compile();
     service = module.get<LineUserService>(LineUserService);
