@@ -88,12 +88,35 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # What the running container will answer at GET /api/v1/system/version. Computed here rather
+      # than read from the environment inside the image: the container has no `.git`, and
+      # `npm_package_version` is unset because it starts `node dist/main.js`, not an npm script.
+      #
+      # `${GITHUB_SHA::7}` matches the width easybook-app stamps into its own bundle, so the two
+      # halves of the version screen are comparable by eye — which is the whole point of showing
+      # them side by side. `released_at` is the build moment in UTC; the endpoint hands it back
+      # untouched, and only the frontend decides how to render it.
+      - name: Derive the build stamp
+        id: stamp
+        run: |
+          {
+            echo "version=$(node -p "require('./package.json').version")"
+            echo "build=${GITHUB_SHA::7}"
+            echo "released_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build & push runtime image (app)
         uses: docker/build-push-action@v5
         with:
           context: .
           target: runtime
           push: true
+          # ⚠️ The app image only. The migrator is a one-shot `prisma migrate deploy` that serves
+          # no HTTP and answers no version endpoint — stamping it would only cost a cache miss.
+          build-args: |
+            APP_VERSION=${{ steps.stamp.outputs.version }}
+            APP_BUILD=${{ steps.stamp.outputs.build }}
+            APP_RELEASED_AT=${{ steps.stamp.outputs.released_at }}
           # Immutable commit-SHA tag only — never `latest`. The CD workflow deploys this exact
           # tag, so a redeploy is always reproducible and traceable to a commit.
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }}

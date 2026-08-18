@@ -146,6 +146,32 @@ COPY --from=build --chown=node:node /app/package.json ./package.json
 USER node
 EXPOSE 3300
 
+# The three values `GET /api/v1/system/version` reports about itself, baked in at image build.
+#
+# ⚠️ WITHOUT THESE THE ENDPOINT ANSWERS `0.0.0`. It reads `npm_package_version` as its dev
+# fallback, and npm only sets that for something launched with `npm run` — this image runs
+# `node dist/main.js` directly, so nothing sets it and the version screen paints a permanent
+# amber "the server is behind" over a deploy that is perfectly correct. That colour has one job,
+# and a warning shown on every healthy deploy is a warning nobody reads on the day it is true.
+#
+# ⚠️ DEFAULTS ARE EMPTY ON PURPOSE, not a placeholder version. `stamp()` in system.controller.ts
+# treats empty as unset, so a plain `docker build` with no args behaves exactly as it does today
+# (`0.0.0` / `unknown` / `null`) rather than shipping an image that lies about which commit it is.
+# CI passes the real values via `--build-arg`; see .github/workflows/ci.yml.
+#
+# ⚠️ Do NOT also set these in Infisical. `infisical run --` injects at container start, so a value
+# there would silently outrank the commit this image was actually built from — two sources for one
+# fact, and the wrong one wins.
+#
+# Placed after every COPY so a new stamp invalidates only these last few tiny layers, never the
+# `node_modules`/`dist` ones above.
+ARG APP_VERSION=""
+ARG APP_BUILD=""
+ARG APP_RELEASED_AT=""
+ENV APP_VERSION=$APP_VERSION \
+    APP_BUILD=$APP_BUILD \
+    APP_RELEASED_AT=$APP_RELEASED_AT
+
 # Health-GATED deploy support (see docs/migration-safety-policy.md — this is a brief-cutover
 # health gate, deliberately NOT called "zero-downtime": there is exactly one replica, so the
 # old container is stopped before the new one is confirmed healthy). Route matches the global
