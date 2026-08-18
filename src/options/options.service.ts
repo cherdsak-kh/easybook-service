@@ -28,6 +28,36 @@ export interface OptionResponse {
   updatedAt: string;
   /** How many VISIBLE people hold this option — see `HOLDER_COUNT` for what "visible" excludes. */
   holderCount: number;
+  /**
+   * The same total, SPLIT into the two populations it was summed from (OPT-COUNT-2, 18 ส.ค. 2569).
+   *
+   * The aggregate was always two numbers internally; only `toDto` merged them. The screens need
+   * both halves: the edit dialog states "มีผู้ถือตำแหน่งนี้ 13 คน — ผู้ใช้ LINE 8 คน · เจ้าหน้าที่
+   * ระบบ 5 คน", and the delete confirmation repeats the split before it names the verb. One merged
+   * number hides WHICH population a delete is about to move, and those are different problems for
+   * whoever has to clean up after it.
+   *
+   * `holderCount` stays and is still the sum — the table column shows the total. Additive, so no
+   * existing consumer changes.
+   */
+  staffCount: number;
+  registrationCount: number;
+  /**
+   * TRUE only for the tombstone row (`ไม่พบตำแหน่ง` / `ไม่พบกลุ่ม/ฝ่าย`) — where holders are
+   * re-pointed when their option is deleted (OPT-FALLBACK-1).
+   *
+   * ⚠️ IT IS NOT DERIVABLE FROM `isSystemReserved`, which is what forced this field. Both the
+   * System Developer row and the tombstone carry `isSystemReserved: true`, and the two need
+   * OPPOSITE treatment in a picker: the reserved row may be assigned by a SUPER_ADMIN, while the
+   * tombstone must never be offered — filing somebody under "not found" on purpose is not a choice
+   * any form may present. Without this flag a client can only tell them apart by NAME, which puts
+   * the tombstone's Thai spelling in two repositories and makes renaming it in one a silent
+   * behaviour change in the other.
+   *
+   * Computed here by comparing against the constants this service already resolves tombstones by
+   * (`resolveTombstoneId`), so there is exactly one place that knows the name.
+   */
+  isFallback: boolean;
 }
 
 /** A `Department`/`PersonnelRole` row narrowed to the public select. Dates are still `Date`s. */
@@ -124,17 +154,42 @@ const PUBLIC_SELECT = {
   _count: HOLDER_COUNT,
 } as const;
 
-const toDto = (row: OptionRow): OptionResponse => ({
-  id: row.id,
-  name: row.name,
-  isSystemReserved: row.isSystemReserved,
-  createdAt: row.createdAt.toISOString(),
-  updatedAt: row.updatedAt.toISOString(),
+/** The tombstone's name for one model. The ONE place that maps model → constant. */
+const tombstoneName = (model: OptionModel): string =>
+  model === 'department'
+    ? TOMBSTONE_DEPARTMENT_NAME
+    : TOMBSTONE_PERSONNEL_ROLE_NAME;
+
+const toDto = (model: OptionModel, row: OptionRow): OptionResponse => {
   // A freshly created option has no holders, and `?? 0` says so rather than letting an absent
   // aggregate surface as `undefined` in a field the screen prints.
-  holderCount:
-    (row._count?.systemUsers ?? 0) + (row._count?.registrations ?? 0),
-});
+  const staffCount = row._count?.systemUsers ?? 0;
+  const registrationCount = row._count?.registrations ?? 0;
+  return {
+    id: row.id,
+    name: row.name,
+    isSystemReserved: row.isSystemReserved,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+    holderCount: staffCount + registrationCount,
+    staffCount,
+    registrationCount,
+    /*
+     * ⚠️ `isSystemReserved &&` IS LOAD-BEARING, not belt-and-braces. The name is matched only after
+     * the flag has already established that this is a system-owned row, so an operator who creates
+     * an ordinary option literally called "ไม่พบตำแหน่ง" gets `isFallback: false` and a perfectly
+     * normal, editable, assignable row. Matching on the name alone would let anyone mint a row that
+     * the pickers refuse to offer and the UI treats as a tombstone — a self-inflicted denial of
+     * service costing one create call.
+     *
+     * The 409 on active names does NOT make that unreachable: the real tombstone is reserved, and
+     * `create` is not filtered by `isSystemReserved`, so the collision is with a row that exists —
+     * but soft-deleting is not the only path here and relying on a unique index to enforce a
+     * SECURITY property is exactly the coupling this comment exists to prevent.
+     */
+    isFallback: row.isSystemReserved && row.name === tombstoneName(model),
+  };
+};
 
 /**
  * Admin CRUD for the two registration option tables (`Department`, `PersonnelRole`). Soft-delete
@@ -204,7 +259,7 @@ export class OptionsService {
       select: PUBLIC_SELECT,
       orderBy: { name: 'asc' },
     });
-    const dto = rows.map(toDto);
+    const dto = rows.map((row) => toDto(model, row));
 
     await this.redis.setJson(key, dto);
     return dto;
@@ -224,7 +279,7 @@ export class OptionsService {
       // AFTER the commit, never before: dropping first leaves a window where a concurrent read
       // refills the key from the pre-write state and then nothing drops it again for 300s.
       await this.redis.del(...OPTION_CACHE_KEYS);
-      return toDto(created);
+      return toDto(model, created);
     } catch (error) {
       throw this.mapWriteError(error);
     }
@@ -259,7 +314,7 @@ export class OptionsService {
       });
       this.logger.log(`Option renamed. model=${model} id=${updated.id}`);
       await this.redis.del(...OPTION_CACHE_KEYS);
-      return toDto(updated);
+      return toDto(model, updated);
     } catch (error) {
       throw this.mapWriteError(error);
     }

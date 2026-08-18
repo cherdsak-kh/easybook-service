@@ -3,7 +3,11 @@ import { Prisma } from '@prisma/client';
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
-import { TOMBSTONE_ROW_MISSING } from './options.constants';
+import {
+  TOMBSTONE_DEPARTMENT_NAME,
+  TOMBSTONE_PERSONNEL_ROLE_NAME,
+  TOMBSTONE_ROW_MISSING,
+} from './options.constants';
 import { OPTION_NAME_TAKEN, OPTION_NOT_FOUND } from './options.errors';
 import { OptionsService } from './options.service';
 
@@ -113,7 +117,76 @@ describe('OptionsService', () => {
           // OPT-COUNT-1: the two populations arrive as separate aggregates and reach the screen
           // as ONE number, because "who holds this option" is one question.
           holderCount: 5,
+          // OPT-COUNT-2: ...AND as the two halves, because the delete confirmation has to say
+          // WHICH population it is about to move.
+          staffCount: 2,
+          registrationCount: 3,
+          isFallback: false,
         },
+      ]);
+    });
+
+    // ─────────────── isFallback (OPT-COUNT-2 / OPT-FALLBACK-1) ───────────────
+
+    it('marks the tombstone row isFallback, and only when it is also system-reserved', async () => {
+      department.findMany.mockResolvedValue([
+        // The real tombstone: reserved AND named. Both halves are required.
+        {
+          ...ROW,
+          id: 10,
+          name: TOMBSTONE_DEPARTMENT_NAME,
+          isSystemReserved: true,
+        },
+        // ⚠️ THE ROW THAT MAKES THIS A SECURITY TEST AND NOT A FORMATTING ONE. An ordinary option
+        // an operator created, named exactly like the tombstone. It must come back
+        // `isFallback: false` — otherwise anyone able to create an option could mint a row that
+        // every picker refuses to offer, which is a denial of service costing one POST.
+        {
+          ...ROW,
+          id: 11,
+          name: TOMBSTONE_DEPARTMENT_NAME,
+          isSystemReserved: false,
+        },
+        // Reserved, but the System Developer row — assignable by a SUPER_ADMIN, so NOT a fallback.
+        { ...ROW, id: 12, name: 'System Developer', isSystemReserved: true },
+      ]);
+
+      const result = await service.list('department', {
+        includeReserved: true,
+      });
+
+      expect(result.map((r) => [r.id, r.isFallback])).toEqual([
+        [10, true],
+        [11, false],
+        [12, false],
+      ]);
+    });
+
+    it('uses the PERSONNEL ROLE tombstone name for the personnelRole model', async () => {
+      // The two models have different tombstone names; matching a department name against a
+      // personnelRole row would silently mark nothing at all.
+      personnelRole.findMany.mockResolvedValue([
+        {
+          ...ROW,
+          id: 1,
+          name: TOMBSTONE_PERSONNEL_ROLE_NAME,
+          isSystemReserved: true,
+        },
+        {
+          ...ROW,
+          id: 2,
+          name: TOMBSTONE_DEPARTMENT_NAME,
+          isSystemReserved: true,
+        },
+      ]);
+
+      const result = await service.list('personnelRole', {
+        includeReserved: true,
+      });
+
+      expect(result.map((r) => [r.id, r.isFallback])).toEqual([
+        [1, true],
+        [2, false],
       ]);
     });
 
