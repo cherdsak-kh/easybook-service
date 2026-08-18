@@ -1,6 +1,6 @@
 {
   "name": "easybook-service",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "EasyBook backend — NestJS API (standalone). Publishes the OpenAPI spec at /docs-json.",
   "author": "",
   "private": true,
