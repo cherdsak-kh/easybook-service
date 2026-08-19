@@ -381,6 +381,12 @@ describe('Registration options admin CRUD (e2e)', () => {
         role: SystemRole.VIEWER, // the ONLY thing that grants privilege
         departmentId: department.id,
         personnelRoleId: personnelRole.id,
+        // ⚠️ EXPLICIT, because the column defaults to `true` and this row is created straight
+        // through Prisma. Left gated, EVERY non-exempt route answers 403 for the forced-reset
+        // gate — so the original `GET /system-users → 403` here passed for a reason that had
+        // nothing to do with the job title this test is about. It only surfaced when the read
+        // was opened to VIEWER (19 ส.ค. 2569) and the assertion did not move.
+        mustChangePassword: false,
       },
       select: { id: true },
     });
@@ -392,8 +398,10 @@ describe('Registration options admin CRUD (e2e)', () => {
 
     const { agent, token } = await login(email);
 
-    // The job title changed NOTHING: VIEWER is denied the whole admin surface.
-    await agent.get(url('/system-users')).expect(403);
+    // The job title changed NOTHING. Reading the directory is allowed for every role since
+    // 19 ส.ค. 2569, so the probe is a WRITE — which is what "ADMIN" would have to grant to mean
+    // anything, and does not.
+    await agent.get(url('/system-users')).expect(200);
     await agent
       .patch(url(`/system-users/${other.id}`))
       .set('x-csrf-token', token)

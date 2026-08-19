@@ -129,12 +129,28 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       .expect(401);
   });
 
-  it('AC-45 — VIEWER gets 403 on every /system-users route, with no DB read', async () => {
+  /*
+   * AC-45, as amended 19 ส.ค. 2569 (PO). It used to read "VIEWER gets 403 on EVERY /system-users
+   * route"; the READ half was wrong against the design — the prototype's role table for
+   * เจ้าหน้าที่ระบบ marks เห็นรายชื่อ + รายละเอียด ✅ for all three roles, and the app deliberately
+   * keeps that destination out of `VIEWER_DENY`. The WRITE half is the part that carries D-2 and it
+   * is unchanged, so it is asserted here in full.
+   */
+  it('AC-45 — VIEWER may READ the directory', async () => {
+    const { agent } = await login(VIEWER);
+
+    await agent.get(url('/system-users')).expect(200);
+    await agent.get(url(`/system-users/${ids[ADMIN]}`)).expect(200);
+
+    // The cost of that read, stated: existence is no longer hidden from a VIEWER. A real id answers
+    // 200 and an invented one 404 — which the directory they just listed would have told them anyway.
+    await agent.get(url('/system-users/does-not-exist')).expect(404);
+  });
+
+  it('AC-45 — VIEWER still gets 403 on every /system-users WRITE', async () => {
     const { agent, token } = await login(VIEWER);
     const id = ids[ADMIN];
 
-    await agent.get(url('/system-users')).expect(403);
-    await agent.get(url(`/system-users/${id}`)).expect(403);
     await agent
       .patch(url(`/system-users/${id}`))
       .set('x-csrf-token', token)
@@ -148,9 +164,27 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
       .post(url(`/system-users/${id}/restore`))
       .set('x-csrf-token', token)
       .expect(403);
+    await agent
+      .post(url(`/system-users/${id}/reset-password`))
+      .set('x-csrf-token', token)
+      .expect(403);
+    await agent
+      .post(url('/system-users'))
+      .set('x-csrf-token', token)
+      .send({
+        email: `${PREFIX}nope@easybook.local`,
+        firstName: 'N',
+        lastName: 'O',
+        role: 'VIEWER',
+        departmentId: 1,
+        personnelRoleId: 1,
+      })
+      .expect(403);
+  });
 
-    // A VIEWER caller cannot even distinguish a real id from an invented one.
-    await agent.get(url('/system-users/does-not-exist')).expect(403);
+  it('`status=deleted` stays SUPER_ADMIN-only even though the collection is now readable', async () => {
+    const { agent } = await login(VIEWER);
+    await agent.get(url('/system-users?status=deleted')).expect(403);
   });
 
   it('AC-45 — ADMIN gets 403 on DELETE and restore for any id, before the target is loaded', async () => {
@@ -910,7 +944,21 @@ describe('SystemUsers CRUD authz surface (e2e)', () => {
         .send({ role: SystemRole.VIEWER })
         .expect(200);
 
-      await victim.agent.get(url('/system-users')).expect(403);
+      /*
+       * "Loses /system-users" is now about the WRITES: since 19 ส.ค. 2569 a VIEWER may read the
+       * directory, so the demotion is felt on the routes the role actually gated. `status=deleted`
+       * is the read that still tells them apart, and it is checked here for the same reason — it
+       * is judged inside the service, not by `RolesGuard`.
+       */
+      await victim.agent
+        .patch(url(`/system-users/${ids[ADMIN]}`))
+        .set('x-csrf-token', victim.token)
+        .send({ firstName: 'Nope' })
+        .expect(403);
+      await victim.agent.get(url('/system-users?status=deleted')).expect(403);
+
+      // …and the reads they are now entitled to keep working, on the SAME cookie.
+      await victim.agent.get(url('/system-users')).expect(200);
       await victim.agent.get(url('/auth/system/me')).expect(200);
     });
   });

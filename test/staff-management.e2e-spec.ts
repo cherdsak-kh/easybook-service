@@ -301,7 +301,7 @@ describe('Staff Management (e2e)', () => {
 
       // Same agent, same cookie, no re-login: SessionGuard's per-request DB re-read is what makes
       // this work — and is why no session-revocation machinery exists.
-      // VIEWER is 403 on /system-users by ROLE, so assert on a route VIEWER may reach.
+      // Assert on `/auth/system/me`, which is one of the six routes the gate exempts.
       const me = await agent.get(url('/auth/system/me')).expect(200);
       expect((me.body as UserBody).mustChangePassword).toBe(false);
 
