@@ -271,9 +271,17 @@ describe('LINE Users management (e2e)', () => {
       .expect(401);
   });
 
-  it('AC-B7 — VIEWER gets 403 on both routes (not 401)', async () => {
+  /*
+   * ⚠️ AMENDED 19 ส.ค. 2569 (PO): a VIEWER READS this collection and writes nothing.
+   *
+   * It used to assert 403 on both routes, which matched the code and not the product: the portal's
+   * menu offers การลงทะเบียน to a VIEWER, so the closed read turned a menu row into a full-page 403.
+   * The half that is the actual boundary — the PATCH — is unchanged and asserted right below it, in
+   * the same test, so widening the read can never be mistaken for widening the write.
+   */
+  it('AC-B7 — VIEWER may LIST (200) but not write (403); no session is 401 on both', async () => {
     const { agent, token } = await login(VIEWER);
-    await agent.get(url('/line-users')).expect(403);
+    await agent.get(url('/line-users')).expect(200);
     await agent
       .patch(url(`/line-users/${luIds[`${LU_PREFIX}pending`]}`))
       .set('x-csrf-token', token)
@@ -281,8 +289,8 @@ describe('LINE Users management (e2e)', () => {
       .expect(403);
   });
 
-  it('AC-B1/B7 — both SUPER_ADMIN and ADMIN may list', async () => {
-    for (const email of [SUPER, ADMIN]) {
+  it('AC-B1/B7 — all three roles may list', async () => {
+    for (const email of [SUPER, ADMIN, VIEWER]) {
       const { agent } = await login(email);
       await agent.get(url('/line-users')).expect(200);
     }
