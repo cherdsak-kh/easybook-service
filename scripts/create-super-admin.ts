@@ -75,9 +75,25 @@ export const MIN_PASSWORD_LENGTH = 12;
  * expression. No name comparison ever decides privilege; the `isSystemReserved` FLAG is the boundary
  * and `SystemUser.role` is the only thing that grants anything.)
  */
-export const RESERVED_DEPARTMENT_NAME = 'ผู้พัฒนาระบบ (System Developer)';
-export const RESERVED_PERSONNEL_ROLE_NAME =
-  'ผู้ดูแลระบบระดับสูง (System Administrator)';
+/*
+ * ⚠️ RENAMED 19 ส.ค. 2569 (PO), and the pair now reads as a PERSON and the UNIT that person sits
+ * in: `ผู้พัฒนาระบบ` is a job title, `ฝ่ายพัฒนาระบบ` is where the job is done. Previously they were
+ * `ผู้พัฒนาระบบ` (department) and `EasyBook Development` (position) — a person-shaped name in the
+ * table of units, a product name in the table of titles, and neither matching the prototype.
+ *
+ * The English gloss in parentheses is kept on both, because on screen these two rows sit in a list
+ * of ordinary Thai options an operator curates: the gloss is what makes a row read as "belonging to
+ * the system" at a glance, next to `ผู้ดูแลระบบ`, which is an ordinary row granting nothing.
+ * It is a READING AID, never the boundary — `isSystemReserved` is.
+ *
+ * ⚠️ RENAMING THESE IS NOT RENAMING THE ROWS IN A DATABASE THAT ALREADY RAN THIS SCRIPT. Both are
+ * resolved BY NAME, so a rename makes the next run CREATE a new pair and re-point the SUPER_ADMIN
+ * at it; the old two rows survive, still flagged reserved, and no endpoint can rename or delete
+ * them (a reserved row is a 404 to everyone, SUPER_ADMIN included). An existing database therefore
+ * needs a reseed or a hand-written SQL fix — there is no in-product path.
+ */
+export const RESERVED_DEPARTMENT_NAME = 'ฝ่ายพัฒนาระบบ (System Development)';
+export const RESERVED_PERSONNEL_ROLE_NAME = 'ผู้พัฒนาระบบ (System Developer)';
 
 /**
  * The TOMBSTONE rows: where the holders of a deleted option are re-pointed (OPT-FALLBACK-1).
