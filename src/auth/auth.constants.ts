@@ -4,7 +4,40 @@
  */
 export const INVALID_CREDENTIALS = 'Invalid email or password.';
 
+/**
+ * The 401 for a session that simply is not usable: absent, or past the absolute cap. It is also
+ * what an ANONYMOUS caller gets, and that is the point — it says nothing about any account.
+ */
 export const AUTHENTICATION_REQUIRED = 'Authentication required.';
+
+/**
+ * The 401 for a session that RESOLVED to a real account which may no longer be used —
+ * `USER_NOT_FOUND` or `USER_REVOKED` (soft-deleted, or `isActive: false`). AUTH-401-REASON.
+ *
+ * ── Why the two are told apart at all ──
+ * They are the same status and the same remedy on the server, but NOT the same remedy for the
+ * person: a session that ended is fixed by signing in again, and an account that was suspended or
+ * deleted is not fixed by anything the operator can do. One message for both sent them to retry a
+ * login that cannot succeed, which is what the PO reported on 19 ส.ค. 2569.
+ *
+ * ⚠️ WHY THIS IS NOT AN EXISTENCE ORACLE. Reaching this branch requires a session cookie that
+ * already resolved to that user id — the caller was that account moments ago. An anonymous caller,
+ * or one holding a stale cookie for a session the store no longer has, gets `NO_SESSION` and
+ * therefore `AUTHENTICATION_REQUIRED` above. Nothing here can be used to probe whether an address
+ * or an id exists; `POST /auth/system/login` still answers `INVALID_CREDENTIALS` for unknown,
+ * wrong-password, suspended and deleted alike.
+ *
+ * ⚠️ DELIBERATELY COARSER THAN THE RESOLVER. `USER_NOT_FOUND` and `USER_REVOKED` collapse into one
+ * message because the difference between "the row is gone" and "the row is suspended" changes
+ * nothing the reader can do, and publishing it would be disclosure with no purpose.
+ *
+ * ⚠️ THE MESSAGE IS THE CONTRACT. `ErrorResponseDto` is `{ statusCode, error, message }` with no
+ * `code` field anywhere in this repo (see `MUST_CHANGE_PASSWORD` below for why one was not
+ * introduced), so the frontend matches on this exact string. Rewording it degrades the dialog to
+ * its generic copy — it does not break it — but the string is an interface: change it in both
+ * repositories or not at all.
+ */
+export const ACCOUNT_UNAVAILABLE = 'Account is no longer active.';
 
 /**
  * The forced-reset gate's `403` (AC-B8), raised by `SessionGuard` when `mustChangePassword` is true

@@ -9,6 +9,7 @@ import { Reflector } from '@nestjs/core';
 import { PrismaService } from '../../prisma/prisma.service';
 import { destroySessionQuietly } from '../../session/session.util';
 import {
+  ACCOUNT_UNAVAILABLE,
   AUTHENTICATION_REQUIRED,
   MUST_CHANGE_PASSWORD,
 } from '../auth.constants';
@@ -45,9 +46,12 @@ import { resolveSessionUser } from '../session-user.resolver';
  *
  * The lifecycle decision itself now lives in `resolveSessionUser` so the WebSocket handshake can
  * reuse it verbatim instead of growing a second auth path. This guard keeps everything that is
- * HTTP-specific and unchanged: the session destruction on the three 401 paths, the `Reflector`
- * gate, and the 403. `session.guard.spec.ts` passes unmodified — that is the contract of the
- * extraction, not a coincidence.
+ * HTTP-specific: the session destruction on the three 401 paths, the `Reflector` gate, and the 403.
+ *
+ * It also decides WHICH 401 MESSAGE the caller reads (AUTH-401-REASON, 19 ส.ค. 2569) — the
+ * resolver stays pure and returns a reason; turning that reason into something a person can act on
+ * is an HTTP concern, and the socket transport deliberately does not do it (its `session.closed`
+ * reason codes are coarser on purpose).
  */
 @Injectable()
 export class SessionGuard implements CanActivate {
@@ -68,7 +72,18 @@ export class SessionGuard implements CanActivate {
       if (resolution.reason !== 'NO_SESSION') {
         await destroySessionQuietly(req);
       }
-      throw new UnauthorizedException(AUTHENTICATION_REQUIRED);
+      /*
+       * AUTH-401-REASON. Two messages for four reasons, split by what the PERSON can do about it:
+       * a session that ended is fixed by signing in again, an account that is gone or suspended is
+       * not fixed by anything they can do. See `ACCOUNT_UNAVAILABLE` for why this is not an
+       * existence oracle and why the four reasons collapse into two.
+       */
+      const accountGone =
+        resolution.reason === 'USER_NOT_FOUND' ||
+        resolution.reason === 'USER_REVOKED';
+      throw new UnauthorizedException(
+        accountGone ? ACCOUNT_UNAVAILABLE : AUTHENTICATION_REQUIRED,
+      );
     }
 
     // Already stripped of `deletedAt` by the resolver, so it provably cannot reach
