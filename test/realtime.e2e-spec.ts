@@ -98,6 +98,12 @@ const LINE_USER_DTO_KEYS = [
   'followedAt',
   // Beside followedAt on purpose: the submission date, null for a follower who never registered.
   'registeredAt',
+  // The two operator-authored notes (19 ส.ค. 2569). They ride along because the event payload IS
+  // `toDto` — the same row the socket's audience can already GET — and a payload that omitted them
+  // would make a live-updated row disagree with the row a refresh returns. The audience did not
+  // widen: `/admin` is still SUPER_ADMIN|ADMIN, a strict subset of who may now read the list.
+  'rejectionReason',
+  'blockReason',
   'registration',
 ].sort();
 
@@ -622,7 +628,6 @@ describe('Realtime gateway (e2e)', () => {
       expect(Object.keys(adminPayload.user).sort()).toEqual(LINE_USER_DTO_KEYS);
       const serialised = JSON.stringify(adminPayload);
       expect(serialised).not.toContain('deletedAt');
-      expect(serialised).not.toContain('rejectionReason');
       expect(serialised).not.toContain('language');
 
       // Exactly one — a re-emit would duplicate rows in the operator's table.

@@ -209,6 +209,10 @@ export const LINE_USER_PUBLIC_FIELDS = {
   statusMessage: true,
   richMenuType: true,
   access: true,
+  // The two operator-authored notes. Selected because the back-office SHOWS them — see
+  // `LineUserResponseDto`. They are invariant-bound to `access`, so a row can never carry both.
+  rejectionReason: true,
+  blockReason: true,
   followedAt: true,
   registeredAt: true,
   registration: {
@@ -850,6 +854,11 @@ export class LineUserService {
    * the same case is a 400 here. On success the write persists the trimmed `reason` and the reject
    * push (`notifyRejection`) is sent instead of the ALLOWED/BLOCKED copy. The write ALSO enforces the
    * invariant: any non-REJECTED target clears `rejectionReason` to null.
+   *
+   * Block (`access === BLOCKED`) may carry the SAME `reason` field, and it is **optional** here —
+   * see the write below for why the two reasons are not symmetric. It lands in `blockReason`, under
+   * the mirror-image invariant: any non-BLOCKED target clears it to null. There is no push and no
+   * extra guard; a block with no reason behaves exactly as it did before this field existed.
    */
   async updateAccess(
     id: string,
@@ -898,6 +907,21 @@ export class LineUserService {
         // Invariant: set the guarded non-empty reason on REJECTED, clear it on every other target.
         // `reason!` is safe — the guard above guarantees it is non-empty when access === REJECTED.
         rejectionReason: access === AppAccess.REJECTED ? reason! : null,
+        /*
+         * The same invariant for the Block note, from the SAME `reason` field — one body key, and
+         * which column it lands in is decided by the target state, so a row can never hold both.
+         *
+         * ⚠️ NOT GUARDED, unlike the reject above, and that asymmetry is the design: a rejection
+         * reason is a MESSAGE pushed to the user (an empty one sends a blank LINE message), a block
+         * reason is an INTERNAL NOTE nobody outside this building reads. Requiring it here would
+         * also break `BLOCKED → BLOCKED`, which exists so an ADMIN can retry a 502 rich-menu apply
+         * by re-sending the same body.
+         *
+         * A re-block that carries no `reason` therefore CLEARS the previous note, and that is the
+         * right reading: the column describes the block currently in force, not a history of them.
+         * Keeping the old text would attach yesterday's sentence to today's decision.
+         */
+        blockReason: access === AppAccess.BLOCKED ? (reason ?? null) : null,
       },
       select: LINE_USER_PUBLIC_FIELDS,
     });
@@ -1069,6 +1093,8 @@ export class LineUserService {
       statusMessage: user.statusMessage,
       richMenuType: user.richMenuType,
       access: user.access,
+      rejectionReason: user.rejectionReason,
+      blockReason: user.blockReason,
       followedAt: user.followedAt.toISOString(),
       registeredAt: user.registeredAt?.toISOString() ?? null,
       registration: user.registration

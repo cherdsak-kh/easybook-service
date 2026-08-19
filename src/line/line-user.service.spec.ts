@@ -1094,6 +1094,7 @@ describe('LineUserService', () => {
           access: AppAccess.ALLOWED,
           richMenuType: 'TYPE_2',
           rejectionReason: null,
+          blockReason: null,
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
@@ -1128,6 +1129,7 @@ describe('LineUserService', () => {
           access: AppAccess.BLOCKED,
           richMenuType: 'TYPE_1',
           rejectionReason: null,
+          blockReason: null,
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
@@ -1230,6 +1232,7 @@ describe('LineUserService', () => {
           access: AppAccess.ALLOWED,
           richMenuType: 'TYPE_2',
           rejectionReason: null,
+          blockReason: null,
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
@@ -1313,6 +1316,7 @@ describe('LineUserService', () => {
             access: to,
             richMenuType: accessToRichMenuType(to),
             rejectionReason: null,
+            blockReason: null,
           },
           select: LINE_USER_PUBLIC_FIELDS,
         });
@@ -1447,6 +1451,7 @@ describe('LineUserService', () => {
           access: AppAccess.ALLOWED,
           richMenuType: 'TYPE_2',
           rejectionReason: null,
+          blockReason: null,
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
@@ -1482,6 +1487,110 @@ describe('LineUserService', () => {
       expect(line.push).not.toHaveBeenCalled();
     });
 
+    // ───────── Block note (→BLOCKED, OPTIONAL reason → `blockReason`), 19 ส.ค. 2569 ─────────
+    //
+    // The mirror of the reject reason in storage and its opposite in enforcement: optional, never
+    // pushed, back-office only. These four cases pin exactly that asymmetry, because the cheap
+    // mistake here is to "tidy" the two branches into one guarded field and start 400-ing a block.
+
+    it('a Block carrying a reason persists it as blockReason and leaves rejectionReason null', async () => {
+      primeRead(AppAccess.ALLOWED);
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.BLOCKED,
+        richMenuType: 'TYPE_1',
+        blockReason: 'ใช้บัญชีผิดคน',
+      });
+      line.findRichMenuId.mockResolvedValue('rm-type1');
+
+      const result = await service.updateAccess(
+        'lu-1',
+        AppAccess.BLOCKED,
+        actorOf(SystemRole.ADMIN),
+        'ใช้บัญชีผิดคน',
+      );
+
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        data: {
+          access: AppAccess.BLOCKED,
+          richMenuType: 'TYPE_1',
+          rejectionReason: null,
+          blockReason: 'ใช้บัญชีผิดคน',
+        },
+        select: LINE_USER_PUBLIC_FIELDS,
+      });
+      expect(result.blockReason).toBe('ใช้บัญชีผิดคน');
+      // ⚠️ The note is INTERNAL. The blocked user gets the ordinary BLOCKED copy and never the text.
+      expect(line.push).toHaveBeenCalledTimes(1);
+      const pushed = (
+        line.push.mock.calls[0] as [string, { text: string }[]]
+      )[1][0].text;
+      expect(pushed).toBe(BLOCKED_MSG);
+      expect(pushed).not.toContain('ใช้บัญชีผิดคน');
+    });
+
+    it('a Block with NO reason still succeeds — unlike a Reject, it is not required', async () => {
+      primeRead(AppAccess.ALLOWED);
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.BLOCKED,
+        richMenuType: 'TYPE_1',
+      });
+      line.findRichMenuId.mockResolvedValue('rm-type1');
+
+      const result = await service.updateAccess(
+        'lu-1',
+        AppAccess.BLOCKED,
+        actorOf(SystemRole.ADMIN),
+      );
+
+      expect(result.access).toBe(AppAccess.BLOCKED);
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        data: {
+          access: AppAccess.BLOCKED,
+          richMenuType: 'TYPE_1',
+          rejectionReason: null,
+          blockReason: null,
+        },
+        select: LINE_USER_PUBLIC_FIELDS,
+      });
+    });
+
+    it.each([AppAccess.ALLOWED, AppAccess.REJECTED])(
+      'leaving BLOCKED (→%s) clears blockReason — the note describes the block in force, not a history',
+      async (to) => {
+        primeRead(AppAccess.BLOCKED);
+        lineUser.update.mockResolvedValue({
+          ...publicRow,
+          access: to,
+          richMenuType: accessToRichMenuType(to),
+        });
+        line.findRichMenuId.mockResolvedValue('rm-x');
+
+        await service.updateAccess(
+          'lu-1',
+          to,
+          actorOf(SystemRole.ADMIN),
+          // A →REJECTED needs one; a →ALLOWED ignores it. Either way `blockReason` must go to null.
+          'ทบทวนแล้ว',
+        );
+
+        expect(lineUser.update).toHaveBeenCalledWith({
+          where: { id: 'lu-1' },
+          data: {
+            access: to,
+            richMenuType: accessToRichMenuType(to),
+            // The same string lands in the OTHER column on a →REJECTED, and nowhere on a →ALLOWED.
+            rejectionReason: to === AppAccess.REJECTED ? 'ทบทวนแล้ว' : null,
+            blockReason: null,
+          },
+          select: LINE_USER_PUBLIC_FIELDS,
+        });
+      },
+    );
+
     // ───────── Reject (→REJECTED, mandatory reason) — design §4, AC4/AC5/AC6 ─────────
 
     it('AC4/AC5 — ADMIN rejects a reachable PENDING user: persists the reason + TYPE_1, fires ONE reject push, 200', async () => {
@@ -1507,6 +1616,7 @@ describe('LineUserService', () => {
           access: AppAccess.REJECTED,
           richMenuType: 'TYPE_1',
           rejectionReason: 'phone is wrong',
+          blockReason: null,
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
@@ -1602,6 +1712,7 @@ describe('LineUserService', () => {
             access: to,
             richMenuType: accessToRichMenuType(to),
             rejectionReason: null,
+            blockReason: null,
           },
           select: LINE_USER_PUBLIC_FIELDS,
         });
@@ -1660,6 +1771,7 @@ describe('LineUserService', () => {
           access: AppAccess.REJECTED,
           richMenuType: 'TYPE_1',
           rejectionReason: 'account under review',
+          blockReason: null,
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });

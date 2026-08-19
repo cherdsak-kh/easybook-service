@@ -52,6 +52,20 @@ model LineUser {
   /// control, not a column constraint. PDPA: may contain the user's PII; NEVER logged.
   rejectionReason String?
 
+  /// Operator-authored reason for a Block, written on an admin Block and shown ONLY in the
+  /// back-office. INVARIANT: non-null only while `access === BLOCKED`; cleared to null on EVERY
+  /// transition to another state, exactly like `rejectionReason` above.
+  ///
+  /// ⚠️ IT IS NOT THE MIRROR OF `rejectionReason`, and the difference is deliberate. A rejection
+  /// reason is a MESSAGE — it is pushed to the user on LINE, so an empty one would send a blank
+  /// message, which is why the service REQUIRES it (400). A block reason is an internal NOTE: the
+  /// user never sees it, and requiring it here would also break the one path that must stay
+  /// idempotent (an ADMIN re-sending `BLOCKED → BLOCKED` to retry a 502 rich-menu apply). The
+  /// registration screen still asks for one — that is a UI rule, stated as such at the point of use.
+  ///
+  /// PDPA: operator-authored free text ABOUT a user; NEVER logged, same as `rejectionReason`.
+  blockReason String?
+
   followedAt    DateTime     @default(now())
 
   /// When this user SUBMITTED their registration. NULL until they do — which is what makes the

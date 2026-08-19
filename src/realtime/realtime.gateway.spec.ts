@@ -44,6 +44,9 @@ const dto: LineUserResponseDto = {
   statusMessage: null,
   richMenuType: 'TYPE_1',
   access: 'PENDING',
+  // A PENDING row carries neither note — they are invariant-bound to REJECTED and BLOCKED.
+  rejectionReason: null,
+  blockReason: null,
   followedAt: '2026-07-07T10:00:00.000Z',
   // Deliberately a DIFFERENT day from followedAt: the payload carries the day the form was
   // submitted, not the day they followed the OA.

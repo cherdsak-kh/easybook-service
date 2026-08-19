@@ -12,6 +12,7 @@ import { API_BASE_PATH } from '../src/common/api.constants';
 import { ACCESS_NOTIFICATION_MESSAGES } from '../src/line/line-user.service';
 import { LineService } from '../src/line/line.service';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { CACHE_KEY_PREFIX } from '../src/redis/redis.constants';
 import { createE2eApp, prismaOf, redisOf, waitForRedis } from './e2e-app';
 
 jest.setTimeout(120_000);
@@ -82,6 +83,27 @@ describe('LINE registration + status (e2e)', () => {
       `DELETE FROM line_users WHERE "lineUserId" LIKE '${LU_PREFIX}%'`,
     );
 
+  /**
+   * ⚠️ THE ROWS ARE NOT THE ONLY STATE THIS SUITE LEAVES BEHIND.
+   *
+   * `GET /line-users/status` is cache-aside with a 300s TTL (R1/R4), so deleting the Postgres rows
+   * between tests while leaving `eb:cache:line:status:<sub>` in place means the next run is served
+   * a status for a row that no longer exists — and `getStatus` returns before it would have
+   * re-created one. The symptom is AC-B1 failing on the DB assertion while the HTTP assertion above
+   * it passes, and it only appears when a run lands within five minutes of the previous one: run it
+   * alone after a pause and it is green, which is what made it read as flakiness for two sessions.
+   *
+   * Diagnosing it cost twice as long as it should have, because `KEYS 'line:status:*'` finds
+   * nothing — every cache key carries the `eb:cache:` prefix `RedisService` adds. Search for the
+   * key the way the SERVER writes it, not the way `cache-keys.ts` spells it.
+   */
+  const purgeStatusCache = async () => {
+    const keys = await redis.keys(
+      `${CACHE_KEY_PREFIX}line:status:${LU_PREFIX}*`,
+    );
+    if (keys.length > 0) await redis.del(...keys);
+  };
+
   const purgeOptions = async () => {
     await prisma.$executeRawUnsafe(
       `DELETE FROM departments WHERE "name" LIKE '${LU_PREFIX}%'`,
@@ -149,16 +171,19 @@ describe('LINE registration + status (e2e)', () => {
       .mockResolvedValue(undefined);
 
     await purgeLineUsers();
+    await purgeStatusCache();
     await purgeOptions();
     await seedOptions();
   }, 60_000);
 
   beforeEach(async () => {
     await purgeLineUsers();
+    await purgeStatusCache();
   });
 
   afterAll(async () => {
     await purgeLineUsers();
+    await purgeStatusCache();
     await purgeOptions();
     jest.restoreAllMocks();
     await app.close();
