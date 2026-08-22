@@ -40,18 +40,50 @@ import type { messagingApi } from '@line/bot-sdk';
  * convenience link would be worse than both.
  */
 
-/** The prototype's `@theme` values for the four statuses that get a card. */
+/**
+ * The band behind each headline.
+ *
+ * ⚠️ THREE ARE THE PROTOTYPE'S `@theme` TOKEN; ONE DELIBERATELY IS NOT, and the exception is a
+ * mistake this file made first and the PO caught on a real phone (22 ส.ค. 2569).
+ *
+ * Those tokens are FOREGROUND colours. `.badge-amber` is `bg-warning/10 text-warning`, so
+ * `--color-warning` has to be dark enough to read as TEXT on a pale wash — which is why amber-800
+ * is as deep as it is. Painted instead as a SOLID FILL it stops being amber: measured, `#92400e`
+ * is hue 23° at 31% lightness, which is the definition of brown. On screen the รออนุมัติ card came
+ * out the colour of mud between a crimson one and a green one.
+ *
+ * The other three survive the same treatment because of their hue, not because the reasoning was
+ * sound: emerald at 24%, sky at 32% and rose at 41% lightness still read green, blue and red.
+ * Orange is the one hue that becomes a different colour when you darken it.
+ *
+ * So PENDING uses **amber-700**, one step up the same ramp — hue 26° at 37%, and still 5.02:1
+ * against white, comfortably past 4.5 for the small eyebrow line above the headline. Amber-600
+ * (`#d97706`) reads more clearly amber still and was rejected: 3.19:1 passes only for large text,
+ * and the eyebrow is `xs`.
+ *
+ * ⚠️ IT IS NOT A DIFFERENT COLOUR FROM THE BADGE, it is the same hue at the lightness a fill
+ * needs. Copying a value without its job is what went wrong the first time.
+ */
 const TONE: Record<CardAccess, string> = {
-  [AppAccess.PENDING]: '#92400e', // amber-800  — `--color-warning`
+  [AppAccess.PENDING]: '#b45309', // amber-700 — see above; NOT `--color-warning`
   [AppAccess.ALLOWED]: '#047857', // emerald-700 — `--color-success`
   [AppAccess.REJECTED]: '#0369a1', // sky-700    — `--color-info`
   [AppAccess.BLOCKED]: '#be123c', // rose-700    — `--color-error`
 };
 
-/** Body text and the reason box. Fixed, because the bubble's surface is fixed. */
-const INK = '#1f2937';
-const INK_SOFT = '#4b5563';
-const SURFACE_SOFT = '#f3f4f6';
+/**
+ * Body text and the reason box, from the prototype's own surface tokens.
+ *
+ * ⚠️ SLATE, NOT TAILWIND'S DEFAULT GREY, and the first version got that wrong too — `#1f2937` /
+ * `#4b5563` / `#f3f4f6` are gray-800/600/100, a different family from every surface in this
+ * product. The portal is slate throughout (`--color-base-content` `#0f172a`, `--color-base-200`
+ * `#f1f5f9`, `--color-base-300` `#e2e8f0`), and grey beside slate reads as slightly dirty rather
+ * than as a deliberate second neutral.
+ */
+const INK = '#0f172a'; // slate-900 — `--color-base-content`
+const INK_SOFT = '#475569'; // slate-600 — the portal's secondary text weight
+const SURFACE_SOFT = '#f1f5f9'; // slate-100 — `--color-base-200`, the sunken fill
+const LINE_SOFT = '#e2e8f0'; // slate-200 — `--color-base-300`, the portal's divider
 
 /**
  * The states worth a card.
@@ -147,6 +179,11 @@ export function buildAccessCard(
       type: 'box',
       layout: 'vertical',
       backgroundColor: SURFACE_SOFT,
+      // ⚠️ A BORDER, because the fill alone is a 1.07:1 step off white — visible on the phone the
+      // PO photographed, but only just, and it read as a smudge rather than as a block. The
+      // portal draws the same distinction the same way: `cm-diff` is `border border-base-300`.
+      borderColor: LINE_SOFT,
+      borderWidth: '1px',
       cornerRadius: '8px',
       paddingAll: '12px',
       margin: 'lg',

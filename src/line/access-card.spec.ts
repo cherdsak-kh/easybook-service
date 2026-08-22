@@ -50,20 +50,17 @@ describe('buildAccessCard', () => {
   );
 
   it.each([
-    [AppAccess.PENDING, '#92400e'],
+    [AppAccess.PENDING, '#b45309'],
     [AppAccess.ALLOWED, '#047857'],
     [AppAccess.REJECTED, '#0369a1'],
     [AppAccess.BLOCKED, '#be123c'],
-  ] as [CardAccess, string][])(
-    '%s wears the back-office badge colour %s',
-    (access, hex) => {
-      // The exact `@theme` token behind that status's badge in the prototype. The operator who
-      // pressed the button and the user who receives the result see the same hue.
-      const header = bubbleOf(buildAccessCard(access, 'x'))
-        .header as messagingApi.FlexBox;
-      expect(header.backgroundColor).toBe(hex);
-    },
-  );
+  ] as [CardAccess, string][])('%s wears %s on its band', (access, hex) => {
+    // PENDING is amber-700, NOT `--color-warning`: that token is a foreground value and reads brown
+    // as a solid fill. See the comment on `TONE`.
+    const header = bubbleOf(buildAccessCard(access, 'x'))
+      .header as messagingApi.FlexBox;
+    expect(header.backgroundColor).toBe(hex);
+  });
 
   it('puts the rejection reason in its own block, not buried in a sentence', () => {
     const card = buildAccessCard(AppAccess.REJECTED, 'alt', {
