@@ -67,6 +67,51 @@ describe('LineIdTokenGuard', () => {
     fetchSpy.mockRestore();
   });
 
+  /**
+   * The display half of the payload. It is not identity and grants nothing — it exists so a LINE
+   * rename can reach our database, since LINE fires no event for one.
+   */
+  describe('profile claims', () => {
+    it('attaches `name`/`picture` when the token carries the profile scope', async () => {
+      fetchSpy.mockResolvedValue(
+        mockResponse(200, {
+          ...validPayload(),
+          name: 'เชิดศักดิ์ คำไล้',
+          picture: 'https://profile.line-scdn.net/abc',
+        }),
+      );
+      const { ctx, req } = contextFor(`Bearer ${SUB}-token`);
+
+      await expect(makeGuard().canActivate(ctx)).resolves.toBe(true);
+      expect(req.lineProfile).toEqual({
+        displayName: 'เชิดศักดิ์ คำไล้',
+        pictureUrl: 'https://profile.line-scdn.net/abc',
+      });
+    });
+
+    it.each([
+      ['absent', {}],
+      ['empty', { name: '', picture: '' }],
+      ['not strings', { name: 42, picture: null }],
+    ])(
+      'yields undefined, never null, when the claims are %s',
+      async (_label, claims) => {
+        // ⚠️ The consumer reads `undefined` as "no news" and would read `null` as "cleared", so a
+        // scope-less LIFF app must not be able to wipe a stored display name.
+        fetchSpy.mockResolvedValue(
+          mockResponse(200, { ...validPayload(), ...claims }),
+        );
+        const { ctx, req } = contextFor(`Bearer ${SUB}-token`);
+
+        await expect(makeGuard().canActivate(ctx)).resolves.toBe(true);
+        expect(req.lineProfile).toEqual({
+          displayName: undefined,
+          pictureUrl: undefined,
+        });
+      },
+    );
+  });
+
   it('accepts a valid token and attaches the verified sub to req.lineUserId', async () => {
     fetchSpy.mockResolvedValue(mockResponse(200, validPayload()));
     const { ctx, req } = contextFor(`Bearer ${SUB}-token`);

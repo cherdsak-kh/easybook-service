@@ -118,6 +118,7 @@ describe('LineUserService', () => {
     findRichMenuId: jest.fn(),
     linkRichMenuToUser: jest.fn(),
     push: jest.fn(),
+    getProfile: jest.fn(),
   };
   // The gateway is a three-method mock, the same shape `LineService` already has. Its methods are
   // synchronous and `void` in production, so nothing here needs to resolve.
@@ -126,6 +127,9 @@ describe('LineUserService', () => {
     emitLineUserUpdated: jest.fn(),
     emitLineUserDeleted: jest.fn(),
   };
+  // Hoisted so the profile-sync tests can assert on the cooldown marker. `getJson` is re-armed as
+  // a permanent miss in `beforeEach` — see the note at the provider below.
+  const redis = { getJson: jest.fn(), setJson: jest.fn(), del: jest.fn() };
 
   // The push copy per target access, read from the service's own source of truth so these
   // assertions test ROUTING (which copy goes out for which transition), not the copy's spelling.
@@ -154,6 +158,7 @@ describe('LineUserService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    redis.getJson.mockResolvedValue(null);
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         LineUserService,
@@ -171,14 +176,7 @@ describe('LineUserService', () => {
         { provide: RealtimeGateway, useValue: realtime },
         // Permanent cache miss — see the note in `options.service.spec.ts`. A hit would let
         // `getRegistrationOptions` skip Prisma and silently hollow out its assertions.
-        {
-          provide: RedisService,
-          useValue: {
-            getJson: jest.fn().mockResolvedValue(null),
-            setJson: jest.fn(),
-            del: jest.fn(),
-          },
-        },
+        { provide: RedisService, useValue: redis },
       ],
     }).compile();
     service = module.get<LineUserService>(LineUserService);
@@ -2423,6 +2421,139 @@ describe('LineUserService', () => {
           actorOf(SystemRole.ADMIN),
         ),
       ).resolves.toMatchObject({ id: 'lu-1' });
+    });
+  });
+
+  /**
+   * LINE fires no event when somebody renames themselves or changes their photo, so the two places
+   * we can notice are (a) their ID token on a LIFF call and (b) a `getProfile` while they are
+   * chatting. These cover both, and the three ways the sync must NOT fire.
+   */
+  describe('profile sync', () => {
+    const stored = {
+      id: 'lu-1',
+      lineUserId: 'U123',
+      displayName: 'Alice',
+      pictureUrl: 'https://line/old.jpg',
+    } as unknown as Parameters<LineUserService['syncProfile']>[0];
+
+    it('writes only the fields that actually changed, and emits `updated`', async () => {
+      lineUser.update.mockResolvedValue({ ...stored, displayName: 'Alicia' });
+      lineUser.findFirst.mockResolvedValue(publicRow);
+
+      await service.syncProfile(stored, {
+        displayName: 'Alicia',
+        pictureUrl: 'https://line/old.jpg', // unchanged — must not appear in `data`
+      });
+
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        data: { displayName: 'Alicia' },
+      });
+      // No operator: the LINE user did this to themselves.
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(
+        expect.anything(),
+        null,
+      );
+    });
+
+    it('does nothing at all when the profile is identical', async () => {
+      const same = await service.syncProfile(stored, {
+        displayName: 'Alice',
+        pictureUrl: 'https://line/old.jpg',
+      });
+
+      // ⚠️ The whole reason the comparison exists: without it every LIFF open would write a row
+      // and push a `lineUser.updated` down the admin socket for a rename that never happened.
+      expect(lineUser.update).not.toHaveBeenCalled();
+      expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
+      expect(same).toBe(stored);
+    });
+
+    it('treats a missing claim as "no news", never as "cleared"', async () => {
+      // A LIFF app without the `profile` scope verifies fine and carries neither claim. Writing
+      // `null` here would silently wipe a good display name with no event to trace it to.
+      await service.syncProfile(stored, {});
+      await service.syncProfile(stored, { displayName: '' });
+
+      expect(lineUser.update).not.toHaveBeenCalled();
+    });
+
+    it('backfills a row that was created bare by a LIFF-first user', async () => {
+      const bare = {
+        id: 'lu-2',
+        lineUserId: 'U999',
+        displayName: null,
+        pictureUrl: null,
+      } as unknown as Parameters<LineUserService['syncProfile']>[0];
+      lineUser.update.mockResolvedValue({ ...bare, displayName: 'Bob' });
+      lineUser.findFirst.mockResolvedValue(publicRow);
+
+      await service.syncProfile(bare, {
+        displayName: 'Bob',
+        pictureUrl: 'https://line/bob.jpg',
+      });
+
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-2' },
+        data: { displayName: 'Bob', pictureUrl: 'https://line/bob.jpg' },
+      });
+    });
+
+    it('refreshes from LINE on a webhook, marking the cooldown BEFORE the fetch', async () => {
+      lineUser.findFirst.mockResolvedValueOnce(stored);
+      line.getProfile.mockResolvedValue({
+        displayName: 'Alicia',
+        pictureUrl: 'https://line/new.jpg',
+      });
+      lineUser.update.mockResolvedValue({ ...stored, displayName: 'Alicia' });
+      lineUser.findFirst.mockResolvedValue(publicRow); // the publish() re-read
+
+      await service.refreshProfileFromLine('U123');
+
+      expect(redis.setJson).toHaveBeenCalledWith(
+        'line:profile-sync:U123',
+        1,
+        6 * 60 * 60,
+      );
+      expect(line.getProfile).toHaveBeenCalledWith('U123');
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        data: {
+          displayName: 'Alicia',
+          pictureUrl: 'https://line/new.jpg',
+        },
+      });
+    });
+
+    it('skips the LINE call entirely while the cooldown marker is set', async () => {
+      redis.getJson.mockResolvedValue(1);
+
+      await service.refreshProfileFromLine('U123');
+
+      expect(line.getProfile).not.toHaveBeenCalled();
+      // Not even the row read — a follower who chats all day must cost nothing.
+      expect(lineUser.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('does not refresh someone we have never seen or who unfollowed', async () => {
+      lineUser.findFirst.mockResolvedValue(null);
+
+      await service.refreshProfileFromLine('U404');
+
+      expect(redis.setJson).not.toHaveBeenCalled();
+      expect(line.getProfile).not.toHaveBeenCalled();
+    });
+
+    it('swallows a getProfile failure — a webhook must not fail over a rename', async () => {
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      lineUser.findFirst.mockResolvedValue(stored);
+      line.getProfile.mockRejectedValue(new Error('LINE 500'));
+
+      await expect(
+        service.refreshProfileFromLine('U123'),
+      ).resolves.toBeUndefined();
+      expect(lineUser.update).not.toHaveBeenCalled();
     });
   });
 });

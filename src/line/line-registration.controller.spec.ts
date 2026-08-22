@@ -52,7 +52,25 @@ describe('LineRegistrationController', () => {
 
       const result = await controller.getStatus(reqWith('U123'));
 
-      expect(users.getStatus).toHaveBeenCalledWith('U123');
+      expect(users.getStatus).toHaveBeenCalledWith('U123', undefined);
+      expect(result).toBe(status);
+    });
+
+    it('passes the ID token’s display claims through so a LINE rename reaches the DB', async () => {
+      // LINE has no "profile changed" webhook, so this call — already authenticated against a
+      // freshly verified token — is one of only two places a rename can be noticed. It must not
+      // change the RESPONSE, only what the service writes on the side.
+      const status = { access: AppAccess.UNREGISTERED, registration: null };
+      users.getStatus.mockResolvedValue(status);
+      const req = reqWith('U123');
+      req.lineProfile = { displayName: 'Alicia', pictureUrl: 'https://l/1' };
+
+      const result = await controller.getStatus(req);
+
+      expect(users.getStatus).toHaveBeenCalledWith('U123', {
+        displayName: 'Alicia',
+        pictureUrl: 'https://l/1',
+      });
       expect(result).toBe(status);
     });
   });

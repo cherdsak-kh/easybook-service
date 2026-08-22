@@ -72,7 +72,11 @@ export class LineRegistrationController {
   getStatus(
     @Req() req: RequestWithLineUserId,
   ): Promise<LineUserStatusResponseDto> {
-    return this.users.getStatus(req.lineUserId as string);
+    // `lineProfile` rides along on the same verified payload as the `sub` and keeps our copy of
+    // the caller's LINE display name and picture current — LINE fires no event when either
+    // changes, so this is one of only two moments we can find out. It changes nothing about this
+    // response; see `LineUserService.syncProfile`. Still identity from `sub` and `sub` alone.
+    return this.users.getStatus(req.lineUserId as string, req.lineProfile);
   }
 
   @Get('registration/options')

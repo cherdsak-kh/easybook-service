@@ -8,7 +8,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { RequestWithLineUserId } from '../line.types';
+import type { LineProfileClaims, RequestWithLineUserId } from '../line.types';
 
 const LINE_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
 const LINE_ISSUER = 'https://access.line.me';
@@ -24,6 +24,28 @@ interface LineIdTokenPayload {
   sub?: unknown;
   aud?: unknown;
   exp?: unknown;
+  /** Present only when the token was minted with the `profile` scope. Display data, not identity. */
+  name?: unknown;
+  picture?: unknown;
+}
+
+/**
+ * The display half of the payload, kept apart from the identity half on purpose.
+ *
+ * ⚠️ ONLY NON-EMPTY STRINGS SURVIVE, and every other shape becomes absent rather than `null`. The
+ * consumer treats absent as "no news" and would treat `null` as "the user cleared it" — so letting
+ * a missing claim through as `null` would wipe a follower's stored name the first time a LIFF app
+ * without the `profile` scope called us. `''` is folded into absent for the same reason: a blank
+ * display name is not something LINE lets anyone actually have.
+ *
+ * These claims are NOT re-validated against anything, and do not need to be: they arrive on the
+ * same LINE-signed payload the `sub` does, and they are written to display fields that no
+ * authorization decision reads.
+ */
+function profileClaimsOf(payload: LineIdTokenPayload): LineProfileClaims {
+  const str = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.length > 0 ? v : undefined;
+  return { displayName: str(payload.name), pictureUrl: str(payload.picture) };
 }
 
 /**
@@ -80,6 +102,7 @@ export class LineIdTokenGuard implements CanActivate {
 
     // Identity comes ONLY from the verified `sub`.
     req.lineUserId = payload.sub;
+    req.lineProfile = profileClaimsOf(payload);
     return true;
   }
 

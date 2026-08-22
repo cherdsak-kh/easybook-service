@@ -14,7 +14,9 @@ import type { RealtimeActor } from '../realtime/realtime.constants';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import {
   LIFF_OPTIONS_KEY,
+  LINE_PROFILE_SYNC_TTL_SECONDS,
   OPTION_LIST_KEYS,
+  lineProfileSyncKey,
   lineStatusKey,
 } from '../redis/cache-keys';
 import { RedisService } from '../redis/redis.service';
@@ -29,6 +31,7 @@ import { PaginatedLineUsersResponseDto } from './dto/paginated-line-users-respon
 import { RegistrationOptionsResponseDto } from './dto/registration-options-response.dto';
 import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
 import { LineService } from './line.service';
+import type { LineProfileClaims } from './line.types';
 import {
   ALREADY_REGISTERED,
   CANNOT_REJECT_UNREGISTERED,
@@ -395,6 +398,104 @@ export class LineUserService {
     return this.prisma.lineUser.create({ data: { lineUserId } });
   }
 
+  /**
+   * Bring our copy of a follower's LINE profile up to date.
+   *
+   * ── Why this exists at all ──
+   * LINE has **no "profile changed" webhook event** — the event list is message / unfollow /
+   * follow / postback and friends, and none of them fires when somebody renames themselves or
+   * swaps their photo. Before this, `upsertOnFollow` was the ONLY writer of `displayName` and
+   * `pictureUrl`, so a follower's name was frozen at the moment they added the OA, possibly years
+   * earlier, and the back-office's registration list showed that frozen name to an operator
+   * deciding whether to approve them.
+   *
+   * Since no event announces the change, the only thing left is to notice it whenever the user
+   * turns up carrying fresh data. Two moments do:
+   *
+   *   LIFF   every `GET /line-users/status` on a cache miss, from the ID token's own claims —
+   *          FREE, because `LineIdTokenGuard` has already paid for that round trip
+   *   chat   a webhook `message`/`postback`, via `getProfile` behind a 6h cooldown — a real API
+   *          call, so it is the fallback for followers who never open the app
+   *
+   * ⚠️ IT WRITES ONLY WHAT ACTUALLY CHANGED, and returning early is not a micro-optimisation. Every
+   * write here would otherwise bump `updatedAt` and fire a `lineUser.updated` down the admin
+   * socket — on every LIFF open, for every user, forever. The registration page would redraw
+   * itself and show its "มีรายการใหม่" bar for a rename that never happened.
+   *
+   * ⚠️ ABSENT IS "NO NEWS", NEVER "CLEARED". A caller with no claim for a field passes `undefined`
+   * and the stored value survives. Only an actual, different, non-empty value replaces it. The
+   * opposite reading would blank a good name the first time a LIFF app without the `profile` scope
+   * called us — a silent data loss with no event to trace it back to.
+   *
+   * ⚠️ SOFT-DELETED ROWS ARE NOT REFRESHED. `null` in, `null` out: an unfollowed user is gone, and
+   * `upsertOnFollow` is what resurrects them if they come back.
+   */
+  async syncProfile(
+    user: LineUser,
+    next: { displayName?: string; pictureUrl?: string },
+  ): Promise<LineUser> {
+    const data: { displayName?: string; pictureUrl?: string } = {};
+    if (next.displayName && next.displayName !== user.displayName) {
+      data.displayName = next.displayName;
+    }
+    if (next.pictureUrl && next.pictureUrl !== user.pictureUrl) {
+      data.pictureUrl = next.pictureUrl;
+    }
+    if (Object.keys(data).length === 0) return user;
+
+    const updated = await this.prisma.lineUser.update({
+      where: { id: user.id },
+      data,
+    });
+
+    // No operator: the LINE user renamed themselves, and an `actor` here would put somebody's name
+    // on a change they did not make. Same `null` the follow path passes, for the same reason.
+    await this.publish('updated', updated.id, null);
+
+    // ⚠️ NOT dropping `lineStatusKey`. `LineUserStatusResponseDto` carries `access` and the
+    // registration the USER typed — never their LINE display fields — so nothing in that payload
+    // just went stale. Dropping it anyway would evict the hottest key on the LINE surface on every
+    // rename for no reader's benefit.
+    return updated;
+  }
+
+  /**
+   * The chat-only fallback: re-fetch a follower's profile from LINE, at most once per cooldown.
+   *
+   * Best-effort in every direction — this runs inside webhook handling, where a thrown error would
+   * be logged and swallowed anyway, and where failing a delivery makes LINE retry the whole batch.
+   * A user we have never seen, a soft-deleted one, an unreachable Messaging API and a Redis that is
+   * down all resolve to "do nothing this time".
+   *
+   * ⚠️ THE MARKER IS SET BEFORE THE FETCH, not after. Setting it afterwards means a LINE outage
+   * retries `getProfile` on every single inbound message for as long as it lasts — precisely when
+   * the API is least able to answer. Paying for it with one skipped refresh window is the cheaper
+   * mistake.
+   */
+  async refreshProfileFromLine(lineUserId: string): Promise<void> {
+    const key = lineProfileSyncKey(lineUserId);
+    if (await this.redis.getJson<number>(key)) return;
+
+    const user = await this.findActiveByLineUserId(lineUserId);
+    if (!user) return;
+
+    await this.redis.setJson(key, 1, LINE_PROFILE_SYNC_TTL_SECONDS);
+    try {
+      const profile = await this.line.getProfile(lineUserId);
+      await this.syncProfile(user, {
+        displayName: profile.displayName,
+        pictureUrl: profile.pictureUrl,
+      });
+    } catch (error) {
+      // PII discipline, as everywhere in this file: the LINE id and nothing else.
+      this.logger.warn(
+        `Profile refresh failed for ${lineUserId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   /** Set the user's rich-menu type in the DB. Returns null if no active user. */
   async setRichMenuType(
     lineUserId: string,
@@ -752,7 +853,11 @@ export class LineUserService {
    * `sub`, so a caller can only ever read their own status. A LIFF-first user with no prior row gets
    * a fresh `UNREGISTERED` row + `registration: null`.
    */
-  async getStatus(lineUserId: string): Promise<LineUserStatusResponseDto> {
+  async getStatus(
+    lineUserId: string,
+    /** The caller's live LINE display fields, from their verified ID token. See below. */
+    profile?: LineProfileClaims,
+  ): Promise<LineUserStatusResponseDto> {
     // Cache-aside (R1). Two queries, and this is the one call every LINE user makes every time
     // they open the app.
     //
@@ -766,7 +871,26 @@ export class LineUserService {
     const cached = await this.redis.getJson<LineUserStatusResponseDto>(key);
     if (cached) return cached;
 
-    const user = await this.getOrCreateByLineUserId(lineUserId);
+    let user = await this.getOrCreateByLineUserId(lineUserId);
+
+    /*
+     * ⚠️ THIS IS WHERE A RENAME IS NOTICED, and it is free. `LineIdTokenGuard` has already
+     * verified this call's ID token against LINE, and that same signed payload carries the
+     * caller's current display name and picture — so keeping our copy fresh costs a comparison
+     * and, only when something really changed, one UPDATE. See `syncProfile`.
+     *
+     * ⚠️ ON THE CACHE MISS, DELIBERATELY. Above the cache check it would run on every LIFF poll;
+     * here it runs at most once per `lineStatusKey` TTL per user, which is the throttle this path
+     * would otherwise need built by hand. The cost is that a rename reaches the back-office up to
+     * one TTL after the user's next app open — an operator reading a name that was correct five
+     * minutes ago, against a page that never showed it at all before this.
+     *
+     * ⚠️ IT ALSO BACKFILLS. `getOrCreateByLineUserId` creates a bare row for anyone who reaches
+     * the LIFF without a `follow` webhook ever having been processed — no name, no picture. That
+     * row used to stay blank forever; now the first status call fills it in.
+     */
+    if (profile) user = await this.syncProfile(user, profile);
+
     const registration = await this.prisma.lineUserRegistration.findFirst({
       where: { lineUserId: user.id, deletedAt: null },
       select: REGISTRATION_OWNER_SELECT,

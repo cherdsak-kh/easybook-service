@@ -82,3 +82,26 @@ export const OPTION_CACHE_KEYS: readonly string[] = [
  */
 export const lineStatusKey = (lineSub: string): string =>
   `line:status:${lineSub}`;
+
+/**
+ * "This follower's LINE profile was re-fetched recently" — a cooldown marker for the webhook
+ * refresh path, NOT a copy of anything.
+ *
+ * ⚠️ IT IS WRITTEN FROM A NON-READ PATH, WHICH `RedisService.setJson` OTHERWISE FORBIDS (R4), and
+ * the exemption is the point rather than an oversight. That rule exists because a write that fills
+ * the cache is a DB-then-Redis pair which cannot be atomic — die between them and Redis serves a
+ * stale copy of a row until somebody edits it again. There is no copy here: the value is a
+ * throwaway `1`, and the two ways it can be wrong are "we skip one profile refresh" (marker
+ * survived a failed fetch) and "we do one extra" (marker lost to a flush). Neither can serve a
+ * wrong answer to anybody.
+ *
+ * ⚠️ THE TTL IS THE STALENESS BUDGET FOR A CHAT-ONLY FOLLOWER. Someone who opens the LIFF is
+ * refreshed from their ID token on every cache-missed `GET /line-users/status` — free, no cooldown.
+ * This path is the fallback for a follower who only ever chats with the OA, where each refresh
+ * costs a real Messaging-API call, so it is deliberately slow.
+ */
+export const lineProfileSyncKey = (lineSub: string): string =>
+  `line:profile-sync:${lineSub}`;
+
+/** How long the marker above suppresses another `getProfile` for the same follower. */
+export const LINE_PROFILE_SYNC_TTL_SECONDS = 6 * 60 * 60;

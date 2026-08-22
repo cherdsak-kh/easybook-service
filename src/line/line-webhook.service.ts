@@ -57,6 +57,7 @@ export class LineWebhookService {
       }
 
       case 'message':
+        await this.refreshProfile(event);
         if (event.message.type === 'text' && event.replyToken) {
           await this.line.reply(event.replyToken, [
             { type: 'text', text: `You said: ${event.message.text}` },
@@ -65,6 +66,7 @@ export class LineWebhookService {
         break;
 
       case 'postback': {
+        await this.refreshProfile(event);
         if (!event.replyToken) {
           break;
         }
@@ -102,6 +104,28 @@ export class LineWebhookService {
 
   private userIdOf(event: webhook.Event): string | undefined {
     return event.source?.type === 'user' ? event.source.userId : undefined;
+  }
+
+  /**
+   * Keep a chat-only follower's stored LINE profile from going stale.
+   *
+   * LINE announces a rename with **no event at all**, so the only way to learn about one is to
+   * look while the user happens to be talking to us. Anybody who opens the LIFF is refreshed for
+   * free from their own ID token (`LineUserService.getStatus`); this covers the follower who only
+   * ever uses the chat, and it costs a real `getProfile` call — hence the cooldown inside
+   * `refreshProfileFromLine` rather than a fetch per message.
+   *
+   * ⚠️ NOT ON `follow`, which does the fuller `upsertOnFollow` (it also clears `deletedAt` and
+   * moves `followedAt`), and NOT on `unfollow`, where refreshing the profile of somebody who just
+   * left would be work in the wrong direction.
+   *
+   * ⚠️ IT NEVER THROWS AND NEVER BLOCKS THE REPLY'S CORRECTNESS. `handleEvents` already swallows
+   * per-event failures so LINE does not retry the batch, and this is awaited only so the refresh
+   * cannot outlive the request that started it.
+   */
+  private async refreshProfile(event: webhook.Event): Promise<void> {
+    const userId = this.userIdOf(event);
+    if (userId) await this.users.refreshProfileFromLine(userId);
   }
 
   /** Best-effort profile fetch + upsert; the row is stored even if getProfile fails. */
