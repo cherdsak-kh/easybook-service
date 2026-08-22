@@ -41,35 +41,52 @@ import type { messagingApi } from '@line/bot-sdk';
  */
 
 /**
- * The band behind each headline.
+ * The band behind each headline, and the ink that goes on it.
  *
- * ⚠️ THREE ARE THE PROTOTYPE'S `@theme` TOKEN; ONE DELIBERATELY IS NOT, and the exception is a
- * mistake this file made first and the PO caught on a real phone (22 ส.ค. 2569).
+ * ── ⚠️ THREE ARE THE PROTOTYPE'S `@theme` TOKEN. THE FOURTH CANNOT BE, AND IT TOOK TWO TRIES TO
+ * ACCEPT THAT (PO, 22 ส.ค. 2569 — reported twice, from photographs of a real phone) ──
  *
  * Those tokens are FOREGROUND colours. `.badge-amber` is `bg-warning/10 text-warning`, so
  * `--color-warning` has to be dark enough to read as TEXT on a pale wash — which is why amber-800
- * is as deep as it is. Painted instead as a SOLID FILL it stops being amber: measured, `#92400e`
- * is hue 23° at 31% lightness, which is the definition of brown. On screen the รออนุมัติ card came
- * out the colour of mud between a crimson one and a green one.
+ * is as deep as it is. Painted instead as a SOLID FILL it stops being amber: `#92400e` is hue 23°
+ * at 31% lightness, which is brown, and the รออนุมัติ card arrived the colour of mud between a
+ * crimson one and a green one.
  *
- * The other three survive the same treatment because of their hue, not because the reasoning was
- * sound: emerald at 24%, sky at 32% and rose at 41% lightness still read green, blue and red.
- * Orange is the one hue that becomes a different colour when you darken it.
+ * The first fix moved one step up the same ramp to amber-700 and **was still brown** — hue 26° at
+ * 37%. That was the lesson: the problem was never the exact step, it was the CONSTRAINT. Insisting
+ * on white text forces the fill dark, and orange is the one hue that becomes a different colour
+ * when you darken it. Every candidate that satisfied white-on-fill was rust, and the second
+ * photograph said so.
  *
- * So PENDING uses **amber-700**, one step up the same ramp — hue 26° at 37%, and still 5.02:1
- * against white, comfortably past 4.5 for the small eyebrow line above the headline. Amber-600
- * (`#d97706`) reads more clearly amber still and was rejected: 3.19:1 passes only for large text,
- * and the eyebrow is `xs`.
+ * So PENDING inverts instead: **amber-500 `#f59e0b` with slate-900 ink**. Hue 38° — actual amber —
+ * and the contrast goes UP rather than down: 8.31:1 for the headline and 5.17:1 for the eyebrow at
+ * 75%, against 5.02 and (blended) far less on the white-on-rust version.
  *
- * ⚠️ IT IS NOT A DIFFERENT COLOUR FROM THE BADGE, it is the same hue at the lightness a fill
- * needs. Copying a value without its job is what went wrong the first time.
+ * ⚠️ THE ODD ONE OUT IS THE CORRECT ONE. Dark text on amber is not an inconsistency to apologise
+ * for beside three white-on-dark cards — it is what every road sign, hazard tape and design-system
+ * warning token does, because amber only exists at a lightness where white does not survive.
+ *
+ * The other three keep their token and their white ink: emerald at 24%, sky at 32% and rose at 41%
+ * lightness still read green, blue and red. They survived because of their hue, not because the
+ * original reasoning held.
  */
-const TONE: Record<CardAccess, string> = {
-  [AppAccess.PENDING]: '#b45309', // amber-700 — see above; NOT `--color-warning`
-  [AppAccess.ALLOWED]: '#047857', // emerald-700 — `--color-success`
-  [AppAccess.REJECTED]: '#0369a1', // sky-700    — `--color-info`
-  [AppAccess.BLOCKED]: '#be123c', // rose-700    — `--color-error`
+const TONE: Record<CardAccess, { fill: string; ink: string }> = {
+  // ⚠️ NOT `--color-warning`, and not white ink. See above before "fixing" this back.
+  [AppAccess.PENDING]: { fill: '#f59e0b', ink: '#0f172a' }, // amber-500 + slate-900
+  [AppAccess.ALLOWED]: { fill: '#047857', ink: '#ffffff' }, // emerald-700 — `--color-success`
+  [AppAccess.REJECTED]: { fill: '#0369a1', ink: '#ffffff' }, // sky-700    — `--color-info`
+  [AppAccess.BLOCKED]: { fill: '#be123c', ink: '#ffffff' }, // rose-700    — `--color-error`
 };
+
+/**
+ * The eyebrow sits at 75% of the headline's ink.
+ *
+ * Written as an 8-digit hex rather than an opacity property because Flex has no such property on
+ * a text node — `#0f172abf` is the alpha channel, and `bf` is 75% of 255. Both inks were measured
+ * at this alpha over their own fill (5.17:1 on amber, and white on the three dark bands is never
+ * in question), so the small line clears 4.5:1 on all four.
+ */
+const EYEBROW_ALPHA = 'bf';
 
 /**
  * Body text and the reason box, from the prototype's own surface tokens.
@@ -158,7 +175,7 @@ export function buildAccessCard(
   altText: string,
   { reason, liffUrl }: { reason?: string; liffUrl?: string | null } = {},
 ): messagingApi.FlexMessage {
-  const tone = TONE[access];
+  const { fill, ink } = TONE[access];
   const cta = CTA[access];
 
   const body: messagingApi.FlexComponent[] = [
@@ -202,15 +219,15 @@ export function buildAccessCard(
     header: {
       type: 'box',
       layout: 'vertical',
-      backgroundColor: tone,
+      backgroundColor: fill,
       paddingAll: '16px',
       spacing: 'xs',
       contents: [
-        text('สถานะการลงทะเบียน', { size: 'xs', color: '#ffffffcc' }),
+        text('สถานะการลงทะเบียน', { size: 'xs', color: ink + EYEBROW_ALPHA }),
         text(HEADLINE[access], {
           size: 'xl',
           weight: 'bold',
-          color: '#ffffff',
+          color: ink,
         }),
       ],
     },
@@ -233,7 +250,10 @@ export function buildAccessCard(
           type: 'button',
           style: 'primary',
           height: 'sm',
-          color: tone,
+          // Safe as the fill even though PENDING's is now light: `CTA` only covers ALLOWED and
+          // REJECTED, and both are dark bands whose white label LINE supplies itself. If a button
+          // is ever added to PENDING this needs its own contrast decision, not this line.
+          color: fill,
           action: { type: 'uri', label: cta, uri: liffUrl },
         },
       ],

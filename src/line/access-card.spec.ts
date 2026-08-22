@@ -50,17 +50,28 @@ describe('buildAccessCard', () => {
   );
 
   it.each([
-    [AppAccess.PENDING, '#b45309'],
-    [AppAccess.ALLOWED, '#047857'],
-    [AppAccess.REJECTED, '#0369a1'],
-    [AppAccess.BLOCKED, '#be123c'],
-  ] as [CardAccess, string][])('%s wears %s on its band', (access, hex) => {
-    // PENDING is amber-700, NOT `--color-warning`: that token is a foreground value and reads brown
-    // as a solid fill. See the comment on `TONE`.
-    const header = bubbleOf(buildAccessCard(access, 'x'))
-      .header as messagingApi.FlexBox;
-    expect(header.backgroundColor).toBe(hex);
-  });
+    [AppAccess.PENDING, '#f59e0b', '#0f172a'],
+    [AppAccess.ALLOWED, '#047857', '#ffffff'],
+    [AppAccess.REJECTED, '#0369a1', '#ffffff'],
+    [AppAccess.BLOCKED, '#be123c', '#ffffff'],
+  ] as [CardAccess, string, string][])(
+    '%s wears %s with %s ink',
+    (access, fill, ink) => {
+      // ⚠️ PENDING IS THE ODD ONE AND MUST STAY ODD. `--color-warning` (#92400e) is a FOREGROUND
+      // token; as a solid fill it is brown, and so is amber-700 — both were shipped, photographed
+      // and rejected. Amber only exists at a lightness where white text does not survive, so this
+      // card inverts. See the comment on `TONE`; do not "restore consistency" here.
+      const header = bubbleOf(buildAccessCard(access, 'x'))
+        .header as messagingApi.FlexBox;
+      const [eyebrow, headline] = header.contents as messagingApi.FlexText[];
+
+      expect(header.backgroundColor).toBe(fill);
+      expect(headline.color).toBe(ink);
+      // The small line is the same ink at 75% — the first thing that would fail if a fill were
+      // ever lightened again.
+      expect(eyebrow.color).toBe(`${ink}bf`);
+    },
+  );
 
   it('puts the rejection reason in its own block, not buried in a sentence', () => {
     const card = buildAccessCard(AppAccess.REJECTED, 'alt', {
