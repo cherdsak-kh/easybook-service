@@ -7,6 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { AppAccess, Prisma, SystemRole } from '@prisma/client';
+import { ConfigService } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
@@ -88,6 +89,21 @@ const ADMIN_ACTOR: AdminActor = {
   name: 'วีระ ทองดี',
   role: SystemRole.ADMIN,
 };
+
+const LIFF_URL = 'https://liff.line.me/1234567890-abcdefgh';
+
+/**
+ * What a status push looks like now: ONE Flex card whose `altText` is the sentence the plain-text
+ * push used to be.
+ *
+ * ⚠️ THE ASSERTIONS BELOW MATCH ON `altText`, NOT ON THE BUBBLE. Those existing tests are about
+ * ROUTING — which copy goes out for which transition — and pinning the bubble's layout in every
+ * one of them would turn a padding change into thirty red tests while testing the routing no
+ * better. The bubble's own shape is covered once, in `access-card.spec.ts`.
+ */
+const cardWithAlt = (altText: string) => [
+  expect.objectContaining({ type: 'flex', altText }) as unknown,
+];
 
 const actorOf = (role: SystemRole): AdminActor => ({
   id: 'op-1',
@@ -177,6 +193,12 @@ describe('LineUserService', () => {
         // Permanent cache miss — see the note in `options.service.spec.ts`. A hit would let
         // `getRegistrationOptions` skip Prisma and silently hollow out its assertions.
         { provide: RedisService, useValue: redis },
+        // `LINE_LIFF_URL` — a real value so the status cards carry their footer button and the
+        // assertions below exercise the branch a configured deploy actually renders.
+        {
+          provide: ConfigService,
+          useValue: { get: jest.fn().mockReturnValue(LIFF_URL) },
+        },
       ],
     }).compile();
     service = module.get<LineUserService>(LineUserService);
@@ -429,9 +451,7 @@ describe('LineUserService', () => {
       });
       // Best-effort "registration received" push (PENDING copy) to the caller's U… id (the arg),
       // not the cuid. Reuses the single PENDING source, so it can't drift from updateAccess.
-      expect(line.push).toHaveBeenCalledWith('U123', [
-        { type: 'text', text: PENDING_MSG },
-      ]);
+      expect(line.push).toHaveBeenCalledWith('U123', cardWithAlt(PENDING_MSG));
     });
 
     it('rejects a deleted/unknown departmentId with 400 (SC-B6), writing nothing', async () => {
@@ -651,9 +671,7 @@ describe('LineUserService', () => {
       expect(result.access).toBe(AppAccess.PENDING);
       expect(result.rejectionReason).toBeNull();
       // The existing PENDING ack is pushed to the caller's verified U… id (not the cuid).
-      expect(line.push).toHaveBeenCalledWith('U123', [
-        { type: 'text', text: PENDING_MSG },
-      ]);
+      expect(line.push).toHaveBeenCalledWith('U123', cardWithAlt(PENDING_MSG));
     });
 
     it('a REJECTED resubmit is fail-soft: still 200/PENDING when the PENDING ack push rejects (AC-7/AC-6)', async () => {
@@ -1101,9 +1119,7 @@ describe('LineUserService', () => {
       expect(result.access).toBe(AppAccess.ALLOWED);
       expect(result.richMenuType).toBe('TYPE_2');
       // Pushes the exact ALLOWED copy to the LINE-side U… id (not the cuid).
-      expect(line.push).toHaveBeenCalledWith('U123', [
-        { type: 'text', text: ALLOWED_MSG },
-      ]);
+      expect(line.push).toHaveBeenCalledWith('U123', cardWithAlt(ALLOWED_MSG));
     });
 
     it('Block writes richMenuType TYPE_1 and applies the TYPE_1 menu on LINE (AC-B8)', async () => {
@@ -1134,9 +1150,7 @@ describe('LineUserService', () => {
       expect(line.findRichMenuId).toHaveBeenCalledWith(RICH_MENU_SPECS.TYPE_1);
       expect(line.linkRichMenuToUser).toHaveBeenCalledWith('U123', 'rm-type1');
       // Pushes the exact BLOCKED copy to the LINE-side U… id.
-      expect(line.push).toHaveBeenCalledWith('U123', [
-        { type: 'text', text: BLOCKED_MSG },
-      ]);
+      expect(line.push).toHaveBeenCalledWith('U123', cardWithAlt(BLOCKED_MSG));
     });
 
     it('PENDING pushes the exact PENDING copy to the LINE-side U… id (SUPER_ADMIN forcing PENDING)', async () => {
@@ -1154,9 +1168,7 @@ describe('LineUserService', () => {
         actorOf(SystemRole.SUPER_ADMIN),
       );
 
-      expect(line.push).toHaveBeenCalledWith('U123', [
-        { type: 'text', text: PENDING_MSG },
-      ]);
+      expect(line.push).toHaveBeenCalledWith('U123', cardWithAlt(PENDING_MSG));
     });
 
     it('UNREGISTERED sends NO push (SUPER_ADMIN forcing UNREGISTERED)', async () => {
@@ -1522,8 +1534,8 @@ describe('LineUserService', () => {
       // ⚠️ The note is INTERNAL. The blocked user gets the ordinary BLOCKED copy and never the text.
       expect(line.push).toHaveBeenCalledTimes(1);
       const pushed = (
-        line.push.mock.calls[0] as [string, { text: string }[]]
-      )[1][0].text;
+        line.push.mock.calls[0] as [string, { altText: string }[]]
+      )[1][0].altText;
       expect(pushed).toBe(BLOCKED_MSG);
       expect(pushed).not.toContain('ใช้บัญชีผิดคน');
     });
@@ -1621,12 +1633,13 @@ describe('LineUserService', () => {
       expect(result.access).toBe(AppAccess.REJECTED);
       // Exactly ONE push, using the reject template — NOT the PENDING copy.
       expect(line.push).toHaveBeenCalledTimes(1);
-      expect(line.push).toHaveBeenCalledWith('U123', [
-        { type: 'text', text: rejectMsg('phone is wrong') },
-      ]);
+      expect(line.push).toHaveBeenCalledWith(
+        'U123',
+        cardWithAlt(rejectMsg('phone is wrong')),
+      );
       const pushed = (
-        line.push.mock.calls[0] as [string, { text: string }[]]
-      )[1][0].text;
+        line.push.mock.calls[0] as [string, { altText: string }[]]
+      )[1][0].altText;
       // Copy-agnostic on purpose: assert the admin's REASON is interpolated into whatever the
       // template currently says, rather than pinning a Thai fragment of the template itself. The
       // service still has to run to produce `pushed`, so this keeps asserting that a Reject routes
@@ -1716,9 +1729,7 @@ describe('LineUserService', () => {
         });
         // The existing ALLOWED/BLOCKED copy is used (NOT the reject copy).
         const expected = to === AppAccess.ALLOWED ? ALLOWED_MSG : BLOCKED_MSG;
-        expect(line.push).toHaveBeenCalledWith('U123', [
-          { type: 'text', text: expected },
-        ]);
+        expect(line.push).toHaveBeenCalledWith('U123', cardWithAlt(expected));
       },
     );
 

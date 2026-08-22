@@ -55,7 +55,18 @@ const menuType1: MenuDef = {
     size: { width: TYPE_1.width, height: TYPE_1.height },
     selected: true,
     name: TYPE_1.name,
-    chatBarText: 'EasyBook App',
+    /*
+     * ⚠️ THE SAME WORDS AS TYPE_2, and that is the point (PO, 22 ส.ค. 2569). `chatBarText` is the
+     * label on the bar that opens the rich menu — the one piece of this UI that is always on
+     * screen. It used to read `EasyBook App` here and `เริ่มต้นใช้งาน` on TYPE_2, so the bar
+     * silently renamed itself the moment an operator approved somebody: a control the user had
+     * learned changed its name, in a different language, to mark a change that had nothing to do
+     * with it. The menu BEHIND it is what differs between the two types; the handle is not.
+     *
+     * ⚠️ CHANGING THIS STRING DOES NOTHING UNTIL `npm run line:setup-richmenu` IS RE-RUN. Rich
+     * menus live on LINE's side, not in this repo — the script recreates them by name.
+     */
+    chatBarText: 'เริ่มต้นใช้งาน',
     areas: [
       {
         bounds: { x: 0, y: 0, width: TYPE_1.width, height: TYPE_1.height },

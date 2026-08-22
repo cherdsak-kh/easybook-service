@@ -142,3 +142,37 @@ describe('validateEnv — Cloudflare R2 (AC-B14)', () => {
     }
   });
 });
+
+/**
+ * `LINE_LIFF_URL` — the button on the ALLOWED and REJECTED status cards.
+ *
+ * Optional everywhere, because a missing convenience link is a card with no footer, not a broken
+ * deploy. Checked whenever present, because LINE validates a `uri` action's scheme and rejects the
+ * WHOLE message when it fails — a typo would not produce a dud button, it would silently stop
+ * every approval and return notification from arriving, visible only as a push warning in the log.
+ */
+describe('validateEnv — LINE_LIFF_URL', () => {
+  it('is optional: absent is fine', () => {
+    expect(() => validateEnv({ ...BASE })).not.toThrow();
+  });
+
+  it('accepts an https LIFF URL', () => {
+    expect(() =>
+      validateEnv({ ...BASE, LINE_LIFF_URL: 'https://liff.line.me/123-abc' }),
+    ).not.toThrow();
+  });
+
+  it('rejects a non-https URL at BOOT rather than at push time', () => {
+    expectError(
+      { ...BASE, LINE_LIFF_URL: 'http://liff.line.me/123-abc' },
+      /LINE_LIFF_URL must use https/,
+    );
+  });
+
+  it('rejects a malformed URL', () => {
+    expectError(
+      { ...BASE, LINE_LIFF_URL: 'liff.line.me/123-abc' },
+      /LINE_LIFF_URL must be a valid absolute URL/,
+    );
+  });
+});

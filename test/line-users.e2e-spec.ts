@@ -531,7 +531,7 @@ describe('LINE Users management (e2e)', () => {
 
       // Pushed to the LINE-side U… id (the fixture's lineUserId), NOT the cuid.
       expect(pushSpy).toHaveBeenCalledWith(lineUserId, [
-        { type: 'text', text: ALLOWED_MSG },
+        expect.objectContaining({ type: 'flex', altText: ALLOWED_MSG }),
       ]);
 
       // Best-effort: even when the push rejects, the PATCH still succeeds (no 500/502) and the
@@ -545,7 +545,7 @@ describe('LINE Users management (e2e)', () => {
         .expect(200);
       expect((blocked.body as LineUserBody).access).toBe(AppAccess.BLOCKED);
       expect(pushSpy).toHaveBeenCalledWith(lineUserId, [
-        { type: 'text', text: BLOCKED_MSG },
+        expect.objectContaining({ type: 'flex', altText: BLOCKED_MSG }),
       ]);
 
       const row = await prisma.lineUser.findUnique({

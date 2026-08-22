@@ -150,6 +150,32 @@ export function validateEnv(
     );
   }
 
+  /*
+   * `LINE_LIFF_URL` — the button on two of the four status cards. OPTIONAL EVERYWHERE, including
+   * production: an unset value renders those cards without a footer, which is a card that is
+   * slightly less convenient, not a broken one.
+   *
+   * ⚠️ CHECKED WHENEVER PRESENT, for the same reason `R2_PUBLIC_BASE_URL` is. LINE validates a
+   * `uri` action's scheme and rejects the WHOLE message if it fails — so a typo here would not
+   * produce a dud button, it would silently stop every approval and every return notification
+   * from arriving at all. That failure would surface as "users say they never got the message",
+   * days later, with nothing in our logs but a push warning. Boot is the place to catch it.
+   */
+  const liffUrl = str(raw, 'LINE_LIFF_URL');
+  if (liffUrl !== undefined) {
+    let parsed: URL | undefined;
+    try {
+      parsed = new URL(liffUrl);
+    } catch {
+      errors.push('LINE_LIFF_URL must be a valid absolute URL.');
+    }
+    // https only — LINE refuses anything else in a `uri` action, and the LIFF endpoint is https
+    // by definition.
+    if (parsed && parsed.protocol !== 'https:') {
+      errors.push('LINE_LIFF_URL must use https.');
+    }
+  }
+
   const sessionSecret = str(raw, 'SESSION_SECRET');
   const csrfSecret = str(raw, 'CSRF_SECRET');
   const cookieSecureRaw = str(raw, 'SESSION_COOKIE_SECURE');

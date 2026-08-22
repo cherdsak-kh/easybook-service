@@ -31,7 +31,7 @@ describe('LineWebhookService', () => {
     service = module.get<LineWebhookService>(LineWebhookService);
   });
 
-  it('follow: fetches profile, upserts the user, and replies', async () => {
+  it('follow: fetches profile and upserts the user, and says NOTHING back', async () => {
     line.getProfile.mockResolvedValue({ displayName: 'Alice', language: 'en' });
     const event = {
       type: 'follow',
@@ -45,7 +45,10 @@ describe('LineWebhookService', () => {
     expect(users.upsertOnFollow).toHaveBeenCalledWith(
       expect.objectContaining({ lineUserId: 'U1', displayName: 'Alice' }),
     );
-    expect(line.reply).toHaveBeenCalled();
+    // ⚠️ The welcome moved OUT of this repo (PO, 22 ส.ค. 2569): LINE delivers its own greeting
+    // message, configured in the Official Account Manager, before this webhook even runs. A reply
+    // here would be the second welcome in two seconds — and this one was English.
+    expect(line.reply).not.toHaveBeenCalled();
   });
 
   it('follow: still stores the user when getProfile fails', async () => {
@@ -61,6 +64,25 @@ describe('LineWebhookService', () => {
     expect(users.upsertOnFollow).toHaveBeenCalledWith(
       expect.objectContaining({ lineUserId: 'U2', displayName: null }),
     );
+  });
+
+  it('message: a typed message is answered with nothing', async () => {
+    // The `You said: …` echo was scaffolding from the day the webhook was wired up, and it had
+    // become the product telling every user in English that nobody is reading. Silence is the
+    // honest answer while there is no conversational feature — the account's surface is the rich
+    // menu and the LIFF app.
+    const event = {
+      type: 'message',
+      replyToken: 'rt',
+      message: { type: 'text', text: 'สวัสดีครับ' },
+      source: { type: 'user', userId: 'U5' },
+    } as unknown as webhook.Event;
+
+    await service.handleEvents([event]);
+
+    expect(line.reply).not.toHaveBeenCalled();
+    // Still handled, though: it is the only signal a chat-only follower gives us.
+    expect(users.refreshProfileFromLine).toHaveBeenCalledWith('U5');
   });
 
   it('unfollow: soft-deletes the user', async () => {

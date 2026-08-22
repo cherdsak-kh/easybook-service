@@ -40,11 +40,20 @@ export class LineWebhookService {
         if (userId) {
           await this.storeFollower(userId);
         }
-        if (event.replyToken) {
-          await this.line.reply(event.replyToken, [
-            { type: 'text', text: 'Welcome to easy-book-app! 🎉' },
-          ]);
-        }
+        /*
+         * ⚠️ NO REPLY (PO, 22 ส.ค. 2569). This used to answer `Welcome to easy-book-app! 🎉` — an
+         * English line, in a product whose every other word is Thai, that had survived from the
+         * first day of the LINE module.
+         *
+         * ⚠️ IT DOES NOT MEAN A NEW FOLLOWER IS GREETED BY SILENCE, and that is why deleting it is
+         * safe rather than a regression. LINE has a **greeting message** of its own, configured in
+         * the Official Account Manager and delivered by LINE the instant somebody adds the account
+         * — before this webhook is even called. It is where a welcome belongs: editable by whoever
+         * owns the copy, without a deploy. Two welcomes would have arrived back to back.
+         *
+         * What still happens here is the part only we can do: `storeFollower` writes the row the
+         * back-office lists them from.
+         */
         break;
       }
 
@@ -56,13 +65,18 @@ export class LineWebhookService {
         break;
       }
 
+      /*
+       * ⚠️ A TYPED MESSAGE IS ANSWERED WITH NOTHING (PO, 22 ส.ค. 2569). It used to echo
+       * `You said: ${text}` — a scaffold from the day the webhook was wired up, which had become
+       * the product telling every user, in English, that nobody is reading.
+       *
+       * Silence is the honest answer while there is no conversational feature: the account's
+       * surface is the rich menu and the LIFF app, and an echo invited people to type at a bot
+       * that cannot help them. The event is still handled — it is the only signal a chat-only
+       * follower gives us that their LINE profile may have changed.
+       */
       case 'message':
         await this.refreshProfile(event);
-        if (event.message.type === 'text' && event.replyToken) {
-          await this.line.reply(event.replyToken, [
-            { type: 'text', text: `You said: ${event.message.text}` },
-          ]);
-        }
         break;
 
       case 'postback': {

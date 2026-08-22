@@ -297,7 +297,7 @@ describe('LINE registration + status (e2e)', () => {
 
     // Best-effort PENDING push fired, to the caller's LINE U… id (the verified sub), not the cuid.
     expect(pushSpy).toHaveBeenCalledWith(currentSub, [
-      { type: 'text', text: PENDING_MSG },
+      expect.objectContaining({ type: 'flex', altText: PENDING_MSG }),
     ]);
 
     const row = await prisma.lineUser.findFirst({

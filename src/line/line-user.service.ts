@@ -7,6 +7,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { AppAccess, Prisma, SystemRole } from '@prisma/client';
 import type { LineUser, RichMenuType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -20,6 +21,7 @@ import {
   lineStatusKey,
 } from '../redis/cache-keys';
 import { RedisService } from '../redis/redis.service';
+import { buildAccessCard, type CardAccess } from './access-card';
 import { canAdminSetAccess } from './line-access.policy';
 import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
@@ -263,12 +265,24 @@ type OwnerRegistration = Prisma.LineUserRegistrationGetPayload<{
 export class LineUserService {
   private readonly logger = new Logger(LineUserService.name);
 
+  /**
+   * `LINE_LIFF_URL` — where a status card's button sends the user, or `null` when unset.
+   *
+   * ⚠️ READ ONCE, AT CONSTRUCTION, and never required. It is a convenience link on two of the four
+   * cards (see `access-card.ts`); a box that has not configured it gets cards with no footer, which
+   * is the correct degradation. Failing the boot over it would be treating a button like a secret.
+   */
+  private readonly liffUrl: string | null;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly line: LineService,
     private readonly realtime: RealtimeGateway,
     private readonly redis: RedisService,
-  ) {}
+    config: ConfigService,
+  ) {
+    this.liffUrl = config.get<string>('LINE_LIFF_URL') ?? null;
+  }
 
   /**
    * Fail-soft realtime publish. NEVER throws — it mirrors `notifyAccessChange`'s discipline: the
@@ -543,7 +557,15 @@ export class LineUserService {
     const text = ACCESS_NOTIFICATION_MESSAGES[access];
     if (!text) return;
     try {
-      await this.line.push(lineUserId, [{ type: 'text', text }]);
+      // The card carries the news; `text` becomes its `altText`, which is the notification banner
+      // and the fallback on a client that cannot render Flex — so the redesign added a bubble and
+      // took nothing away. `access` is narrowed by the `!text` guard above: the two states with no
+      // copy (`UNREGISTERED`, and `REJECTED` which uses `notifyRejection`) have already returned.
+      await this.line.push(lineUserId, [
+        buildAccessCard(access as CardAccess, text, {
+          liffUrl: this.liffUrl,
+        }),
+      ]);
     } catch (error) {
       // Best-effort: log the LINE id + target access (never PII) and continue.
       this.logger.warn(
@@ -571,7 +593,16 @@ export class LineUserService {
   ): Promise<void> {
     const text = buildRejectionMessage(reason);
     try {
-      await this.line.push(lineUserId, [{ type: 'text', text }]);
+      // ⚠️ The reason travels TWICE and that is not duplication: inside `altText` (the one-line
+      // copy `buildRejectionMessage` has always produced, which is what the phone's notification
+      // shows) and again as its own block in the card, where it is the thing being read rather
+      // than a clause after a colon.
+      await this.line.push(lineUserId, [
+        buildAccessCard(AppAccess.REJECTED, text, {
+          reason,
+          liffUrl: this.liffUrl,
+        }),
+      ]);
     } catch (error) {
       // PII discipline: never log the reason — only the LINE id + target access.
       this.logger.warn(
