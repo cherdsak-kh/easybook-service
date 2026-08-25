@@ -169,7 +169,7 @@ export class VenuesService {
       // After the commit, never before — dropping first leaves a window in which a concurrent read
       // refills the key from the pre-write state and nothing drops it again for the whole TTL.
       await this.redis.del(...VENUE_WRITE_CACHE_KEYS);
-      return toDto(created);
+      return toDto(await this.rehomePhotos(created));
     } catch (error) {
       throw this.mapWriteError(error);
     }
@@ -268,7 +268,7 @@ export class VenuesService {
           before.map((p) => p.url).filter((url) => !kept.has(url)),
         );
       }
-      return toDto(updated);
+      return toDto(await this.rehomePhotos(updated));
     } catch (error) {
       throw this.mapWriteError(error);
     }
@@ -356,6 +356,79 @@ export class VenuesService {
     });
     this.logger.log(`Venue soft-deleted. id=${id}`);
     await this.redis.del(...VENUE_WRITE_CACHE_KEYS);
+  }
+
+  /**
+   * Move a venue's freshly-uploaded photos out of the staging folder and into `venues/<venueId>/`
+   * (PO, 25 ส.ค. 2569 — *"เพิ่มโฟลเดอร์ของสถานที่นั้นมาอีกชั้น รูปจะได้ไม่ปนกัน"*).
+   *
+   * ⚠️ IT RUNS AFTER THE COMMIT, AND THE ORDER IS THE WHOLE DESIGN. The row is written pointing at
+   * the STAGING url first; only once that is safely stored does the object move and the row get
+   * repointed. The tempting order — compute the final key, store it, then copy — is strictly worse:
+   * a copy that fails then leaves a row pointing at an object that does not exist, i.e. a broken
+   * image. This way the worst case is a photo that stays in `_new/`, which still resolves and still
+   * renders. Untidy beats broken.
+   *
+   * ⚠️ ONLY STAGED KEYS MOVE. On a `PATCH` most of the set is already under the venue's folder from a
+   * previous save, and re-copying those would be pointless work and a second chance to fail.
+   *
+   * ⚠️ NEVER THROWS. Every step is best-effort and the venue is already saved; a storage problem must
+   * not turn into a failed request for a write that succeeded. A failure is logged and the row keeps
+   * its staging url.
+   *
+   * Returns the row to serve — re-read only when something actually moved, so the ordinary path
+   * (no new photos) costs no extra query.
+   */
+  private async rehomePhotos(row: VenueRow): Promise<VenueRow> {
+    const base = this.storage.publicBaseUrl();
+    if (!base) return row;
+    const prefix = `${base}/`;
+
+    const moves: { id: string; url: string }[] = [];
+    for (const photo of row.photos) {
+      if (!photo.url.startsWith(prefix)) continue;
+      const key = photo.url.slice(prefix.length);
+      if (!this.storage.isStagedVenuePhotoKey(key)) continue;
+
+      const target = this.storage.venuePhotoKeyFor(row.id, key);
+      if (!(await this.storage.copyObject(key, target))) continue;
+      moves.push({ id: photo.id, url: this.storage.publicUrlFor(target) });
+      // Best-effort, and only once the copy is known to have worked — deleting first would destroy
+      // the only copy if the write below never lands.
+      await this.storage.deleteObject(key);
+    }
+    if (moves.length === 0) return row;
+
+    try {
+      // One statement per photo rather than a `updateMany`: each row gets a different url, and the
+      // set is at most ten.
+      await this.prisma.$transaction(
+        moves.map((m) =>
+          this.prisma.venuePhoto.update({
+            where: { id: m.id },
+            data: { url: m.url },
+          }),
+        ),
+      );
+    } catch (error) {
+      // The objects are now in BOTH places (the copy landed, the delete may have too) and the rows
+      // still name the staging url. If the delete went through, those urls are dead — the one case
+      // in this method that is worse than doing nothing, and it needs a loud line rather than
+      // silence.
+      this.logger.error(
+        `Venue photo re-home committed in R2 but not in the database. id=${row.id} moved=${moves.length} reason=${error instanceof Error ? error.message : String(error)}`,
+      );
+      return row;
+    }
+
+    this.logger.log(
+      `Venue photos re-homed. id=${row.id} moved=${moves.length}`,
+    );
+    const fresh = await this.prisma.venue.findUnique({
+      where: { id: row.id },
+      include: PUBLIC_INCLUDE,
+    });
+    return fresh ?? row;
   }
 
   /**

@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  CopyObjectCommand,
   DeleteObjectCommand,
   PutObjectCommand,
   S3Client,
@@ -19,6 +20,16 @@ import type { AvatarImageType } from './image-sniff';
  * constant is a misconfiguration vector, not a knob.
  */
 const R2_REGION = 'auto';
+
+/**
+ * Where a venue photo lands before a venue owns it. Trailing slash included so callers never have to
+ * remember it.
+ *
+ * ⚠️ IT LIVES HERE, NOT IN `venues.constants.ts`. This module is the only thing in the repo that
+ * knows what an object key looks like — putting half a key shape in a feature module is how the two
+ * halves drift and a `startsWith` check quietly stops matching.
+ */
+export const VENUE_PHOTO_STAGING_PREFIX = 'venues/_new/';
 
 /** The extension stored in the object key, derived from the SNIFFED type — never `originalname`. */
 const EXTENSION: Record<AvatarImageType, string> = {
@@ -103,30 +114,70 @@ export class R2StorageService {
   }
 
   /**
-   * `venues/<32 lowercase hex>.<ext>` — FLAT, with no id segment at all.
+   * `venues/_new/<32 lowercase hex>.<ext>` — where an upload LANDS, before any venue owns it.
    *
-   * ⚠️ THE DESIGN LOG SAID `venues/<venueId>/…` AND THAT SHAPE IS UNAVAILABLE, because the PO chose
-   * upload-then-bind (option ข, 2026-08-25): the operator picks photos inside the CREATE dialog,
-   * where no venue exists yet and therefore no id does either. The alternatives were to split the
-   * form into two steps, or to upload into a staging prefix and COPY every object on save — a second
-   * R2 round trip per photo that can fail halfway through a write that has already committed.
+   * ⚠️ IT IS NOT WHERE THE PHOTO ENDS UP. `VenuesService` re-homes it to
+   * `venues/<venueId>/<same filename>` once the venue is written (PO, 25 ส.ค. 2569: *"เพิ่มโฟลเดอร์
+   * ของสถานที่นั้นมาอีกชั้น รูปจะได้ไม่ปนกัน"*). The staging step exists because the operator picks
+   * photos inside the CREATE dialog, where no venue exists and therefore no id does — upload-then-bind
+   * (`D-VN10`) is what the form requires, and this is the price of also getting a per-venue folder.
    *
-   * Dropping the id costs less than it looks, and the design log's own erasure paragraph is why: a
-   * `<venueId>` prefix does NOT do for venue photos what `<userId>` does for avatars. An erasure
-   * request names a PERSON, and a person appears nowhere in either key — so the prefix was never
-   * going to make a face findable. What it would have bought is "purge one venue's objects in one
-   * call", and venues are soft-deleted, never purged.
+   * `_new` cannot collide with a real folder: a cuid never starts with an underscore. It also sorts
+   * ahead of every venue id in a console listing, so "what has not been claimed yet" is visible at a
+   * glance — which is what the orphan sweep will want.
    *
-   * What the flat prefix does buy, and what the orphan sweep needs: every venue photo the system has
-   * ever minted is under one `venues/` prefix, so "objects with no row" is one `ListObjectsV2` and
-   * one query — easier, not harder, than if abandoned uploads were scattered under per-venue folders
-   * that a cancelled create would never have produced anyway.
-   *
-   * 128 bits of `randomBytes(16)` — UNGUESSABLE, for the same reason as the avatar key: the bucket
-   * is public-read, so enumerability is the whole threat.
+   * 128 bits of `randomBytes(16)` — UNGUESSABLE, for the same reason as the avatar key: the bucket is
+   * public-read, so enumerability is the whole threat. The filename carries all of that entropy, so
+   * the folder never has to be secret.
    */
   buildVenuePhotoKey(type: AvatarImageType): string {
-    return `venues/${randomBytes(16).toString('hex')}.${EXTENSION[type]}`;
+    return `${VENUE_PHOTO_STAGING_PREFIX}${randomBytes(16).toString('hex')}.${EXTENSION[type]}`;
+  }
+
+  /**
+   * The same object, under the venue that now owns it. Filename is preserved — it is the part that
+   * carries the entropy, and keeping it makes a staging key and its final key obviously the same
+   * photo when both turn up in a listing.
+   */
+  venuePhotoKeyFor(venueId: string, stagingKey: string): string {
+    return `venues/${venueId}/${stagingKey.slice(VENUE_PHOTO_STAGING_PREFIX.length)}`;
+  }
+
+  /** Is this key still sitting in the staging folder, i.e. does it need re-homing? */
+  isStagedVenuePhotoKey(key: string): boolean {
+    return key.startsWith(VENUE_PHOTO_STAGING_PREFIX);
+  }
+
+  /**
+   * Server-side copy. `MetadataDirective` defaults to COPY, so the sniffed `ContentType` set at
+   * upload survives — re-declaring it here would be a second place for it to drift.
+   *
+   * Returns whether it worked rather than throwing, because the caller runs this AFTER the database
+   * write has already committed. A failed copy leaves the row pointing at the staging object, which
+   * still resolves; a thrown error would turn "the photo is in the wrong folder" into "the save
+   * failed", which is a far worse answer to the same event.
+   */
+  async copyObject(fromKey: string, toKey: string): Promise<boolean> {
+    try {
+      await this.s3().send(
+        new CopyObjectCommand({
+          Bucket: this.config.getOrThrow<string>('R2_BUCKET'),
+          // ⚠️ `CopySource` IS BUCKET-QUALIFIED AND URI-ENCODED, unlike `Key`. Passing a bare key
+          // here is the classic mistake and surfaces as a NoSuchKey for an object that plainly
+          // exists.
+          CopySource: encodeURI(
+            `${this.config.getOrThrow<string>('R2_BUCKET')}/${fromKey}`,
+          ),
+          Key: toKey,
+        }),
+      );
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        `R2 copyObject failed (ignored). from=${fromKey} to=${toKey} reason=${error instanceof Error ? error.message : String(error)}`,
+      );
+      return false;
+    }
   }
 
   /** The durable, public https URL for a key. */

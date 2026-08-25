@@ -32,6 +32,7 @@ const ADMIN = `${SU_PREFIX}admin@easybook.local`;
 const VIEWER = `${SU_PREFIX}viewer@easybook.local`;
 
 const R2_BASE = 'https://cdn.e2e.invalid';
+const STAGING = 'venues/_new/';
 
 const url = (path: string) => `${API_BASE_PATH}${path}`;
 
@@ -77,21 +78,33 @@ describe('Venues (e2e)', () => {
   // fake that forgot to answer it would make every photo assertion below pass vacuously.
   const putImage = jest.fn();
   const deleteObject = jest.fn();
+  const copyObject = jest.fn();
   let keyCounter = 0;
   const storageFake = {
     isConfigured: () => true,
     publicBaseUrl: () => R2_BASE,
     buildAvatarKey: (userId: string, type: string) =>
       `avatars/${userId}/${'a'.repeat(32)}.${type === 'image/png' ? 'png' : 'jpg'}`,
+    // Mirrors the real shapes, INCLUDING the staging prefix — a fake that returned a final-looking
+    // key would make the re-home assertions below pass without the re-home ever running.
     buildVenuePhotoKey: (type: string) =>
-      `venues/${String(++keyCounter).padStart(32, '0')}.${type === 'image/png' ? 'png' : 'jpg'}`,
+      `${STAGING}${String(++keyCounter).padStart(32, '0')}.${type === 'image/png' ? 'png' : 'jpg'}`,
+    venuePhotoKeyFor: (venueId: string, stagingKey: string) =>
+      `venues/${venueId}/${stagingKey.slice(STAGING.length)}`,
+    isStagedVenuePhotoKey: (key: string) => key.startsWith(STAGING),
     publicUrlFor: (key: string) => `${R2_BASE}/${key}`,
     putImage,
     deleteObject,
+    copyObject,
   };
 
+  /** A URL as it looks straight after upload: still in the staging folder, owned by nobody. */
   const photoUrl = (n: number) =>
-    `${R2_BASE}/venues/${String(n).padStart(32, '0')}.png`;
+    `${R2_BASE}/${STAGING}${String(n).padStart(32, '0')}.png`;
+
+  /** The same photo once a venue owns it. */
+  const homedUrl = (venueId: string, n: number) =>
+    `${R2_BASE}/venues/${venueId}/${String(n).padStart(32, '0')}.png`;
 
   const server = () => app.getHttpServer();
 
@@ -224,8 +237,10 @@ describe('Venues (e2e)', () => {
   beforeEach(async () => {
     putImage.mockReset();
     deleteObject.mockReset();
+    copyObject.mockReset();
     putImage.mockResolvedValue(undefined);
     deleteObject.mockResolvedValue(true);
+    copyObject.mockResolvedValue(true);
     await clearThrottleCounters(redis);
     await seed();
   });
@@ -469,11 +484,24 @@ describe('Venues (e2e)', () => {
       const s = await login(ADMIN);
       const urls = [photoUrl(1), photoUrl(2), photoUrl(3)];
       const v = await create(s, { photoUrls: urls });
-      expect(v.photos.map((p) => p.url)).toEqual(urls);
+      // ⚠️ THE URLS COME BACK RE-HOMED, not as they were sent: the response names
+      // `venues/<venueId>/…`, never the staging folder they were uploaded into. The ORDER is what
+      // this test is about, and it survives the move.
+      expect(v.photos.map((p) => p.url)).toEqual([
+        homedUrl(v.id, 1),
+        homedUrl(v.id, 2),
+        homedUrl(v.id, 3),
+      ]);
       expect(v.photos.map((p) => p.position)).toEqual([0, 1, 2]);
 
-      // A new cover is a reordered set, not a flag — `photoUrls[0]` IS the cover.
-      const reordered = [photoUrl(3), photoUrl(1), photoUrl(2)];
+      // A new cover is a reordered set, not a flag — `photoUrls[0]` IS the cover. These are already
+      // the venue's own urls, so nothing is copied a second time.
+      const reordered = [
+        homedUrl(v.id, 3),
+        homedUrl(v.id, 1),
+        homedUrl(v.id, 2),
+      ];
+      copyObject.mockClear();
       const patched = await s.agent
         .patch(url(`/venues/${v.id}`))
         .set('x-csrf-token', s.token)
@@ -482,6 +510,8 @@ describe('Venues (e2e)', () => {
       expect((patched.body as VenueBody).photos.map((p) => p.url)).toEqual(
         reordered,
       );
+      // ⚠️ RE-HOMING AN ALREADY-HOMED PHOTO WOULD BE POINTLESS WORK AND A SECOND CHANCE TO FAIL.
+      expect(copyObject).not.toHaveBeenCalled();
 
       const rows = await prisma.venuePhoto.findMany({
         where: { venueId: v.id },
@@ -523,16 +553,71 @@ describe('Venues (e2e)', () => {
     it('replacing the set deletes the objects it dropped, and keeps the ones it did not', async () => {
       const s = await login(ADMIN);
       const v = await create(s, { photoUrls: [photoUrl(1), photoUrl(2)] });
+      // ⚠️ CLEARED AFTER THE CREATE, because the re-home deletes the two staging originals — counting
+      // from before it would measure the move rather than the drop.
       deleteObject.mockClear();
       await s.agent
         .patch(url(`/venues/${v.id}`))
         .set('x-csrf-token', s.token)
-        .send({ photoUrls: [photoUrl(2)] })
+        .send({ photoUrls: [homedUrl(v.id, 2)] })
         .expect(200);
       expect(deleteObject).toHaveBeenCalledTimes(1);
       expect(deleteObject).toHaveBeenCalledWith(
-        `venues/${String(1).padStart(32, '0')}.png`,
+        `venues/${v.id}/${String(1).padStart(32, '0')}.png`,
       );
+    });
+
+    /**
+     * The re-home itself (PO, 25 ส.ค. 2569). Asserted on the OBJECT STORE and on the ROW, because
+     * the response body alone would be satisfied by a service that renamed the url and moved nothing.
+     */
+    it('a newly uploaded photo is moved into the venue’s own folder', async () => {
+      const s = await login(ADMIN);
+      copyObject.mockClear();
+      deleteObject.mockClear();
+      const v = await create(s, { photoUrls: [photoUrl(1)] });
+
+      const staged = `${STAGING}${String(1).padStart(32, '0')}.png`;
+      const home = `venues/${v.id}/${String(1).padStart(32, '0')}.png`;
+      expect(copyObject).toHaveBeenCalledWith(staged, home);
+      // Copy FIRST, delete after — never the other way round, or a failed copy destroys the only
+      // copy of the photo.
+      expect(deleteObject).toHaveBeenCalledWith(staged);
+      expect(v.photos[0].url).toBe(homedUrl(v.id, 1));
+
+      const row = await prisma.venuePhoto.findFirst({
+        where: { venueId: v.id },
+        select: { url: true },
+      });
+      expect(row?.url).toBe(homedUrl(v.id, 1));
+      // The filename is preserved across the move — it is the part carrying the entropy.
+      expect(home.endsWith(staged.slice(STAGING.length))).toBe(true);
+    });
+
+    /**
+     * ⚠️ A FAILED COPY MUST NOT FAIL THE SAVE, and must not strand the row either. The venue is
+     * already committed by the time the move runs, so the honest outcome is a photo that stays in
+     * the staging folder — untidy, and still renders. Anything else turns a storage hiccup into a
+     * lost write or a broken image.
+     */
+    it('a copy failure leaves the venue saved and the photo still reachable', async () => {
+      const s = await login(ADMIN);
+      copyObject.mockResolvedValue(false);
+      deleteObject.mockClear();
+      const v = await create(s, {
+        name: `${ROW_PREFIX}copyfail`,
+        photoUrls: [photoUrl(1)],
+      });
+
+      expect(v.photos[0].url).toBe(photoUrl(1));
+      // ⚠️ THE ORIGINAL IS NOT DELETED when the copy did not land — that is the whole reason the
+      // delete is sequenced after it.
+      expect(deleteObject).not.toHaveBeenCalled();
+      const row = await prisma.venuePhoto.findFirst({
+        where: { venueId: v.id },
+        select: { url: true },
+      });
+      expect(row?.url).toBe(photoUrl(1));
     });
 
     it('uploads, and the key + ContentType come from the SNIFFED bytes', async () => {
@@ -545,8 +630,10 @@ describe('Venues (e2e)', () => {
           contentType: 'image/png',
         })
         .expect(200);
+      // Lands in STAGING — a venue does not exist yet on the create path, which is the whole reason
+      // the staging folder is there.
       expect((res.body as { url: string }).url).toMatch(
-        new RegExp(`^${R2_BASE}/venues/[0-9a-f]+\\.png$`),
+        new RegExp(`^${R2_BASE}/${STAGING}[0-9a-f]+\\.png$`),
       );
       // `originalname` is attacker-controlled and must never reach the key.
       expect(JSON.stringify(putImage.mock.calls)).not.toContain('evil');
@@ -604,16 +691,21 @@ describe('Venues (e2e)', () => {
         .set('x-csrf-token', s.token)
         .send({ url: photoUrl(7) })
         .expect(204);
+      // An UNBOUND photo is still in staging by definition — nothing has claimed it, so nothing has
+      // moved it.
       expect(deleteObject).toHaveBeenCalledWith(
-        `venues/${String(7).padStart(32, '0')}.png`,
+        `${STAGING}${String(7).padStart(32, '0')}.png`,
       );
 
       const v = await create(s, { photoUrls: [photoUrl(8)] });
       deleteObject.mockClear();
+      // ⚠️ THE VENUE'S URL, NOT THE STAGING ONE IT WAS UPLOADED AS. After the re-home the row names
+      // `venues/<id>/…`, so that is the url the guard has to recognise as referenced. Sending the
+      // stale staging url would be a 204 — and correctly so: nothing points at it any more.
       await s.agent
         .delete(url('/venues/photos'))
         .set('x-csrf-token', s.token)
-        .send({ url: photoUrl(8) })
+        .send({ url: homedUrl(v.id, 8) })
         .expect(409);
       // The guard is what keeps a live row from ever pointing at a dead object.
       expect(deleteObject).not.toHaveBeenCalled();
