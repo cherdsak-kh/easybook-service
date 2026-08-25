@@ -65,6 +65,42 @@ export const OPTION_CACHE_KEYS: readonly string[] = [
 ];
 
 /**
+ * The `VenueType` admin list. Same two-view keyspace as `optionListKey` and for the same reason:
+ * the result depends on exactly one thing beyond the table's contents — whether the caller may see
+ * the reserved row.
+ *
+ * ⚠️ A SEPARATE FUNCTION RATHER THAN `optionListKey('venueType', …)`, deliberately. `OptionModel` is
+ * the union `'department' | 'personnelRole'` and widening it does not compile — `OptionsService`'s
+ * hand-written `OptionDelegate` exists precisely because a union of two Prisma delegates is not
+ * callable, and a third table with a different `_count` cannot join it. Forcing the union would also
+ * make this key collide with an option key the moment the `? :` inside `optionListKey` fell through
+ * to its else branch.
+ */
+export const venueTypeListKey = (includeReserved: boolean): string =>
+  `opt:vtype:${includeReserved ? 'reserved' : 'plain'}`;
+
+/** Both `VenueType` views. Dropped by any write that can move a row or its venue count. */
+export const VENUE_TYPE_CACHE_KEYS: readonly string[] = [
+  venueTypeListKey(false),
+  venueTypeListKey(true),
+];
+
+/**
+ * The `Amenity` admin list — **ONE key, not two**, and the asymmetry is load-bearing rather than an
+ * optimisation.
+ *
+ * The other three curated tables need a `includeReserved` dimension because they hold rows a
+ * non-SUPER_ADMIN must not see. `Amenity` has no `isSystemReserved` column at all (see the model's
+ * comment): no System Developer row, and no tombstone, because deleting an amenity removes ticks
+ * from a join table and orphans nothing. Every caller sees byte-identical rows.
+ *
+ * ⇒ There is no role dimension to forget. The bug `optionListKey`'s comment warns about — serving a
+ * SUPER_ADMIN's view to the next ADMIN, invisible to any test run under a single account — is not
+ * merely avoided here, it is unrepresentable.
+ */
+export const AMENITY_LIST_KEY = 'opt:amenity';
+
+/**
  * A LINE user's own status view — the single call the LIFF client makes on open to decide which
  * of the four screens to render.
  *

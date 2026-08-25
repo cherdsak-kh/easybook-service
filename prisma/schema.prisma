@@ -241,6 +241,103 @@ model PersonnelRole {
   @@map("personnel_roles")
 }
 
+/// ประเภทสถานที่ — admin-curated venue categories. The THIRD table of this shape (Department,
+/// PersonnelRole, and now this), and it is deliberately a table rather than a Prisma enum for the
+/// same reason as those two: the school curates the vocabulary, and an enum would need a migration
+/// to add a category.
+///
+/// Soft-deleted, never hard-deleted. Active-name uniqueness is a PARTIAL unique index
+/// (`WHERE "deletedAt" IS NULL`, raw SQL in the migration — the PSL cannot express it), so `name` is
+/// deliberately NOT `@unique` here: a soft-deleted name is REUSABLE. Holds no PII.
+///
+/// ⚠️ THE FIVE STARTING CATEGORIES ARE NOT INVENTED. `project-documents/markdown/บทที่ 1.md` §1.3.2
+/// lists the nine real venues this system is for, and they project onto exactly five categories
+/// (โรงยิม 3 · ลานกิจกรรม 2 · สนามกีฬา 1 · ห้องประชุม 1 · หอประชุม 2 = 9). An earlier, invented
+/// taxonomy (ห้องเรียน · ห้องปฏิบัติการ · ห้องคอมพิวเตอร์ · โรงอาหาร) matched NOT ONE of the nine.
+/// They are a SEED, not a validation set — `scripts/seed-venue-types.ts` writes them and nothing
+/// checks against them afterwards.
+model VenueType {
+  id   Int    @id @default(autoincrement())
+  name String
+
+  /// TRUE only for the tombstone row `ไม่พบประเภทสถานที่`, where a deleted category's venues are
+  /// re-pointed. Identical flag and identical meaning to Department.isSystemReserved: it supplies
+  /// the lock in the table, the SUPER_ADMIN-only visibility, and the 404 on rename/delete for every
+  /// role — all three for free.
+  ///
+  /// ⚠️ THIS TABLE HAS EXACTLY ONE BEARER, unlike the other two. The personnel tables each carry TWO
+  /// reserved rows because `create-super-admin.ts` must file the System Developer under a ตำแหน่ง
+  /// and a กลุ่ม/ฝ่าย. It needs no venue category. So here `isSystemReserved` and the derived
+  /// `isFallback` are true of the same single row — which is NOT a reason to collapse them: an
+  /// operator may create an ordinary row literally NAMED `ไม่พบประเภทสถานที่`, and the flag is what
+  /// keeps that row ordinary and assignable.
+  ///
+  /// Settable by NO endpoint: absent from every DTO, so `forbidNonWhitelisted: true` 400s any
+  /// attempt — the same construction that protects `SystemUser.lineUserId`.
+  ///
+  /// ⚠️ ITS ONE WRITER IS `scripts/seed-venue-types.ts`, not `create-super-admin.ts` and not
+  /// `options:seed` (`Q16`, answered 2026-08-25). The rule those two encode is "exactly ONE writer
+  /// of this flag PER TABLE"; this table had none, so its seed script becomes that writer and may
+  /// therefore write both the ordinary rows and the reserved one.
+  isSystemReserved Boolean @default(false)
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  /// Back-relation for `Venue.venueType`. ⚠️ STILL COMMENTED — `Venue` has a design
+  /// (`feature/20260824_1359_venues/02_design_log.md`) but no table yet, because the PO ordered the
+  /// two option screens first. A model with no relations is legal, so this table ships, seeds and is
+  /// curated on its own; until `Venue` exists every row honestly reports 0 venues, which is the
+  /// correct thing for the screen to print when the system contains no venues at all.
+  // venues Venue[] @relation("VenueVenueType")
+
+  @@index([deletedAt])
+  @@map("venue_types")
+}
+
+/// อุปกรณ์ที่ให้บริการ — admin-curated amenity vocabulary, ticked on the venue form and used to
+/// filter venues. Soft-deleted; partial unique index on the active name, exactly like the three
+/// tables above. Holds no PII.
+///
+/// ⚠️ NO `isSystemReserved`, AND THE ABSENCE IS THE DESIGN — not an oversight and not "add it later
+/// if needed". Neither kind of reserved row can exist here:
+///
+///   · no System Developer row — that account needs a ตำแหน่ง and a กลุ่ม/ฝ่าย, never an amenity;
+///   · no tombstone — an amenity is a TICK in a join table, so deleting one removes ticks and
+///     orphans nothing. There is no required FK left dangling, hence nowhere to re-point to.
+///
+/// The rejected alternative was to add the column `@default(false)` so all four tables look alike.
+/// A column that no code may ever write `true` is a lie that does not sit still — somebody finds a
+/// use for it. And the uniformity it buys is imaginary: `OptionDelegate` hard-codes three things
+/// this table contradicts (the `_count` is over a different table, the delete resolves no tombstone,
+/// and holders are แห่ง rather than คน), so this table needs its own service either way.
+///
+/// The WIRE shape stays identical — `AmenityResponseDto` returns `isSystemReserved: false` and
+/// `isFallback: false` as constants — because what the client shares with the other three screens is
+/// a response shape, not a column.
+///
+/// ⇒ This is the only one of the four curated tables where a SUPER_ADMIN and an ADMIN see
+/// byte-identical rows, and the only one that may legitimately ship EMPTY: the other three are
+/// pointed at by required FKs, so an empty table means nothing can be created at all, while an
+/// amenity is optional on the venue form. `Q18` (2026-08-25): the vocabulary is the operator's, so
+/// there is no correct starting list to collect — only one to avoid inventing. **It seeds zero rows.**
+model Amenity {
+  id   Int    @id @default(autoincrement())
+  name String
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  /// Back-relation for `VenueAmenity.amenity`. ⚠️ Commented for the same reason as `VenueType.venues`
+  /// above — the join table arrives with `Venue`.
+  // venues VenueAmenity[]
+
+  @@index([deletedAt])
+  @@map("amenities")
+}
+
 /// Back-office operator role. Distinct from AppAccess (LINE consumer domain) by design.
 ///
 /// The third value is VIEWER, not STAFF. "เจ้าหน้าที่" is what the portal calls every operator in

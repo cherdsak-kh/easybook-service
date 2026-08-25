@@ -18,6 +18,8 @@ import { CsrfModule } from './csrf/csrf.module';
 import { HealthModule } from './health/health.module';
 import { LineModule } from './line/line.module';
 import { OptionsModule } from './options/options.module';
+import { VenueTypesModule } from './venue-types/venue-types.module';
+import { AmenitiesModule } from './amenities/amenities.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { SystemModule } from './system/system.module';
 import { RealtimeModule } from './realtime/realtime.module';
@@ -79,6 +81,11 @@ const throttlerModule: DynamicModule = {
     AuthModule,
     SystemUsersModule,
     OptionsModule,
+    // The venue-side curated vocabularies. Separate modules rather than more
+    // controllers on OptionsModule: they share a screen and a response shape with
+    // /departments, not a service.
+    VenueTypesModule,
+    AmenitiesModule,
     SystemModule,
     // Domain modules (ResourceModule, BookingModule, ...) are added in their own tasks.
   ],
