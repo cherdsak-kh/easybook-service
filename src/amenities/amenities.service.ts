@@ -23,6 +23,7 @@ interface AmenityRow {
   name: string;
   createdAt: Date;
   updatedAt: Date;
+  _count: { venues: number };
 }
 
 const PUBLIC_SELECT = {
@@ -30,6 +31,16 @@ const PUBLIC_SELECT = {
   name: true,
   createdAt: true,
   updatedAt: true,
+  /*
+   * ✅ REAL SINCE VENUE-1 (2026-08-25) — this was a hard-coded `0`.
+   *
+   * ⚠️ THE FILTER REACHES THROUGH THE JOIN TABLE, which is the one shape difference from
+   * `VenueType`'s otherwise identical count. `venues` here is `VenueAmenity[]`, not `Venue[]`, so
+   * "how many venues provide this" is a count of TICKS whose venue is still live — `{ venue: {
+   * deletedAt: null } }`, not `{ deletedAt: null }`. The latter type-checks against the join row's
+   * own (non-existent) column only by accident of naming, so it is worth stating.
+   */
+  _count: { select: { venues: { where: { venue: { deletedAt: null } } } } },
 } as const;
 
 /**
@@ -39,8 +50,9 @@ const PUBLIC_SELECT = {
  * SHAPE, not a storage shape. Adding the columns "for symmetry" would put a field in the database
  * that no code may ever set to `true`, and a column like that does not stay unused.
  *
- * `holderCount` is hard-zero for the same reason it is on `VenueType`: there are no venues yet, so
- * no amenity is provided anywhere. It becomes `_count` over `VenueAmenity` with VENUE-1.
+ * `holderCount` counts the VENUES that provide this amenity and are not soft-deleted — the same
+ * question `VenueType.holderCount` answers, phrased over a join table. It was a hard zero until
+ * VENUE-1 and is now real.
  */
 const toDto = (row: AmenityRow): AmenityResponseDto => ({
   id: row.id,
@@ -49,7 +61,7 @@ const toDto = (row: AmenityRow): AmenityResponseDto => ({
   isFallback: false,
   createdAt: row.createdAt.toISOString(),
   updatedAt: row.updatedAt.toISOString(),
-  holderCount: 0,
+  holderCount: row._count.venues,
 });
 
 /**
@@ -161,20 +173,32 @@ export class AmenitiesService {
     // One transaction, because releasing the ticks and retiring the row is one operation: a failure
     // between them would leave venues advertising an amenity that no longer exists, or an amenity
     // nobody can find still ticked on nine venues.
-    await this.prisma.$transaction(async (tx) => {
+    const releasedVenueCount = await this.prisma.$transaction(async (tx) => {
+      // ✅ THE RELEASE THE COMMENT HERE WAS WAITING FOR (VENUE-1, 2026-08-25).
+      //
+      // ⚠️ COUNTED BEFORE THE DELETE, AND ONLY OVER LIVE VENUES. `deleteMany().count` would include
+      // ticks on soft-deleted venues, and the number goes into a toast that confirms what the confirm
+      // dialog promised — a dialog that quoted the LIST's count, which excludes them. Two numbers
+      // that disagree by "venues nobody can see" is the worst kind of off-by-N: it is correct in the
+      // database and wrong on the screen.
+      const released = await tx.venueAmenity.count({
+        where: { amenityId: existing.id, venue: { deletedAt: null } },
+      });
+      // The delete itself is NOT filtered: a tick on a soft-deleted venue must go too, or restoring
+      // that venue would resurrect a claim about an amenity that no longer exists.
+      await tx.venueAmenity.deleteMany({ where: { amenityId: existing.id } });
       await tx.amenity.update({
         where: { id: existing.id },
         data: { deletedAt: new Date() },
       });
-      // ⚠️ THE RELEASE LANDS HERE WITH VENUE-1:
-      //   await tx.venueAmenity.deleteMany({ where: { amenityId: existing.id } });
-      // …and `releasedVenueCount` becomes its `count`. Until `VenueAmenity` exists there is nothing
-      // to release and 0 is the true answer, not a stub.
+      return released;
     });
 
-    this.logger.log(`Amenity soft-deleted. id=${id} releasedVenues=0`);
+    this.logger.log(
+      `Amenity soft-deleted. id=${id} releasedVenues=${releasedVenueCount}`,
+    );
     await this.redis.del(AMENITY_LIST_KEY);
-    return { releasedVenueCount: 0 };
+    return { releasedVenueCount };
   }
 
   /** A `P2002` from the partial-unique index → 409; anything else is rethrown unchanged. */

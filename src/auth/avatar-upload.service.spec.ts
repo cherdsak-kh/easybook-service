@@ -38,7 +38,7 @@ const userOf = (profilePictureUrl: string | null = null) =>
 describe('AvatarUploadService', () => {
   let service: AvatarUploadService;
 
-  const putAvatar = jest.fn();
+  const putImage = jest.fn();
   const deleteObject = jest.fn();
   const buildAvatarKey = jest.fn();
   const publicUrlFor = jest.fn();
@@ -46,7 +46,7 @@ describe('AvatarUploadService', () => {
   const setOwnAvatar = jest.fn();
 
   const storage = {
-    putAvatar,
+    putImage,
     deleteObject,
     buildAvatarKey,
     publicUrlFor,
@@ -58,7 +58,7 @@ describe('AvatarUploadService', () => {
     jest.clearAllMocks();
     // clearAllMocks clears CALLS, not implementations — a mockRejectedValue set by one test would
     // otherwise leak into every test after it.
-    putAvatar.mockResolvedValue(undefined);
+    putImage.mockResolvedValue(undefined);
     buildAvatarKey.mockReturnValue('avatars/u-1/deadbeef.png');
     publicUrlFor.mockImplementation((k: string) => `${BASE}/${k}`);
     publicBaseUrl.mockReturnValue(BASE);
@@ -83,7 +83,7 @@ describe('AvatarUploadService', () => {
   it('uploads a valid PNG and writes the resulting https URL', async () => {
     await service.replaceAvatar(userOf(), fileOf());
 
-    expect(putAvatar).toHaveBeenCalledWith(
+    expect(putImage).toHaveBeenCalledWith(
       'avatars/u-1/deadbeef.png',
       expect.any(Buffer),
       'image/png',
@@ -105,7 +105,7 @@ describe('AvatarUploadService', () => {
     await expect(service.replaceAvatar(userOf(), file)).rejects.toThrow(
       new BadRequestException(AVATAR_TYPE_UNSUPPORTED),
     );
-    expect(putAvatar).not.toHaveBeenCalled();
+    expect(putImage).not.toHaveBeenCalled();
     expect(setOwnAvatar).not.toHaveBeenCalled();
   });
 
@@ -115,7 +115,7 @@ describe('AvatarUploadService', () => {
     await expect(service.replaceAvatar(userOf(), file)).rejects.toThrow(
       new BadRequestException(AVATAR_TYPE_UNSUPPORTED),
     );
-    expect(putAvatar).not.toHaveBeenCalled();
+    expect(putImage).not.toHaveBeenCalled();
   });
 
   it('400s a declared MIME outside the allowlist, even when the bytes are a real image', async () => {
@@ -143,19 +143,19 @@ describe('AvatarUploadService', () => {
     await service.replaceAvatar(userOf(), file);
 
     expect(buildAvatarKey).toHaveBeenCalledWith('u-1', 'image/jpeg');
-    expect(putAvatar).toHaveBeenCalledWith(
+    expect(putImage).toHaveBeenCalledWith(
       expect.any(String),
       expect.any(Buffer),
       'image/jpeg',
     );
     // originalname never reaches the key or the stored type.
-    expect(JSON.stringify(putAvatar.mock.calls)).not.toContain('passwd');
+    expect(JSON.stringify(putImage.mock.calls)).not.toContain('passwd');
   });
 
   // ───────────────────────── ordering / cleanup ─────────────────────────
 
   it('does NOT write the DB when the upload fails — no dead URL', async () => {
-    putAvatar.mockRejectedValue(new Error('r2 down'));
+    putImage.mockRejectedValue(new Error('r2 down'));
 
     await expect(service.replaceAvatar(userOf(), fileOf())).rejects.toThrow(
       'r2 down',

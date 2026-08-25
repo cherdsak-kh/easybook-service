@@ -39,9 +39,9 @@ import {
   AVATAR_MULTER_SIZE_LIMIT,
   AvatarUploadService,
 } from './avatar-upload.service';
-import { AVATAR_REQUIRED } from '../storage/storage.errors';
+import { AVATAR_REQUIRED, AVATAR_TOO_LARGE } from '../storage/storage.errors';
 import { SystemUsersService } from '../system-users/system-users.service';
-import { MulterErrorTo400Filter } from './filters/multer-error.filter';
+import { MulterErrorTo400Filter } from '../common/filters/multer-error.filter';
 import {
   sessionCookieName,
   sessionCookieOptions,
@@ -337,7 +337,10 @@ export class AuthSystemController {
   )
   // Multer raises MulterError(LIMIT_FILE_SIZE), which Nest surfaces as 413 — but AC-B13 demands 400.
   // This filter is what makes that true; without it the AC fails SILENTLY.
-  @UseFilters(MulterErrorTo400Filter)
+  // An INSTANCE, not the class: the filter takes the size message as a constructor argument now that
+  // venue photos (5 MB) share it with avatars (2 MB), and a `string` is not resolvable by the
+  // injector. See the filter's own note.
+  @UseFilters(new MulterErrorTo400Filter(AVATAR_TOO_LARGE))
   @ApiCookieAuth('session')
   @ApiConsumes('multipart/form-data')
   @ApiBody({

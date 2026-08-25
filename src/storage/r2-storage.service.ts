@@ -11,7 +11,7 @@ import {
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
-import { AVATAR_UPLOAD_FAILED, R2_NOT_CONFIGURED } from './storage.errors';
+import { IMAGE_UPLOAD_FAILED, STORAGE_NOT_CONFIGURED } from './storage.errors';
 import type { AvatarImageType } from './image-sniff';
 
 /**
@@ -63,9 +63,9 @@ export class R2StorageService {
   private s3(): S3Client {
     if (!this.isConfigured()) {
       this.logger.error(
-        'R2 is not configured — set the five R2_* vars. Avatar upload is unavailable.',
+        'R2 is not configured — set the five R2_* vars. Avatar and venue-photo upload are unavailable.',
       );
-      throw new InternalServerErrorException(R2_NOT_CONFIGURED);
+      throw new InternalServerErrorException(STORAGE_NOT_CONFIGURED);
     }
     if (!this.client) {
       const accountId = this.config.getOrThrow<string>('R2_ACCOUNT_ID');
@@ -102,6 +102,33 @@ export class R2StorageService {
     return `avatars/${systemUserId}/${randomBytes(16).toString('hex')}.${EXTENSION[type]}`;
   }
 
+  /**
+   * `venues/<32 lowercase hex>.<ext>` — FLAT, with no id segment at all.
+   *
+   * ⚠️ THE DESIGN LOG SAID `venues/<venueId>/…` AND THAT SHAPE IS UNAVAILABLE, because the PO chose
+   * upload-then-bind (option ข, 2026-08-25): the operator picks photos inside the CREATE dialog,
+   * where no venue exists yet and therefore no id does either. The alternatives were to split the
+   * form into two steps, or to upload into a staging prefix and COPY every object on save — a second
+   * R2 round trip per photo that can fail halfway through a write that has already committed.
+   *
+   * Dropping the id costs less than it looks, and the design log's own erasure paragraph is why: a
+   * `<venueId>` prefix does NOT do for venue photos what `<userId>` does for avatars. An erasure
+   * request names a PERSON, and a person appears nowhere in either key — so the prefix was never
+   * going to make a face findable. What it would have bought is "purge one venue's objects in one
+   * call", and venues are soft-deleted, never purged.
+   *
+   * What the flat prefix does buy, and what the orphan sweep needs: every venue photo the system has
+   * ever minted is under one `venues/` prefix, so "objects with no row" is one `ListObjectsV2` and
+   * one query — easier, not harder, than if abandoned uploads were scattered under per-venue folders
+   * that a cancelled create would never have produced anyway.
+   *
+   * 128 bits of `randomBytes(16)` — UNGUESSABLE, for the same reason as the avatar key: the bucket
+   * is public-read, so enumerability is the whole threat.
+   */
+  buildVenuePhotoKey(type: AvatarImageType): string {
+    return `venues/${randomBytes(16).toString('hex')}.${EXTENSION[type]}`;
+  }
+
   /** The durable, public https URL for a key. */
   publicUrlFor(key: string): string {
     return `${this.config.getOrThrow<string>('R2_PUBLIC_BASE_URL')}/${key}`;
@@ -113,8 +140,13 @@ export class R2StorageService {
    *
    * An upload failure is a `502`: R2 is an upstream, and the condition is retryable. Mirrors the
    * module-wide "upstream failed → BadGateway" convention.
+   *
+   * ⚠️ RENAMED FROM `putAvatar` WITH VENUE-1. It never had anything avatar-specific in it — the key
+   * and the content type both arrive as arguments — and a venue photo going through a method called
+   * `putAvatar` is the kind of name that survives long enough to mislead somebody reading a stack
+   * trace. The two CALLERS stay distinct; only this seam is shared.
    */
-  async putAvatar(
+  async putImage(
     key: string,
     body: Buffer,
     contentType: AvatarImageType,
@@ -133,7 +165,7 @@ export class R2StorageService {
       this.logger.error(
         `R2 putObject failed. key=${key} reason=${error instanceof Error ? error.message : String(error)}`,
       );
-      throw new BadGatewayException(AVATAR_UPLOAD_FAILED);
+      throw new BadGatewayException(IMAGE_UPLOAD_FAILED);
     }
   }
 

@@ -86,7 +86,7 @@ export class AvatarUploadService {
     const contentType = this.sniffOrThrow(file);
     const key = this.storage.buildAvatarKey(user.id, contentType);
 
-    await this.storage.putAvatar(key, file.buffer, contentType); // 1
+    await this.storage.putImage(key, file.buffer, contentType); // 1
 
     let updated: SystemUserResponseDto;
     try {

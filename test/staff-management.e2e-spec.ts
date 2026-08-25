@@ -75,7 +75,7 @@ describe('Staff Management (e2e)', () => {
   let personnelRoleId = 0;
 
   // The R2 seam, faked. The e2e suite must NEVER hit real object storage.
-  const putAvatar = jest.fn();
+  const putImage = jest.fn();
   const deleteObject = jest.fn();
   const storageFake = {
     isConfigured: () => true,
@@ -83,7 +83,7 @@ describe('Staff Management (e2e)', () => {
     buildAvatarKey: (userId: string, type: string) =>
       `avatars/${userId}/${'a'.repeat(32)}.${type === 'image/png' ? 'png' : type === 'image/jpeg' ? 'jpg' : 'webp'}`,
     publicUrlFor: (key: string) => `${R2_BASE}/${key}`,
-    putAvatar,
+    putImage,
     deleteObject,
   };
 
@@ -163,7 +163,7 @@ describe('Staff Management (e2e)', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    putAvatar.mockResolvedValue(undefined);
+    putImage.mockResolvedValue(undefined);
     deleteObject.mockResolvedValue(true);
     await clearThrottleCounters(redis);
     await seed();
@@ -254,7 +254,7 @@ describe('Staff Management (e2e)', () => {
       expect((res.body as { message: string }).message).toBe(
         MUST_CHANGE_PASSWORD,
       );
-      expect(putAvatar).not.toHaveBeenCalled();
+      expect(putImage).not.toHaveBeenCalled();
     });
 
     it('GATED — the write routes on /system-users answer 403, not 400/404', async () => {
@@ -856,8 +856,8 @@ describe('Staff Management (e2e)', () => {
       expect(body.profilePictureUrl).toMatch(
         new RegExp(`^${R2_BASE}/avatars/${ids[VIEWER]}/[0-9a-f]{32}\\.png$`),
       );
-      expect(putAvatar).toHaveBeenCalledTimes(1);
-      expect(putAvatar).toHaveBeenCalledWith(
+      expect(putImage).toHaveBeenCalledTimes(1);
+      expect(putImage).toHaveBeenCalledWith(
         expect.stringMatching(/^avatars\//),
         expect.any(Buffer),
         'image/png',
@@ -885,7 +885,7 @@ describe('Staff Management (e2e)', () => {
       expect((res.body as { message: string }).message).toBe(
         AVATAR_TYPE_UNSUPPORTED,
       );
-      expect(putAvatar).not.toHaveBeenCalled();
+      expect(putImage).not.toHaveBeenCalled();
     });
 
     it('AC-B13 — 2 MiB + 1 byte is a 400, NOT a 413 (the MulterError mapping)', async () => {
@@ -902,7 +902,7 @@ describe('Staff Management (e2e)', () => {
 
       expect(res.status).toBe(400); // 413 here is an AC-B13 FAIL
       expect((res.body as { message: string }).message).toBe(AVATAR_TOO_LARGE);
-      expect(putAvatar).not.toHaveBeenCalled();
+      expect(putImage).not.toHaveBeenCalled();
     });
 
     it('accepts a file exactly AT the 2 MiB limit', async () => {
@@ -946,7 +946,7 @@ describe('Staff Management (e2e)', () => {
     });
 
     it('a storage failure is a 502 and leaves profilePictureUrl UNCHANGED', async () => {
-      putAvatar.mockRejectedValue(new BadGatewayException('upstream'));
+      putImage.mockRejectedValue(new BadGatewayException('upstream'));
       const { agent, token } = await login(VIEWER);
 
       await agent

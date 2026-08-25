@@ -27,6 +27,7 @@ interface VenueTypeRow {
   isSystemReserved: boolean;
   createdAt: Date;
   updatedAt: Date;
+  _count: { venues: number };
 }
 
 const PUBLIC_SELECT = {
@@ -35,19 +36,25 @@ const PUBLIC_SELECT = {
   isSystemReserved: true,
   createdAt: true,
   updatedAt: true,
+  /*
+   * ✅ REAL SINCE VENUE-1 (2026-08-25). This was a hard-coded `0` with a comment naming this exact
+   * line as its replacement, and the honest zero it returned has now become an honest count.
+   *
+   * ⚠️ THE `where` IS NOT OPTIONAL. Without it a soft-deleted venue keeps padding the number on the
+   * ประเภทสถานที่ card, and the count answers the question "what will the operator see move" — a
+   * deleted venue moves nothing, because no screen renders it.
+   */
+  _count: { select: { venues: { where: { deletedAt: null } } } },
 } as const;
 
 /**
- * ⚠️ `holderCount` IS HARD-ZERO UNTIL THE `Venue` TABLE EXISTS, and it is a real answer rather than a
- * stub: the system contains no venues at all, so no category holds any. When `Venue` lands
- * (VENUE-1) this becomes `_count: { select: { venues: { where: { deletedAt: null } } } }` on the
- * select above and this function disappears; nothing in the DTO or the client changes.
+ * The one place the venue count is read out of a row.
  *
- * It is a named function and not an inline `0` so that grepping `venueCountOf` finds the one place
- * that has to change. It takes no argument yet — there is no row field to read — and gains `row`
- * when the `_count` arrives.
+ * Kept as a named function rather than inlined for the reason it was named in the first place: it is
+ * what a `grep venueCountOf` finds, and it is the seam that changed shape when the `Venue` table
+ * arrived. It now takes the row it always expected to take.
  */
-const venueCountOf = (): number => 0;
+const venueCountOf = (row: VenueTypeRow): number => row._count.venues;
 
 const toDto = (row: VenueTypeRow): VenueTypeResponseDto => ({
   id: row.id,
@@ -55,7 +62,7 @@ const toDto = (row: VenueTypeRow): VenueTypeResponseDto => ({
   isSystemReserved: row.isSystemReserved,
   createdAt: row.createdAt.toISOString(),
   updatedAt: row.updatedAt.toISOString(),
-  holderCount: venueCountOf(),
+  holderCount: venueCountOf(row),
   /*
    * ⚠️ `isSystemReserved &&` GUARDS AGAINST A NAME MATCH ALONE — and the honest statement of its
    * value is narrower than `OptionsService`'s comment might suggest, so here it is precisely.
@@ -202,19 +209,30 @@ export class VenueTypesService {
 
     const fallbackId = await this.resolveTombstoneId();
 
-    // A transaction even though it currently holds one statement: the re-point of `Venue.venueTypeId`
-    // lands here with VENUE-1 and MUST be in the same commit as the delete. Order will be move-then-
-    // delete, matching `OptionsService.softDelete` — deleting first leaves a window where live rows
-    // reference a soft-deleted category.
-    await this.prisma.$transaction(async (tx) => {
+    // ✅ THE RE-POINT THE COMMENT HERE WAS WAITING FOR (VENUE-1, 2026-08-25).
+    //
+    // ⚠️ MOVE FIRST, THEN DELETE, matching `OptionsService.softDelete`. The other order leaves a
+    // window — inside the transaction, but a window an error can land in — where live venues
+    // reference a category already marked deleted.
+    //
+    // ⚠️ THE MOVE IS NOT FILTERED BY `deletedAt`. A soft-deleted venue is re-pointed too, because the
+    // category row it references is going away and a restore would otherwise resurrect a venue
+    // pointing at a retired category. The COUNT logged below is the visible half only.
+    const movedVenues = await this.prisma.$transaction(async (tx) => {
+      const moved = await tx.venue.updateMany({
+        where: { venueTypeId: existing.id },
+        data: { venueTypeId: fallbackId },
+      });
       await tx.venueType.update({
         where: { id: existing.id },
         data: { deletedAt: new Date() },
       });
-      this.logger.log(
-        `Venue type soft-deleted. id=${id} fallbackId=${fallbackId} movedVenues=0`,
-      );
+      return moved.count;
     });
+
+    this.logger.log(
+      `Venue type soft-deleted. id=${id} fallbackId=${fallbackId} movedVenues=${movedVenues}`,
+    );
 
     // Outside the transaction, so it can only run once the delete actually committed.
     await this.redis.del(...VENUE_TYPE_CACHE_KEYS);

@@ -20,6 +20,7 @@ import { LineModule } from './line/line.module';
 import { OptionsModule } from './options/options.module';
 import { VenueTypesModule } from './venue-types/venue-types.module';
 import { AmenitiesModule } from './amenities/amenities.module';
+import { VenuesModule } from './venues/venues.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { SystemModule } from './system/system.module';
 import { RealtimeModule } from './realtime/realtime.module';
@@ -86,8 +87,13 @@ const throttlerModule: DynamicModule = {
     // /departments, not a service.
     VenueTypesModule,
     AmenitiesModule,
+    // The first real DOMAIN module: `Venue` is the Resource this file's header has been promising
+    // since the init migration. It must come after the two above — not for Nest (module order is
+    // irrelevant to the injector) but because that is the dependency direction on paper: a venue
+    // points at a category and ticks amenities, never the reverse.
+    VenuesModule,
     SystemModule,
-    // Domain modules (ResourceModule, BookingModule, ...) are added in their own tasks.
+    // BookingModule and the rest of the booking core are still their own future tasks.
   ],
   controllers: [AppController],
 })

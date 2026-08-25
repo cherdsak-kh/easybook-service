@@ -285,12 +285,10 @@ model VenueType {
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
-  /// Back-relation for `Venue.venueType`. ⚠️ STILL COMMENTED — `Venue` has a design
-  /// (`feature/20260824_1359_venues/02_design_log.md`) but no table yet, because the PO ordered the
-  /// two option screens first. A model with no relations is legal, so this table ships, seeds and is
-  /// curated on its own; until `Venue` exists every row honestly reports 0 venues, which is the
-  /// correct thing for the screen to print when the system contains no venues at all.
-  // venues Venue[] @relation("VenueVenueType")
+  /// Back-relation for `Venue.venueType`. ✅ UNCOMMENTED 2026-08-25 with VENUE-1 — the moment the
+  /// comment that stood here named for itself. `VenueTypeResponseDto.holderCount` stopped being a
+  /// hard zero in the same commit and became a real `_count` over this relation.
+  venues Venue[] @relation("VenueVenueType")
 
   @@index([deletedAt])
   @@map("venue_types")
@@ -330,12 +328,166 @@ model Amenity {
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
 
-  /// Back-relation for `VenueAmenity.amenity`. ⚠️ Commented for the same reason as `VenueType.venues`
-  /// above — the join table arrives with `Venue`.
-  // venues VenueAmenity[]
+  /// Back-relation for `VenueAmenity.amenity`. ✅ UNCOMMENTED 2026-08-25 with VENUE-1, alongside
+  /// `VenueType.venues`. `DELETE /amenities/:id` now really does release ticks, and
+  /// `releasedVenueCount` is their count rather than the honest 0 it used to be.
+  venues VenueAmenity[]
 
   @@index([deletedAt])
   @@map("amenities")
+}
+
+/// สถานที่จัดกิจกรรม — a bookable place. The "Resource" the header of this file has been promising
+/// since the init migration, and the product's actual subject: every other table in this schema is
+/// paperwork arranged around this one.
+///
+/// Soft-deleted, never hard-deleted. The delete confirmation promises
+/// "ประวัติคำขอจองของสถานที่นี้ยังอยู่ครบ", and a future `Booking.venueId` must keep resolving a name
+/// long after an operator retires the room.
+///
+/// ⚠️ FIELD SET ARGUED FROM DECISIONS, NOT COPIED FROM HOTEL SOFTWARE. Every column here is consumed
+/// by one of three deciders (`[data-route="venues"]` in the prototype states them): the LINE user
+/// picking a place, the admin approving a request, the admin maintaining the list. Deliberately
+/// ABSENT, each for a stated reason: ราคา (no evidence this school charges), คะแนนรีวิว (no actor
+/// writes it), รหัสสถานที่ (nine unique names have no collision to solve), พิกัด GPS, ขนาด ตร.ม.
+/// (answers what `capacity` already answers, in a unit nobody measured), and opening hours (`Q17d`:
+/// the PO said เวลา is not decided, so no column may guess).
+model Venue {
+  /// cuid, not autoincrement — the rule this schema now follows. Curated VOCABULARY tables are Int
+  /// (`Department`, `PersonnelRole`, `VenueType`, `Amenity`: small, seeded, referenced by id in a
+  /// query string a human reads); ENTITIES are cuid (`LineUser`, `SystemUser`,
+  /// `LineUserRegistration`, and this). A venue is an entity — it has photos, a description, its own
+  /// open/closed lifecycle, and `Booking` will carry its id.
+  id String @id @default(cuid())
+
+  /// Required. Unique among ACTIVE rows via a partial unique index (`venues_name_active_key`,
+  /// hand-written in the migration — PSL cannot express `WHERE "deletedAt" IS NULL`), so a
+  /// soft-deleted name is reusable exactly like an option name. 120 chars is a DTO cap
+  /// (`maxlength="120"` on `#vf-name`), not a column constraint.
+  name String
+
+  /// FK -> VenueType.id. REQUIRED — every venue has exactly one category (`Q15a`), so the form
+  /// offers no blank option: "ไม่ระบุ" is not a value the server can store.
+  ///
+  /// `onDelete: Restrict` refuses a stray HARD delete of a referenced category. Normal category
+  /// deletes are SOFT, and a soft-deleted row is still a live FK target, so the FK does not do this
+  /// job — `VenueTypesService.softDelete` re-points these rows onto the tombstone inside the same
+  /// transaction. Same read/write asymmetry as `SystemUser.departmentId`: READS ignore `deletedAt`
+  /// (an existing venue keeps resolving its category name forever), WRITES require an ACTIVE,
+  /// NON-RESERVED category -> 400.
+  venueTypeId Int
+  venueType   VenueType @relation("VenueVenueType", fields: [venueTypeId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// Required. `min="1" max="100000"` on the form; both are DTO bounds. `min` is 1 and not 0 — a
+  /// venue that holds nobody is not a venue, and 0 is what a half-filled form submits by accident.
+  capacity Int
+
+  /// ที่ตั้ง — optional, and it EARNED its place on evidence rather than on inference: four of the
+  /// nine real venues carry their location INSIDE the name, in parentheses (`ลานกิจกรรม
+  /// (ข้างพระนเรศวร)`). Nobody writes a parenthetical into a proper name for fun; they do it when the
+  /// form has nowhere else to put it.
+  location String?
+
+  /// รายละเอียด — optional free text: conditions of use, what to bring, what to watch out for.
+  description String?
+
+  /// เปิดให้จอง. FALSE = ปิดชั่วคราว — the venue stays VISIBLE to end users but accepts no NEW
+  /// booking requests. NOT a soft delete and not `deletedAt`: an operator reaching for ลบ almost
+  /// always means this, which is why the delete dialog names it as the alternative.
+  ///
+  /// ⚠️ NOT SETTABLE THROUGH `PATCH`. Closing requires a reason and reopening clears it, so it is a
+  /// TRANSITION with its own two endpoints (`POST /venues/:id/close` · `/reopen`), never a field in a
+  /// diff somebody skimmed. Absent from `UpdateVenueDto` ⇒ `forbidNonWhitelisted` 400s an attempt.
+  isOpen Boolean @default(true)
+
+  /// เหตุผลที่ปิด. INVARIANT: non-null IFF `isOpen === false`. Cleared to null on every reopen — the
+  /// confirm dialog states that as a promise ("เหตุผลที่ปิดไว้จะถูกล้างทิ้ง").
+  ///
+  /// ⚠️ IT IS A MESSAGE, NOT A NOTE, and that is what decides the service REQUIRES it. `LineUser`
+  /// carries one of each and they behave differently on purpose: `rejectionReason` is pushed to the
+  /// user, so an empty one would send a blank message and the service 400s without it; `blockReason`
+  /// is an internal note and stays optional so the idempotent re-block path survives. This one is
+  /// read by the people it affects — it prints on the venue card and, once LIFF exists, in front of
+  /// everybody who tries to book the room. So it follows `rejectionReason`: REQUIRED on the close
+  /// transition (400 without it).
+  closedReason String?
+
+  photos    VenuePhoto[]
+  amenities VenueAmenity[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([deletedAt])
+  @@index([venueTypeId])
+  /// The list filters by status and sorts/searches by name. Free on an empty table, a lock on a
+  /// populated one — same reasoning as the registration and staff indexes above.
+  @@index([isOpen])
+  @@index([name])
+  @@map("venues")
+}
+
+/// One photo of one venue. A ROW, not an array column, because the ORDER is data the operator edits.
+///
+/// 🔴 `venues/` IS A SECOND PII STORE AND IS IN `AUTH-ERASURE`'s SCOPE, and the reason is a PATH
+/// rather than caution. `avatars/<userId>/…` carries the person's id in the key, so one erasure
+/// request is one prefix delete. `venues/<venueId>/…` does NOT — a face in this bucket appears
+/// nowhere in the path, so no erasure request can ever locate it. That is what makes the form's
+/// "ไม่ควรมีบุคคลอยู่ในภาพ" line a real control and not politeness: it is the last point at which the
+/// problem is still preventable. (`Q19`, PO 2026-08-25. The remaining question — school photos
+/// contain MINORS — is for the school's PDPA owner before go-live, and blocks no code.)
+model VenuePhoto {
+  id String @id @default(cuid())
+
+  /// `onDelete: Cascade` — a photo is a PART of its venue with no independent identity, the same
+  /// relationship `LineUserRegistration` has to `LineUser`. (Contrast `VenueAmenity.amenityId` below,
+  /// which is `Restrict`: an amenity has a life of its own.)
+  venueId String
+  venue   Venue  @relation(fields: [venueId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  /// https URL of the stored object. The backend NEVER fetches it — same contract as
+  /// `SystemUser.profilePictureUrl`.
+  url String
+
+  /// 0-based. ⚠️ `position === 0` IS THE COVER — there is no `isCover` flag, deliberately. The dialog
+  /// tracks the cover as an INDEX so the thumbnail strip never moves under the cursor, and rotates it
+  /// to the front on save; the record keeps `photos[0] === cover`, which is what the card reads and
+  /// what this table stores. A flag would be a second record of one fact, free to disagree with the
+  /// order — the exact bug `Venue.venueTypeId` exists to avoid.
+  ///
+  /// NO unique constraint on `[venueId, position]`: the only write pattern is "replace the whole
+  /// ordered set", and a non-deferrable unique index would reject the single renumbering statement
+  /// that write is made of. Contiguity is the writer's job; the read is
+  /// `orderBy: [{ position: 'asc' }, { id: 'asc' }]`, so a duplicate degrades to a stable but
+  /// arbitrary order, never to an error.
+  position Int
+
+  createdAt DateTime @default(now())
+
+  @@index([venueId, position])
+  @@map("venue_photos")
+}
+
+/// A TICK: "this venue provides this amenity". The first pure join table in this schema, and the one
+/// structural reason `Amenity` needs no tombstone — deleting an amenity removes rows from HERE and
+/// orphans nothing, where deleting a `VenueType` would leave a required FK dangling.
+model VenueAmenity {
+  venueId String
+  venue   Venue  @relation(fields: [venueId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  /// `onDelete: Restrict`, NOT Cascade — matching `Department`/`PersonnelRole`. An amenity delete is
+  /// a SOFT delete plus an explicit `deleteMany` of these rows inside one transaction, so the cascade
+  /// would never fire in normal operation; leaving it as Cascade would only mean a stray HARD delete
+  /// silently strips ticks off venues instead of being refused.
+  amenityId Int
+  amenity   Amenity @relation(fields: [amenityId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@id([venueId, amenityId])
+  @@index([amenityId])
+  @@map("venue_amenities")
 }
 
 /// Back-office operator role. Distinct from AppAccess (LINE consumer domain) by design.

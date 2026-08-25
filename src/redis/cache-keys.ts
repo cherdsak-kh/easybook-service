@@ -101,6 +101,26 @@ export const VENUE_TYPE_CACHE_KEYS: readonly string[] = [
 export const AMENITY_LIST_KEY = 'opt:amenity';
 
 /**
+ * What a write to `venues` must drop — **including `POST` and `DELETE`, which touch neither the
+ * category table nor the amenity table.**
+ *
+ * 🔴 THIS IS THE TRAP `OPTION_LIST_KEYS` WARNS ABOUT, ONE TABLE OVER: `holderCount` on both curated
+ * tables is counted over `venues` and `venue_amenities`, not over the curated table itself. So
+ * creating one venue makes ประเภทสถานที่ print `3 แห่ง` where it should print `4` — for up to 300
+ * seconds, on a different screen, with nothing connecting the two for whoever reports it.
+ *
+ * ⚠️ THERE IS NO `Venue` KEY, deliberately. Nine rows, the most frequently edited table of the three,
+ * and the base of both counts above — caching it would produce a key that every write in this list
+ * has to drop anyway, in exchange for saving one small query.
+ *
+ * ⚠️ Debugging note: the real key prefix is `eb:cache:…`, so `KEYS 'opt:*'` finds nothing.
+ */
+export const VENUE_WRITE_CACHE_KEYS: readonly string[] = [
+  ...VENUE_TYPE_CACHE_KEYS,
+  AMENITY_LIST_KEY,
+];
+
+/**
  * A LINE user's own status view — the single call the LIFF client makes on open to decide which
  * of the four screens to render.
  *
