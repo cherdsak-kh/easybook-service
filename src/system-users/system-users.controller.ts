@@ -136,7 +136,7 @@ export class SystemUsersController {
   @ApiOperation({
     summary: 'List back-office users, paginated.',
     description:
-      'Search matches the first name, last name or email, case-insensitively. `role` and `status` narrow further; `status` is derived (`deleted` > `suspended` > `pending` > `active`), matching the badge the screen shows. Soft-deleted rows are excluded from `data` and from `meta.total` unless `status=deleted`, which is SUPER_ADMIN-only and is the only way to obtain the id a restore needs. Ordered `createdAt DESC, id DESC`. A page beyond the last one is a 200 with an empty `data`, not a 404.',
+      'Search matches the first name, last name, email or phone number, case-insensitively. The phone match is on the number as stored and is therefore format-sensitive (`0812345678` does not match a stored `081-234-5678`). `role` and `status` narrow further; `status` is derived (`deleted` > `suspended` > `pending` > `active`), matching the badge the screen shows. Soft-deleted rows are excluded from `data` and from `meta.total` unless `status=deleted`, which is SUPER_ADMIN-only and is the only way to obtain the id a restore needs. Ordered `createdAt DESC, id DESC`. A page beyond the last one is a 200 with an empty `data`, not a 404.',
   })
   @ApiOkResponse({
     description: 'A page of users.',

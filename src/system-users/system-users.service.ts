@@ -321,6 +321,14 @@ export class SystemUsersService {
               { firstName: { contains: q, mode: 'insensitive' } },
               { lastName: { contains: q, mode: 'insensitive' } },
               { email: { contains: q, mode: 'insensitive' } },
+              // ⚠️ FORMAT-SENSITIVE, unlike LineUserRegistration's search. That model carries a
+              // normalized `phoneDigits` column alongside `phone` precisely so an operator can
+              // find a number however it was typed; `SystemUser` has no such column, so
+              // `0812345678` does NOT match a stored `081-234-5678`. Fixing that is a schema
+              // change (architect/pm), not something to paper over here with a digits-only
+              // fallback — a second OR term on the raw column cannot match across separators.
+              // A NULL phoneNumber simply never matches `contains`, which is correct.
+              { phoneNumber: { contains: q, mode: 'insensitive' } },
             ],
           }
         : {}),

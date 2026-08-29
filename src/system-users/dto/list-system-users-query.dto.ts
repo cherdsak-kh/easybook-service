@@ -75,8 +75,9 @@ export class ListSystemUsersQueryDto {
   @ApiPropertyOptional({
     maxLength: 100,
     description:
-      'Case-insensitive substring match on the first name, last name or email. Trimmed; ' +
-      'empty/absent → no search filter.',
+      'Case-insensitive substring match on the first name, last name, email or phone number. ' +
+      'Trimmed; empty/absent → no search filter. The phone match is on the number **as stored**, ' +
+      'so it is format-sensitive: `0812345678` does not match a stored `081-234-5678`.',
   })
   @IsOptional()
   @Transform(trim)

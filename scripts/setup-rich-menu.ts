@@ -43,10 +43,15 @@ interface MenuDef {
   menu: messagingApi.RichMenuRequest;
 }
 
-// menu_type_1.jpg — 2500x1686 ("Check Status / Login"), one full-bleed area that
-// opens the LIFF app. This artwork was 2500x843 (half height) before 2026-07-31;
-// the size below and RICH_MENU_SPECS.TYPE_1 both had to change with it, because
-// LINE rejects an image whose dimensions differ from the declared size.
+// menu_type_1.jpg — 2500x843 ("EasyBook Application"), one full-bleed area that
+// opens the LIFF app. The artwork is a single edge-to-edge panel with no card
+// gutters, so the one area below deliberately covers the whole canvas.
+//
+// This height has changed twice (2500x843 → 2500x1686 on 2026-07-31, back to
+// 2500x843 with the current artwork). The area takes its size from TYPE_1 rather
+// than hardcoding numbers precisely so the next swap cannot leave it overflowing:
+// LINE rejects an image whose dimensions differ from the declared size, and it
+// rejects an area that extends past the canvas.
 const menuType1: MenuDef = {
   key: 'type1',
   richMenuType: 'TYPE_1',
@@ -66,26 +71,36 @@ const menuType1: MenuDef = {
      * ⚠️ CHANGING THIS STRING DOES NOTHING UNTIL `npm run line:setup-richmenu` IS RE-RUN. Rich
      * menus live on LINE's side, not in this repo — the script recreates them by name.
      */
-    chatBarText: 'เริ่มต้นใช้งาน',
+    chatBarText: 'เมนู',
     areas: [
       {
         bounds: { x: 0, y: 0, width: TYPE_1.width, height: TYPE_1.height },
-        action: { type: 'uri', label: 'Check Status / Login', uri: LIFF_URI },
+        action: { type: 'uri', label: 'EasyBook Application', uri: LIFF_URI },
       },
     ],
   },
 };
 
-// menu_type_2.jpg — 2500x1686: one wide "Enter EasyBook" card on top, three cards
-// below (My Bookings / Report Issue / Settings).
+// menu_type_2.jpg — 2500x1686: one wide "เข้าสู่หน้าหลัก" card on top, three cards
+// below (การจองของฉัน / แจ้งปัญหา / ตั้งค่า).
 //
-// The bounds below are MEASURED from the artwork, not assumed: the gutters between
-// the bottom cards sit at x≈815-870 and x≈1635-1670, and the gap between the top
-// card and the bottom row at y≈931-969. The split lines (x=840, x=1650, y=950)
-// therefore fall in the middle of a gutter rather than clipping a card edge, and
-// the four areas tile the full 2500x1686 so there is no dead zone that swallows a
-// tap. The previous layout assumed an even 843/843 split with equal thirds, which
-// no longer matches this artwork.
+// The bounds below are MEASURED from the artwork, not assumed (re-verified
+// 2026-08-29 by decoding the JPEG and locating the card edges against the light
+// background). The cards sit on a ~41px margin with gutters between them:
+//
+//   top card      x 41..2458   y 40..904
+//   gutter                     y 905..955
+//   bottom row                 y 956..1628
+//   bottom cards  x 41..837 | 885..1639 | 1687..2458  (gutters x 838..884, 1640..1686)
+//
+// Each area hugs its own card to within ~5px, so no area clips a neighbouring card
+// and none extends past the canvas. UNLIKE THE PREVIOUS LAYOUT, these areas do not
+// tile the full 2500x1686 — the margins and gutters (~13% of the canvas) are
+// deliberately dead. That is the trade: a tap on the visible gap between two cards
+// does nothing rather than firing whichever neighbour happened to own the gutter.
+//
+// Re-measure this block whenever the artwork is replaced; the numbers are specific
+// to this image, not to the 2500x1686 format.
 //
 // Only the top card has a destination today. The other three are shortcuts to
 // pages that do not exist yet, so they postback and the webhook answers with
@@ -97,18 +112,18 @@ const menuType2: MenuDef = {
   image: resolve(ASSET_DIR, 'menu_type_2.jpg'),
   menu: {
     size: { width: TYPE_2.width, height: TYPE_2.height },
-    selected: false,
+    selected: true,
     name: TYPE_2.name,
-    chatBarText: 'เริ่มต้นใช้งาน',
+    chatBarText: 'เมนู',
     areas: [
       {
-        // Top card "Enter EasyBook" → opens the LIFF app.
-        bounds: { x: 0, y: 0, width: TYPE_2.width, height: 950 },
-        action: { type: 'uri', label: 'Enter EasyBook', uri: LIFF_URI },
+        // Top card "เข้าสู่หน้าหลัก" → opens the LIFF app.
+        bounds: { x: 41, y: 41, width: 2418, height: 866 },
+        action: { type: 'uri', label: 'เข้าสู่หน้าหลัก', uri: LIFF_URI },
       },
       {
-        // Bottom-left "My Bookings" (blue).
-        bounds: { x: 0, y: 950, width: 840, height: 736 },
+        // Bottom-left "การจองของฉัน" (blue).
+        bounds: { x: 41, y: 951, width: 797, height: 680 },
         action: {
           type: 'postback',
           label: RICH_MENU_SHORTCUTS.myBookings.label,
@@ -116,8 +131,8 @@ const menuType2: MenuDef = {
         },
       },
       {
-        // Bottom-middle "Report Issue" (orange).
-        bounds: { x: 840, y: 950, width: 810, height: 736 },
+        // Bottom-middle "แจ้งปัญหา" (orange).
+        bounds: { x: 887, y: 953, width: 756, height: 675 },
         action: {
           type: 'postback',
           label: RICH_MENU_SHORTCUTS.reportIssue.label,
@@ -125,8 +140,8 @@ const menuType2: MenuDef = {
         },
       },
       {
-        // Bottom-right "Settings" (green).
-        bounds: { x: 1650, y: 950, width: 850, height: 736 },
+        // Bottom-right "ตั้งค่า" (green).
+        bounds: { x: 1686, y: 955, width: 774, height: 676 },
         action: {
           type: 'postback',
           label: RICH_MENU_SHORTCUTS.settings.label,
@@ -171,7 +186,7 @@ async function loadActiveUsers(prisma: PrismaService): Promise<ActiveUser[]> {
  * of `LineUserService.applyRichMenu` is `updateAccess` (approve/block/reinstate),
  * and `upsertOnFollow` deliberately does not link. So before this pass existed, a
  * menu refresh silently dropped every ALLOWED user onto the account default —
- * which this script sets to type1, the restricted "Check Status / Login" menu —
+ * which this script sets to type1, the restricted "EasyBook Application" menu —
  * while the DB still read `richMenuType: TYPE_2`. Nothing detected the drift, and
  * the only recovery was an admin re-approving each user by hand.
  *

@@ -470,7 +470,7 @@ describe('SystemUsersService', () => {
       expect($transaction).not.toHaveBeenCalled();
     });
 
-    it('search matches first name, last name OR email, case-insensitively', async () => {
+    it('search matches first name, last name, email OR phone number, case-insensitively', async () => {
       $transaction.mockResolvedValue([[], 0]);
 
       await service.findManyPaginated(
@@ -483,7 +483,12 @@ describe('SystemUsersService', () => {
         expect.objectContaining({
           where: {
             deletedAt: null,
-            OR: [{ firstName: like }, { lastName: like }, { email: like }],
+            OR: [
+              { firstName: like },
+              { lastName: like },
+              { email: like },
+              { phoneNumber: like },
+            ],
           },
         }),
       );
