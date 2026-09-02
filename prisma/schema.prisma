@@ -1,6 +1,7 @@
 // Prisma schema — easy-book-app backend.
-// Domain models (User, Resource, Availability, Booking) are added in the
-// domain-modelling task; this sets up the datasource + client generator only.
+//
+// The booking domain landed 2026-09-02 (BookingRequest / BookingSlot / AppSetting / BookingStatus,
+// at the bottom of this file) — the header previously said it was still to come.
 //
 // Prisma 7: the connection URL lives in prisma.config.ts (for the CLI/Migrate)
 // and is supplied to PrismaClient at runtime via a driver adapter (@prisma/adapter-pg).
@@ -98,6 +99,11 @@ model LineUser {
   /// Back-relation for the 1:1 registration a LINE user submits to move UNREGISTERED -> PENDING.
   /// VIRTUAL — adds no column to line_users. Nullable: a follower who never registered has none.
   registration LineUserRegistration? @relation("LineUserToRegistration")
+
+  /// Back-relation for BookingRequest.lineUserId (D-C18). VIRTUAL — adds no column to line_users.
+  /// EMPTY for a follower who never booked, and empty forever for the staff-created half of the
+  /// booking table: those rows carry `createdById` instead. This is the LIFF origin's list.
+  bookingRequests BookingRequest[] @relation("BookingRequesterLineUser")
 
   @@index([deletedAt])
   /// The list's default ordering key.
@@ -198,6 +204,14 @@ model Department {
 
   /// Back-relation for SystemUser.department. VIRTUAL — adds no column to departments.
   systemUsers SystemUser[] @relation("SystemUserDepartment")
+
+  /// Back-relation for BookingRequest.departmentId (D-C18). VIRTUAL — adds no column to departments.
+  /// ⚠️ This is the department the booking is FOR, typed in by staff on a direct booking. It is NOT
+  /// the creating staff member's own department (that is `SystemUser.departmentId`), and it is NOT
+  /// how a LIFF request resolves its department — that reads through
+  /// `BookingRequest.lineUserId -> LineUserRegistration.departmentId`. Three different questions,
+  /// and only this one is a manual override.
+  bookingRequests BookingRequest[] @relation("BookingDepartment")
 
   @@index([deletedAt])
   @@map("departments")
@@ -415,6 +429,15 @@ model Venue {
   photos    VenuePhoto[]
   amenities VenueAmenity[]
 
+  /// Back-relations for the booking domain (D-C13). VIRTUAL — add no column to venues.
+  ///
+  /// TWO of them, and the pair is deliberate: `bookingSlots` is NOT reachable only through
+  /// `bookingRequests`. `BookingSlot.venueId` is denormalised precisely so the overlap query — the
+  /// hottest read in the product, run inside the approval transaction — touches one table and one
+  /// index. Going through the parent would make it a join.
+  bookingRequests BookingRequest[] @relation("BookingVenue")
+  bookingSlots    BookingSlot[]    @relation("BookingSlotVenue")
+
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   deletedAt DateTime?
@@ -586,6 +609,19 @@ model SystemUser {
   lineUserId String?   @unique
   lineUser   LineUser? @relation("SystemUserLineAccount", fields: [lineUserId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
+  /// Back-relations for the booking domain (D-C18). VIRTUAL — add no column to system_users.
+  ///
+  /// TWO relations to ONE model, which is why both ends must be named: `createdBookings` is the
+  /// ADMIN ORIGIN (this person typed the booking in from the back office), `approvedBookings` is the
+  /// APPROVAL AUDIT (this person ruled on it). On a direct booking they are the SAME person and both
+  /// point here — that is not duplication, it is the record that creation WAS the approval.
+  ///
+  /// Both are HISTORY, not identity: resolve them WITHOUT a `deletedAt` filter, exactly like
+  /// `createdById` above (DD-4). A staff member who has left must still resolve as the creator and
+  /// approver of the bookings they made.
+  createdBookings  BookingRequest[] @relation("BookingCreatedBy")
+  approvedBookings BookingRequest[] @relation("BookingApprovedBy")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -600,4 +636,289 @@ model SystemUser {
   @@index([isActive])
   @@index([lastName, firstName])
   @@map("system_users")
+}
+
+/// Lifecycle of a BookingRequest (D-C13, PO 2026-08-26).
+///
+/// ⚠️ THERE IS DELIBERATELY NO `EXPIRED`, and adding one is a schema regression. A pending request
+/// nobody ruled on before its time passed is COMPUTED at read time (`lastEndAt < now()`), never
+/// stored — the same reasoning that keeps the request's status derived from its slots and keeps
+/// `VenuePhoto` free of an `isCover` flag: one fact, one home. A stored EXPIRED needs a cron, and a
+/// cron that misses a day makes every screen lie. Filter the approval queue with `lastEndAt > now()`
+/// instead. See SERVICE_CHANGES.md §2.4.
+enum BookingStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+/// A request to use a venue — the PARENT of one or more BookingSlot rows (D-C13).
+///
+/// 🔴 DUAL-ORIGIN, AND THAT IS THE WHOLE POINT OF THIS MODEL'S SHAPE (D-C18, PO 2026-09-02).
+/// Bookings enter the system two ways, and BOTH live in this one table:
+///
+///   1. CLIENT PORTAL (LIFF) — a LINE end-user submits a request. `lineUserId` is set,
+///      `createdById` is null, and the row ALWAYS starts PENDING. It is a request, never an
+///      instant reservation.
+///   2. ADMIN PORTAL (back office) — a staff member creates a booking directly: locking a slot for
+///      an internal school event, or booking on behalf of a teacher or department that has no LINE
+///      account at all. `createdById` is set, and the row MAY be created APPROVED outright with
+///      `approvedById = createdById` and `approvedAt = now()`.
+///
+/// Splitting these into two tables would give the question "is this slot taken?" TWO answers and
+/// two code paths to keep in agreement. The origin is expressed in WHICH IDENTITY COLUMN IS
+/// POPULATED, not in which model the row lives in.
+///
+/// ⚠️ D-C13 rule 1 ("a booking requires approval") scopes to the CLIENT origin — it describes what
+/// an end-user may initiate. Rules 2-6 bind BOTH origins without exception: parent-child slots,
+/// overlap validated at SLOT level, a PENDING request holds nothing, approval auto-rejects every
+/// overlapping request, and the client portal is real-time throughout. A staff-created APPROVED
+/// booking holds its slot exactly as an approved LIFF request does, and must auto-reject overlapping
+/// pending requests in the SAME transaction that creates it.
+///
+/// 🔴 PRIVACY (D-C13, last clause): an unapproved request NEVER reveals who made it or what for —
+/// on screen, on the socket, or in a LINE notification. That rule is about the VIEWER, not about who
+/// wrote the row, so it covers staff-created bookings identically.
+model BookingRequest {
+  id String @id @default(cuid())
+
+  /// Human-readable identifier ("BR-25690902-001") — the string a user pastes out of LINE chat into
+  /// the My Bookings search box, and the one staff quote on the phone. SEPARATE from `id` on purpose:
+  /// a cuid is unreadable and unspeakable, and a readable PK invites people to parse meaning out of
+  /// it. This is a LABEL; `id` is the key. @unique, because the search resolves it directly.
+  ///
+  /// ⚠️ The client strips a leading "#" before comparing — users paste "#BR-25690902-001".
+  code String @unique
+
+  /// FK -> LineUser.id (a cuid), NOT LineUser.lineUserId (the "U..." string). Same-name footgun as
+  /// SystemUser.lineUserId and LineUserRegistration.lineUserId.
+  ///
+  /// 🔴 NULLABLE, AND IT MUST STAY NULLABLE (D-C18). A required column here makes the entire admin
+  /// direct-booking half of the product unrepresentable — that need does not disappear, it just
+  /// relocates into a second table and a second answer to "is this slot taken?".
+  ///
+  /// `onDelete: SetNull` — a LINE user who unfollows is SOFT-deleted, so this rarely fires; if a hard
+  /// delete ever happens the booking survives as history rather than vanishing from the venue's
+  /// schedule. Resolve as HISTORY (no `deletedAt` filter), same asymmetry as `createdById`.
+  lineUserId String?
+  lineUser   LineUser? @relation("BookingRequesterLineUser", fields: [lineUserId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  /// FK -> SystemUser.id. The staff member who created this booking from the Admin Portal — the
+  /// ADMIN ORIGIN's identity column. Null on every LIFF request.
+  ///
+  /// ⚠️ NOT an approval. `approvedById` below records who RULED; this records who TYPED. They are the
+  /// same person on a direct booking and different people on an approved LIFF request, and conflating
+  /// them loses the distinction between "staff booked this" and "staff allowed this".
+  ///
+  /// 🔴 DB-LEVEL INVARIANT, hand-written in the migration as `booking_requests_owner_check`:
+  /// at least one of `lineUserId` / `createdById` is non-null. A row with neither belongs to nobody —
+  /// it cannot be listed on #/bookings, cannot be notified, and cannot be audited. It lives in the
+  /// DATABASE and not in a service method because ADR-001's reasoning applies unchanged: a guard one
+  /// code path can forget to call is not an invariant.
+  ///
+  /// ⚠️ BOTH may be set at once, deliberately. That is staff booking ON BEHALF OF a LINE user who
+  /// does have an account: `createdById` is who typed it, `lineUserId` is whose booking it is, and
+  /// the row correctly appears in that user's My Bookings list.
+  createdById String?
+  createdBy   SystemUser? @relation("BookingCreatedBy", fields: [createdById], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  /// Manual overrides for a staff entry: who the booking is FOR, when there is no LineUser row to
+  /// read a name and phone from.
+  ///
+  /// 🔴 OVERRIDES, NOT A SECOND PROFILE STORE. On a LIFF request these stay NULL and the name, phone
+  /// and department are read through `lineUserId` -> LineUserRegistration. Copying them onto every
+  /// row would be one fact in two places, free to disagree the moment a user corrects their
+  /// registration — the exact bug VenuePhoto's absent `isCover` flag exists to avoid.
+  ///
+  /// PDPA: `requesterName` and `contactPhone` are PII. NEVER logged.
+  requesterName String?
+  contactPhone  String?
+
+  /// FK -> Department.id. Manual override, same rule as the two fields above.
+  /// ⚠️ The department the booking is FOR — not the creating staff member's own department, and not
+  /// how a LIFF request resolves its department. `onDelete: SetNull` rather than Restrict: this is
+  /// an optional label on a historical record, not a required classification like
+  /// `SystemUser.departmentId`. Reads ignore `deletedAt` (an existing booking keeps resolving its
+  /// department name forever); writes require an ACTIVE option, checked in the service -> 400.
+  departmentId Int?
+  department   Department? @relation("BookingDepartment", fields: [departmentId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  /// FK -> Venue.id. REQUIRED — a booking with no venue is not a booking.
+  /// `onDelete: Restrict`: venue deletes are SOFT, and a soft-deleted venue is still a live FK
+  /// target, so this only refuses a stray HARD delete of a venue that has history.
+  venueId String
+  venue   Venue  @relation("BookingVenue", fields: [venueId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// วัตถุประสงค์ and จำนวนผู้เข้าร่วม — BOTH MANDATORY (D-C13). They are not description fields:
+  /// because a PENDING request holds nothing and several may overlap, a human has to CHOOSE between
+  /// competing requests, and that choice cannot be made from times alone.
+  ///
+  /// 🔴 `purpose` is never shown for an UNAPPROVED request belonging to somebody else (D-C13).
+  purpose   String
+  attendees Int
+
+  status BookingStatus @default(PENDING)
+
+  /// Why it was refused. Written on BOTH refusal paths — an operator's explicit reject, AND the
+  /// AUTO-REJECTION that fires when a competing request wins the slot (D-C13 rule 5). The second is
+  /// the common one and the reason this column is not optional in practice.
+  /// ⚠️ An auto-rejection may say the slot went to someone else; it must NEVER say who, or what for.
+  rejectReason String?
+
+  /// DENORMALISED span across this request's slots: earliest start, latest end.
+  ///
+  /// 🔴 NOT a convenience — a REQUIREMENT of this repo's own pagination rule. Cursor pagination here
+  /// must order on a scalar belonging to the model being ordered, never through a relation (the same
+  /// constraint that produced `LineUser.registeredAt`). My Bookings sorts by "soonest" and the
+  /// approval queue filters by "not yet past", and both of those are aggregates over booking_slots.
+  /// Ordering through the child collection is not expressible; these two columns make it a plain
+  /// indexed scalar sort.
+  ///
+  /// ⚠️ WRITER'S CONTRACT: recompute BOTH in the SAME transaction as any write that adds, removes or
+  /// cancels a slot. They are a cache of the children, and a stale cache here silently mis-sorts the
+  /// list and mis-filters the queue rather than erroring.
+  ///
+  /// `lastEndAt` is also what makes the computed "expired" state possible without an enum value or a
+  /// cron: `status = PENDING AND lastEndAt < now()`.
+  firstStartAt DateTime
+  lastEndAt    DateTime
+
+  /// Approval audit. FK -> SystemUser.id; resolve as HISTORY, never filtered by `deletedAt` (DD-4).
+  /// On an admin DIRECT booking these are written in the creating transaction with
+  /// `approvedById = createdById` and `approvedAt = now()` — creation IS the approval (D-C18).
+  approvedById String?
+  approvedBy   SystemUser? @relation("BookingApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  approvedAt   DateTime?
+
+  /// The children. "Continuous single span" and "repeat across several days" differ ONLY in how many
+  /// rows land here (D-C13 rule 2) — they are not two kinds of request and must never become two
+  /// code paths.
+  slots BookingSlot[] @relation("BookingSlotRequest")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([lineUserId])
+  @@index([createdById])
+  @@index([venueId])
+  @@index([status])
+  /// The approval queue ("pending, not yet past") and My Bookings' "soonest" sort both read this
+  /// pair. Free on an empty table, a lock on a populated one — same reasoning as every other index
+  /// in this schema.
+  @@index([firstStartAt, lastEndAt])
+  @@map("booking_requests")
+}
+
+/// ONE occupied time span at ONE venue — the CHILD of a BookingRequest, and the row that actually
+/// holds a slot (D-C13, Q-C4).
+///
+/// 🔴 THIS IS WHERE THE TRUTH LIVES. A request's effective status is DERIVED from its slots; it is
+/// not a second stored column free to disagree with them (Q-C4 sub-ruling 2). Overlap is validated
+/// HERE, cancellation happens HERE, and a request whose every slot is cancelled becomes CANCELLED by
+/// computation.
+model BookingSlot {
+  id String @id @default(cuid())
+
+  /// `onDelete: Cascade` — a slot is a PART of its request with no independent identity, the same
+  /// relationship VenuePhoto has to Venue and LineUserRegistration has to LineUser.
+  bookingRequestId String
+  bookingRequest   BookingRequest @relation("BookingSlotRequest", fields: [bookingRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  /// DENORMALISED from the parent, deliberately.
+  ///
+  /// 🔴 The overlap check is the hottest read in the product and runs INSIDE the approval
+  /// transaction, where it is also the correctness boundary (ADR-001: double-booking is prevented by
+  /// database constraints inside a transaction, never by an application check alone). Carrying
+  /// `venueId` here makes that query one table and one index — `@@index([venueId, startAt, endAt])`
+  /// below — instead of a join back through the parent on every approval.
+  ///
+  /// ⚠️ WRITER'S CONTRACT: it MUST equal `bookingRequest.venueId`. Nothing in the schema can enforce
+  /// that, so slots are only ever written by the service that creates the parent, in the same
+  /// transaction, from the same value. A request never changes venue — an approver who wants a
+  /// different room rejects and asks for a new request, which is also what keeps the audit honest.
+  venueId String
+  venue   Venue  @relation("BookingSlotVenue", fields: [venueId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// The occupied span. Half-open [startAt, endAt): a slot ending 12:00 and one starting 12:00 do
+  /// NOT overlap. State it here because the overlap predicate is written in several places and one
+  /// of them using closed intervals produces phantom conflicts nobody can reproduce.
+  ///
+  /// 🔴 "No booking in the past" is checked against EACH SLOT's `startAt` versus the real clock —
+  /// NOW, never TODAY (D-C16). Today is still bookable at 09:00 for 14:00.
+  startAt DateTime
+  endAt   DateTime
+
+  /// Cancellation, per slot (Q-C4 sub-ruling 2). A three-slot request whose Monday has already begun
+  /// can still have its Tuesday and Wednesday cancelled.
+  ///
+  /// ⚠️ `isCancelled` is a FLAG, `cancelledAt` is a TIMESTAMP, and keeping both is a deliberate
+  /// exception to this schema's usual "the timestamp IS the flag" pattern (`deletedAt`). The reason
+  /// is the index: the overlap query must exclude cancelled slots on EVERY read, and a boolean
+  /// column indexes and reads more cheaply than `cancelledAt IS NULL` in a composite predicate.
+  /// 🔴 WRITER'S CONTRACT: they are written TOGETHER, always. `isCancelled = true` with a null
+  /// `cancelledAt` is a corrupt row.
+  ///
+  /// 🔴 A CANCELLED SLOT FREES IMMEDIATELY, and requests previously auto-rejected for that slot are
+  /// NOT revived (Q-C4) — the user may well have made other plans. They are TOLD it is free again.
+  isCancelled Boolean   @default(false)
+  cancelledAt DateTime?
+
+  /// Who cancelled, as an UNCONSTRAINED pair rather than two nullable FKs.
+  ///
+  /// 🔴 THE ACTOR MAY BE EITHER DOMAIN, and this schema has no bridge between them: a LineUser and
+  /// a SystemUser share no table, no session and no authentication surface. Two nullable FKs plus an
+  /// "exactly one is set" rule would be a third invariant to police for an AUDIT field that no query
+  /// joins on. `cancelledByRole` says which table `cancelledById` points into — "LINE_USER" |
+  /// "STAFF" | "ADMIN" — and the service writes both.
+  /// ⚠️ It is therefore NOT a foreign key and resolves nothing on its own. Do not `include` it.
+  cancelledById   String?
+  cancelledByRole String?
+
+  /// Optional free text. PDPA: may name a person or a reason; never logged.
+  cancelReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// 🔴 THE OVERLAP INDEX. Every availability read and every approval transaction uses it.
+  @@index([venueId, startAt, endAt])
+  @@index([bookingRequestId])
+  @@index([isCancelled])
+  @@map("booking_slots")
+}
+
+/// A single system setting, as a key-value row (Q-C4 sub-ruling 1).
+///
+/// This is the FIRST real settings store in the schema. The four tables the admin portal calls
+/// "system settings" — VenueType, Amenity, Department, PersonnelRole — are OPTION LISTS: curated
+/// vocabularies a user picks from. This is a knob an operator turns.
+///
+/// Seeded in the migration with `booking.cancel_lead_minutes = 30` so the backend has a value from
+/// the moment the table exists and needs no rework when the admin screen to edit it arrives
+/// (CLIENT-SETTINGS-1, undesigned).
+///
+/// 🔴 THE LEAD TIME IS ENFORCED ON THE SERVER, ALWAYS. The client reads it to enable a button and to
+/// write an explanation. A disabled button is UX, not an authorisation boundary — a late cancellation
+/// must be REFUSED by the server (Q-C4).
+///
+/// ⚠️ `value` is TEXT for every setting, parsed at the point of use. A key-value table with a typed
+/// column per setting is a schema migration per knob; this is not. The cost is that a bad value is a
+/// runtime problem, so every read parses with a fallback to the documented default rather than
+/// throwing — a malformed row must not take the cancel endpoint down.
+model AppSetting {
+  /// The setting's name, dotted ("booking.cancel_lead_minutes"). It IS the primary key: settings are
+  /// looked up by name and by nothing else, so a surrogate id would be a second identifier for the
+  /// same row with no reader.
+  key String @id
+
+  value String
+
+  /// What this knob does, for whoever meets it in Prisma Studio before the admin screen exists.
+  description String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("app_settings")
 }

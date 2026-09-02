@@ -132,6 +132,28 @@ export class VenuesService {
     return rows.map(toDto);
   }
 
+  /**
+   * One venue by id, or a 404 — the read behind `GET /line-users/venues/:id` (`CLIENT-VENUES-1`).
+   *
+   * ⚠️ IT EXISTS BECAUSE THE CLIENT NEEDS IT, NOT THE ADMIN. The back office has no venue-detail
+   * route: `list` returns everything unpaginated, so its dialog opens a row it already holds. The
+   * LIFF detail screen is reached by URL (`#/venue/:id` — `D-C3` puts navigation state in the path),
+   * so it can be opened cold, deep-linked, or restored by LINE with no list in memory.
+   *
+   * A soft-deleted venue is a 404, byte-identical to an unknown id — the same contract `softDelete`
+   * documents. A CLOSED venue is NOT: it returns normally with `isOpen: false` and its
+   * `closedReason`, because the detail screen renders that reason as an alert. "Closed" is a state
+   * the user must be able to read; "deleted" is a row that must not exist for them.
+   */
+  async findById(id: string): Promise<VenueResponseDto> {
+    const row = await this.prisma.venue.findFirst({
+      where: { id, deletedAt: null },
+      include: PUBLIC_INCLUDE,
+    });
+    if (!row) throw new NotFoundException(VENUE_NOT_FOUND);
+    return toDto(row);
+  }
+
   /** A venue is always created OPEN — the form has no switch in create mode, and neither has this. */
   async create(dto: CreateVenueDto): Promise<VenueResponseDto> {
     const photoUrls = this.assertOwnPhotoUrls(dto.photoUrls ?? []);

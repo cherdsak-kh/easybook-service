@@ -3,8 +3,10 @@ import {
   Controller,
   Get,
   HttpCode,
+  Param,
   Patch,
   Post,
+  Query,
   Req,
   UseGuards,
 } from '@nestjs/common';
@@ -15,12 +17,15 @@ import {
   ApiConflictResponse,
   ApiCreatedResponse,
   ApiForbiddenResponse,
+  ApiNotFoundResponse,
   ApiOkResponse,
   ApiOperation,
   ApiTags,
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { ErrorResponseDto } from '../common/dto/error-response.dto';
+import { ListVenuesQueryDto, VenueResponseDto } from '../venues/dto/venue.dto';
+import { VenuesService } from '../venues/venues.service';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { LineUserStatusResponseDto } from './dto/line-user-status-response.dto';
 import { RegistrationOptionsResponseDto } from './dto/registration-options-response.dto';
@@ -38,17 +43,27 @@ import type { RequestWithLineUserId } from './line.types';
  * It shares the `line-users` base with the admin `LineUsersController`. This controller MUST be
  * registered BEFORE the admin one in `LineModule.controllers` (SC-6) so its literal
  * `PATCH /line-users/registration` route wins over the admin `PATCH /line-users/:id`; a real cuid
- * still falls through to `:id`. The admin controller has no `GET /line-users/:id`, so `GET /status`
- * and `GET /registration/options` collide with nothing.
+ * still falls through to `:id`. The admin controller has no `GET /line-users/:id`, so `GET /status`,
+ * `GET /registration/options` and the two venue reads collide with nothing.
  *
  * `POST /register` and `PATCH /registration` are exempt from CSRF (bearer, cookieless — see
- * `CSRF_EXEMPT_PATHS`); the two GETs are GETs and already CSRF-safe.
+ * `CSRF_EXEMPT_PATHS`); every GET here is a GET and already CSRF-safe.
+ *
+ * ⚠️ IT ALSO HOSTS THE CONSUMER VENUE READS (`CLIENT-VENUES-1`), which are about venues rather than
+ * registration. They live here because the guard is the organising principle, not the noun: this is
+ * the only controller in the app whose caller proves identity with a LINE ID token. The alternative
+ * — relaxing `VenuesController`'s class-level `@UseGuards(SessionGuard, RolesGuard)` — would open
+ * the SEVEN admin write routes that class also holds, so it is explicitly forbidden
+ * (`SERVICE_CHANGES.md` §1).
  */
 @ApiTags('LINE Registration')
 @ApiBearerAuth()
 @Controller('line-users')
 export class LineRegistrationController {
-  constructor(private readonly users: LineUserService) {}
+  constructor(
+    private readonly users: LineUserService,
+    private readonly venues: VenuesService,
+  ) {}
 
   @Get('status')
   @UseGuards(LineIdTokenGuard)
@@ -100,6 +115,59 @@ export class LineRegistrationController {
   })
   getOptions(): Promise<RegistrationOptionsResponseDto> {
     return this.users.getRegistrationOptions();
+  }
+
+  /**
+   * ⚠️ LITERAL SEGMENT, REGISTERED BEFORE THE ADMIN CONTROLLER'S PARAMETERISED ROUTES — the same
+   * SC-6 ordering that protects `PATCH /line-users/registration`. The admin controller has no
+   * `GET /line-users/:id` today, so nothing shadows this; if one is ever added, this ordering is
+   * what keeps `venues` from being read as a user id.
+   */
+  @Get('venues')
+  @UseGuards(LineIdTokenGuard)
+  @ApiOperation({
+    summary: 'List venues for the LIFF catalogue screen.',
+    description:
+      'The consumer half of `GET /venues`, which is admin-only at class level and unreachable with a LINE ID token. Same service, same shape, same search/filter behaviour — a different guard in front of it. Unpaginated and `name ASC`, exactly like the admin list. CLOSED venues ARE returned (`isOpen: false`, with `closedReason`): a closed venue stays visible to end users and simply accepts no new booking requests. Soft-deleted venues are never returned.',
+  })
+  @ApiOkResponse({
+    description: 'Every non-deleted venue matching the filters, `name ASC`.',
+    type: [VenueResponseDto],
+  })
+  @ApiUnauthorizedResponse({
+    description: 'Missing/invalid/expired/wrong-aud LINE ID token.',
+    type: ErrorResponseDto,
+  })
+  @ApiBadGatewayResponse({
+    description: 'LINE verification endpoint unreachable (retryable).',
+    type: ErrorResponseDto,
+  })
+  listVenues(@Query() query: ListVenuesQueryDto): Promise<VenueResponseDto[]> {
+    return this.venues.list(query);
+  }
+
+  @Get('venues/:id')
+  @UseGuards(LineIdTokenGuard)
+  @ApiOperation({
+    summary: 'Read one venue for the LIFF detail screen.',
+    description:
+      'There is no admin equivalent — the back office renders detail from the row its unpaginated list already holds, whereas `#/venue/:id` is a URL and can be opened cold, deep-linked, or restored by LINE. A CLOSED venue returns normally, because the screen renders `closedReason` as an alert; a soft-deleted or unknown id is a 404, and the two are byte-identical.',
+  })
+  @ApiOkResponse({ description: 'The venue.', type: VenueResponseDto })
+  @ApiNotFoundResponse({
+    description: 'No such venue, or it has been deleted.',
+    type: ErrorResponseDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'Missing/invalid/expired/wrong-aud LINE ID token.',
+    type: ErrorResponseDto,
+  })
+  @ApiBadGatewayResponse({
+    description: 'LINE verification endpoint unreachable (retryable).',
+    type: ErrorResponseDto,
+  })
+  getVenue(@Param('id') id: string): Promise<VenueResponseDto> {
+    return this.venues.findById(id);
   }
 
   @Post('register')
