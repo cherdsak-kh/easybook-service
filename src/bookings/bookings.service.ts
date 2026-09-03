@@ -6,9 +6,11 @@ import {
   InternalServerErrorException,
   Logger,
   NotFoundException,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import { AppAccess, BookingStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { TOMBSTONE_VENUE_TYPE_NAME } from '../venue-types/venue-types.constants';
 import { bangkokDayRange, formatBookingCode } from './booking-code';
 import {
   AVAILABILITY_MAX_DAYS,
@@ -17,7 +19,16 @@ import {
   BANGKOK_UTC_OFFSET_MINUTES,
   BOOKING_CODE_MAX_ATTEMPTS,
   BOOKING_NOT_ALLOWED,
+  BOOKING_NOT_APPROVED,
+  BOOKING_NOT_FOUND,
+  BOOKING_NOT_PENDING,
+  CANCEL_LEAD_MINUTES_DEFAULT,
+  CANCEL_LEAD_MINUTES_KEY,
+  CANCELLED_BY_LINE_USER,
+  SLOT_ALREADY_CANCELLED,
+  SLOT_CANCEL_TOO_LATE,
   SLOT_IN_THE_PAST,
+  SLOT_NOT_FOUND,
   SLOT_RANGE_INVALID,
   SLOT_SELF_OVERLAP,
   SLOT_TAKEN,
@@ -25,10 +36,17 @@ import {
   VENUE_NOT_FOUND,
 } from './bookings.constants';
 import type {
+  BookingDetailResponseDto,
+  BookingListItemDto,
   BookingRequestResponseDto,
+  BookingSlotResponseDto,
   VenueAvailabilitySlotDto,
 } from './dto/booking-response.dto';
 import type { CreateLineBookingDto } from './dto/create-line-booking.dto';
+import type {
+  BookingSort,
+  ListLineBookingsQueryDto,
+} from './dto/list-line-bookings-query.dto';
 import type { VenueAvailabilityQueryDto } from './dto/venue-availability-query.dto';
 
 /** A slot after parsing, with real `Date`s instead of the DTO's strings. */
@@ -71,6 +89,93 @@ const AVAILABILITY_INCLUDE = {
 type AvailabilityRow = Prisma.BookingSlotGetPayload<{
   include: typeof AVAILABILITY_INCLUDE;
 }>;
+
+/**
+ * Slots as their OWNER reads them, oldest first.
+ *
+ * ⚠️ CANCELLED SLOTS ARE INCLUDED, and that is the opposite of {@link AVAILABILITY_INCLUDE}'s rule.
+ * The calendar must not paint a freed hour; the owner's own detail screen must still show that
+ * Wednesday was dropped, or a three-day request silently becomes a two-day one with no explanation
+ * and the user has no way to see what they did.
+ */
+const OWNED_SLOTS = {
+  orderBy: [{ startAt: 'asc' }, { id: 'asc' }],
+} satisfies Prisma.BookingRequest$slotsArgs;
+
+/**
+ * The venue a booking CARD needs. See {@link BookingVenueSummaryDto}.
+ *
+ * ⚠️ NO `deletedAt` FILTER ANYWHERE IN HERE — the read half of this repo's asymmetry. A booking
+ * against a venue whose category was later retired must keep resolving that category's name;
+ * filtering would put `null` into a non-nullable DTO field and 500 the whole list.
+ */
+const VENUE_CARD_SELECT = {
+  id: true,
+  name: true,
+  location: true,
+  venueType: { select: { id: true, name: true, isSystemReserved: true } },
+  photos: {
+    select: { id: true, url: true, position: true },
+    // `id` as the tiebreak, so a duplicated `position` degrades to a stable but arbitrary order
+    // rather than a cover that changes between two reads of the same row (`VenuePhoto`).
+    orderBy: [{ position: 'asc' }, { id: 'asc' }],
+  },
+} satisfies Prisma.VenueSelect;
+
+/** The venue the DETAIL screen needs: the card's fields plus what the user checks a room against. */
+const VENUE_DETAIL_SELECT = {
+  ...VENUE_CARD_SELECT,
+  capacity: true,
+  isOpen: true,
+  amenities: {
+    // The one place a `deletedAt` filter DOES belong: an amenity is a claim about the room right
+    // now ("this hall has a projector"), and a retired one must stop printing. Mirrors
+    // `VenuesService.PUBLIC_INCLUDE` exactly — the two must not drift.
+    where: { amenity: { deletedAt: null } },
+    select: { amenity: { select: { id: true, name: true } } },
+    orderBy: { amenity: { name: 'asc' } },
+  },
+} satisfies Prisma.VenueSelect;
+
+const LIST_INCLUDE = {
+  venue: { select: VENUE_CARD_SELECT },
+  slots: OWNED_SLOTS,
+} satisfies Prisma.BookingRequestInclude;
+
+const DETAIL_INCLUDE = {
+  venue: { select: VENUE_DETAIL_SELECT },
+  slots: OWNED_SLOTS,
+} satisfies Prisma.BookingRequestInclude;
+
+type ListRow = Prisma.BookingRequestGetPayload<{
+  include: typeof LIST_INCLUDE;
+}>;
+type DetailRow = Prisma.BookingRequestGetPayload<{
+  include: typeof DETAIL_INCLUDE;
+}>;
+
+/**
+ * The four orderings, resolved to Prisma.
+ *
+ * ⚠️ EVERY ONE ENDS IN `code: 'asc'`, which makes the order TOTAL. Two requests submitted in the
+ * same second are otherwise ordered by whatever Postgres feels like, so the same list re-fetched
+ * after a cancel can shuffle two rows past each other — and a list that reorders under a user who
+ * did not ask it to reads as data loss. `code` is the prototype's own tiebreak (`a.id` there IS
+ * this `code`).
+ *
+ * ⚠️ `event-*` ORDERS ON `firstStartAt`, NOT ON THE SLOTS. Ordering through a relation is not
+ * expressible in this repo's pagination rule, which is the reason the denormalised pair exists at
+ * all (`schema.prisma`) — and the cancel path below is what keeps it honest.
+ */
+const SORT_ORDER: Record<
+  BookingSort,
+  Prisma.BookingRequestOrderByWithRelationInput[]
+> = {
+  'created-desc': [{ createdAt: 'desc' }, { code: 'asc' }],
+  'created-asc': [{ createdAt: 'asc' }, { code: 'asc' }],
+  'event-asc': [{ firstStartAt: 'asc' }, { code: 'asc' }],
+  'event-desc': [{ firstStartAt: 'desc' }, { code: 'asc' }],
+};
 
 /**
  * `CLIENT-BOOKING-1`, client half — the LIFF end-user's two booking touchpoints.
@@ -158,6 +263,234 @@ export class BookingsService {
     });
 
     return rows.map((row) => toAvailabilityDto(row, requester.id));
+  }
+
+  /**
+   * `GET /line-users/bookings` — My Bookings.
+   *
+   * 🔴 OWNERSHIP IS A `where` CLAUSE, NEVER A FILTER AFTER THE READ. `lineUserId` is fixed from the
+   * verified `sub` and combined with the caller's `q`/`status`, so there is no code path on which a
+   * search term can widen the result set past its author. A post-read `.filter()` would put one
+   * forgotten `return` between a typo and every booking in the product.
+   */
+  async listUserBookings(
+    lineSub: string,
+    query: ListLineBookingsQueryDto,
+  ): Promise<BookingListItemDto[]> {
+    const requester = await this.resolveAllowedRequester(lineSub);
+
+    const rows = await this.prisma.bookingRequest.findMany({
+      where: {
+        lineUserId: requester.id,
+        ...(query.status ? { status: query.status } : {}),
+        ...searchWhere(query.q),
+      },
+      include: LIST_INCLUDE,
+      orderBy: SORT_ORDER[query.sort],
+    });
+
+    return rows.map(toListDto);
+  }
+
+  /**
+   * `GET /line-users/bookings/:id` — addressed by cuid **or** by `code`.
+   *
+   * ⚠️ TWO KEYS FOR ONE ROW, DELIBERATELY. `#/booking/:id` navigates by cuid; `#/sent/:id` knows
+   * only the `BR-…` number it just printed, and the user's own paste of it out of a LINE chat is the
+   * third caller. Making the confirmation screen carry a cuid it never saw, or making the search box
+   * resolve a code to an id first, would both be a round trip to avoid one `OR`.
+   */
+  async getUserBookingDetail(
+    lineSub: string,
+    idOrCode: string,
+  ): Promise<BookingDetailResponseDto> {
+    const requester = await this.resolveAllowedRequester(lineSub);
+    return this.readDetail(ownedBookingWhere(idOrCode, requester.id));
+  }
+
+  /**
+   * `PATCH /line-users/bookings/:id/cancel` — withdraw a request the approver has not ruled on.
+   *
+   * `Q-C4`: `PENDING` is the ONLY cancellable-as-a-whole state. An `APPROVED` booking is cancelled
+   * one slot at a time ({@link cancelApprovedSlot}), and `REJECTED`/`CANCELLED` are terminal.
+   *
+   * 🔴 THE STATE CHECK IS THE CONDITIONAL UPDATE, NOT THE `if`. The read-then-write between two
+   * concurrent taps — a double-tap on a phone is the ordinary case, not an exotic one — would let
+   * both pass the `if` and both write. `updateMany({ where: { id, status: PENDING } })` makes
+   * Postgres the arbiter and the loser sees `count: 0`, which is ADR-001's rule applied to a state
+   * machine rather than to an overlap.
+   *
+   * ⚠️ `firstStartAt`/`lastEndAt` ARE NOT RECOMPUTED HERE, which is the same rule the per-slot path
+   * follows when the last slot goes: a request with nothing live keeps the span it last had, because
+   * the history group still has to sort it by a date and "when was this going to be" is the only
+   * date it has. Recomputing over an empty set has no answer that is not a lie.
+   */
+  async cancelPendingBooking(
+    lineSub: string,
+    idOrCode: string,
+  ): Promise<BookingDetailResponseDto> {
+    const requester = await this.resolveAllowedRequester(lineSub);
+    const where = ownedBookingWhere(idOrCode, requester.id);
+    const now = new Date();
+
+    const id = await this.prisma.$transaction(async (tx) => {
+      const booking = await tx.bookingRequest.findFirst({
+        where,
+        select: { id: true, status: true },
+      });
+      if (!booking) throw new NotFoundException(BOOKING_NOT_FOUND);
+      if (booking.status !== BookingStatus.PENDING) {
+        throw new UnprocessableEntityException(BOOKING_NOT_PENDING);
+      }
+
+      const flipped = await tx.bookingRequest.updateMany({
+        where: { id: booking.id, status: BookingStatus.PENDING },
+        data: { status: BookingStatus.CANCELLED },
+      });
+      if (flipped.count !== 1) {
+        throw new UnprocessableEntityException(BOOKING_NOT_PENDING);
+      }
+
+      // `Q-C4` ②: the truth lives at slot level. Flipping the parent without its children would
+      // leave live slots under a cancelled request — rows the availability read still paints.
+      await tx.bookingSlot.updateMany({
+        where: { bookingRequestId: booking.id, isCancelled: false },
+        data: cancellation(now, requester.id),
+      });
+      return booking.id;
+    });
+
+    return this.readDetail({ id });
+  }
+
+  /**
+   * `PATCH /line-users/bookings/:id/slots/:slotId/cancel` — drop one day of an approved booking.
+   *
+   * `Q-C4` ②, in full: a three-slot request whose Monday has already begun can still have its
+   * Tuesday and Wednesday cancelled, the check runs against **that slot's** `startAt`, and only that
+   * slot is freed.
+   *
+   * 🔴 THE CANCELLED SLOT FREES THE CALENDAR IMMEDIATELY. `listVenueAvailability` filters on
+   * `isCancelled: false` at SLOT level, so the hour is green again on the next read — no job, no
+   * cache, nothing to invalidate. Requests previously auto-rejected for it are NOT revived
+   * (`Q-C4`): the user has probably made other plans, and they are told the slot is free instead.
+   *
+   * ⚠️ THE DENORMALISED SPAN IS RECOMPUTED IN THE SAME TRANSACTION, which is `schema.prisma`'s
+   * writer's contract for these two columns rather than a nicety. They are a cache of the children,
+   * and a stale one here does not error — it silently mis-sorts My Bookings and mis-filters the
+   * approval queue.
+   */
+  async cancelApprovedSlot(
+    lineSub: string,
+    idOrCode: string,
+    slotId: string,
+  ): Promise<BookingDetailResponseDto> {
+    const requester = await this.resolveAllowedRequester(lineSub);
+    const where = ownedBookingWhere(idOrCode, requester.id);
+    const leadMinutes = await this.cancelLeadMinutes();
+    const now = new Date();
+    // 🔴 NOW PLUS THE LEAD TIME, compared against the real clock — the same `D-C16` reasoning that
+    // governs submission. A slot that has already started is refused by this one comparison too,
+    // because it is even further in the past than the cutoff.
+    const cutoff = now.getTime() + leadMinutes * 60_000;
+
+    const id = await this.prisma.$transaction(async (tx) => {
+      const booking = await tx.bookingRequest.findFirst({
+        where,
+        select: { id: true, status: true },
+      });
+      if (!booking) throw new NotFoundException(BOOKING_NOT_FOUND);
+      if (booking.status !== BookingStatus.APPROVED) {
+        throw new UnprocessableEntityException(BOOKING_NOT_APPROVED);
+      }
+
+      // Scoped to the parent, so a slot id belonging to somebody else's booking is a 404 rather
+      // than a cancellation of a stranger's Tuesday.
+      const slot = await tx.bookingSlot.findFirst({
+        where: { id: slotId, bookingRequestId: booking.id },
+        select: { id: true, startAt: true, isCancelled: true },
+      });
+      if (!slot) throw new NotFoundException(SLOT_NOT_FOUND);
+      if (slot.isCancelled) {
+        throw new UnprocessableEntityException(SLOT_ALREADY_CANCELLED);
+      }
+      if (slot.startAt.getTime() <= cutoff) {
+        throw new UnprocessableEntityException(SLOT_CANCEL_TOO_LATE);
+      }
+
+      const cancelled = await tx.bookingSlot.updateMany({
+        where: { id: slot.id, isCancelled: false },
+        data: cancellation(now, requester.id),
+      });
+      if (cancelled.count !== 1) {
+        throw new UnprocessableEntityException(SLOT_ALREADY_CANCELLED);
+      }
+
+      const remaining = await tx.bookingSlot.findMany({
+        where: { bookingRequestId: booking.id, isCancelled: false },
+        select: { startAt: true, endAt: true },
+      });
+
+      // 🔴 THE LAST SLOT TAKES THE REQUEST WITH IT (`Q-C4` ②: the request's status is DERIVED from
+      // its slots). A booking with every slot cancelled but a status still reading `APPROVED` is
+      // the two-sources-of-truth bug that ruling exists to forbid — and it would sit in the
+      // approved accordion looking like something that is still going to happen.
+      //
+      // ⚠️ THAT BRANCH LEAVES THE SPAN ALONE, so a request cancelled slot by slot ends up carrying
+      // the window of whichever slot went LAST rather than its original range. Measured, and
+      // correct for what the column is for: the history group needs a date to sort by, and no
+      // aggregate over zero live slots exists to compute a better one.
+      await tx.bookingRequest.update({
+        where: { id: booking.id },
+        data:
+          remaining.length === 0
+            ? { status: BookingStatus.CANCELLED }
+            : {
+                firstStartAt: new Date(
+                  Math.min(...remaining.map((s) => s.startAt.getTime())),
+                ),
+                lastEndAt: new Date(
+                  Math.max(...remaining.map((s) => s.endAt.getTime())),
+                ),
+              },
+      });
+      return booking.id;
+    });
+
+    return this.readDetail({ id });
+  }
+
+  /** The detail read, shared by the GET and by both cancel routes' echo of the new state. */
+  private async readDetail(
+    where: Prisma.BookingRequestWhereInput,
+  ): Promise<BookingDetailResponseDto> {
+    const [row, leadMinutes] = await Promise.all([
+      this.prisma.bookingRequest.findFirst({ where, include: DETAIL_INCLUDE }),
+      this.cancelLeadMinutes(),
+    ]);
+    if (!row) throw new NotFoundException(BOOKING_NOT_FOUND);
+    return toDetailDto(row, leadMinutes);
+  }
+
+  /**
+   * `booking.cancel_lead_minutes`, or the documented default (`Q-C4` ①).
+   *
+   * ⚠️ A MISSING OR MALFORMED ROW FALLS BACK RATHER THAN THROWING. The seed writes it and a migrated
+   * database always has it, but the failure mode of being wrong here is "nobody in the product can
+   * cancel anything", and that must not be one bad row away. `value` is a `String` column because
+   * `app_settings` is one table for every setting — parsing it is this reader's job.
+   */
+  private async cancelLeadMinutes(): Promise<number> {
+    const row = await this.prisma.appSetting.findUnique({
+      where: { key: CANCEL_LEAD_MINUTES_KEY },
+      select: { value: true },
+    });
+    const parsed = Number.parseInt(row?.value ?? '', 10);
+    // `>= 0` and not `> 0`: zero is a legitimate configuration meaning "cancel right up to the
+    // start". Negative would mean "cancel after it began", which is not a policy, it is a typo.
+    return Number.isFinite(parsed) && parsed >= 0
+      ? parsed
+      : CANCEL_LEAD_MINUTES_DEFAULT;
   }
 
   /**
@@ -383,12 +716,164 @@ function toRequestDto(
     status: row.status,
     firstStartAt: row.firstStartAt,
     lastEndAt: row.lastEndAt,
-    slots: row.slots.map((s) => ({
-      id: s.id,
-      startAt: s.startAt,
-      endAt: s.endAt,
-      isCancelled: s.isCancelled,
-    })),
+    slots: row.slots.map(toSlotDto),
+    createdAt: row.createdAt,
+  };
+}
+
+/**
+ * A booking addressed by cuid **or** by `code`, scoped to its owner.
+ *
+ * 🔴 THE OWNERSHIP IS INSIDE THE `where`, WHICH IS WHY THE ANSWER IS 404 AND NOT 403. A 403 would
+ * confirm the row exists, and `code` is a guessable label — `BR-` plus a date plus a three-digit
+ * counter — so the oracle would be walkable by hand rather than needing a cuid. Every route that
+ * reaches a booking goes through this function; there is no second way to name one.
+ *
+ * ⚠️ THE LEADING `#` IS STRIPPED. Users paste `#BR-25690903-001` because that is how the number is
+ * written to them in LINE, and a URL or a search that refused the exact string it displayed would
+ * be the product being wrong about its own identifier.
+ */
+function ownedBookingWhere(
+  idOrCode: string,
+  lineUserId: string,
+): Prisma.BookingRequestWhereInput {
+  const key = idOrCode.trim().replace(/^#/, '');
+  return { lineUserId, OR: [{ id: key }, { code: key }] };
+}
+
+/**
+ * `q` → the four columns the prototype searches (`mbMatch`): the booking number, the purpose, and
+ * the venue's name and location.
+ *
+ * ⚠️ AN EMPTY TERM MUST PRODUCE NO CLAUSE AT ALL, not `contains: ''`. Postgres matches every row on
+ * an empty substring, so the two happen to agree today — but `q=` would then be silently relying on
+ * that, and the day a `NULL` location or a stricter matcher arrives it stops being true.
+ */
+function searchWhere(q?: string): Prisma.BookingRequestWhereInput {
+  const term = q?.trim().replace(/^#/, '') ?? '';
+  if (!term) return {};
+  const like = { contains: term, mode: 'insensitive' } as const;
+  return {
+    OR: [
+      { code: like },
+      { purpose: like },
+      { venue: { name: like } },
+      { venue: { location: like } },
+    ],
+  };
+}
+
+/**
+ * The four columns a cancellation writes, together.
+ *
+ * 🔴 `isCancelled` AND `cancelledAt` ARE A PAIR (`schema.prisma`): the flag is what the overlap
+ * index covers, the timestamp is what the audit reads, and one without the other is a corrupt row.
+ * They are written from one helper so no path can set half of it.
+ *
+ * ⚠️ `cancelledByRole` IS NOT A FOREIGN KEY. `cancelledById` may point into `line_users` or into
+ * `system_users` — two tables with no bridge — and this string is the only thing that says which.
+ */
+function cancellation(
+  at: Date,
+  lineUserId: string,
+): Prisma.BookingSlotUpdateManyMutationInput {
+  return {
+    isCancelled: true,
+    cancelledAt: at,
+    cancelledById: lineUserId,
+    cancelledByRole: CANCELLED_BY_LINE_USER,
+  };
+}
+
+/**
+ * The tombstone category, derived exactly as `/venue-types` derives it — **flag AND name, never the
+ * name alone**. An operator may create an ordinary category literally called `ไม่พบประเภทสถานที่`,
+ * and that row must render as the ordinary category it is.
+ */
+function toVenueTypeDto(type: {
+  id: number;
+  name: string;
+  isSystemReserved: boolean;
+}) {
+  return {
+    id: type.id,
+    name: type.name,
+    isFallback:
+      type.isSystemReserved && type.name === TOMBSTONE_VENUE_TYPE_NAME,
+  };
+}
+
+function toSlotDto(slot: {
+  id: string;
+  startAt: Date;
+  endAt: Date;
+  isCancelled: boolean;
+  cancelledAt: Date | null;
+  cancelReason: string | null;
+}): BookingSlotResponseDto {
+  return {
+    id: slot.id,
+    startAt: slot.startAt,
+    endAt: slot.endAt,
+    isCancelled: slot.isCancelled,
+    cancelledAt: slot.cancelledAt,
+    cancelReason: slot.cancelReason,
+  };
+}
+
+function toListDto(row: ListRow): BookingListItemDto {
+  return {
+    id: row.id,
+    code: row.code,
+    venue: {
+      id: row.venue.id,
+      name: row.venue.name,
+      location: row.venue.location,
+      venueType: toVenueTypeDto(row.venue.venueType),
+      photos: row.venue.photos,
+    },
+    purpose: row.purpose,
+    attendees: row.attendees,
+    status: row.status,
+    rejectReason: row.rejectReason,
+    firstStartAt: row.firstStartAt,
+    lastEndAt: row.lastEndAt,
+    slots: row.slots.map(toSlotDto),
+    createdAt: row.createdAt,
+  };
+}
+
+/**
+ * ⚠️ `approvedById` IS READ AND NOT RETURNED — see {@link BookingDetailResponseDto}. A LINE user is
+ * entitled to know their request was ruled on and when; they are not entitled to a named staff
+ * member. It is not selected at all, so it cannot leak through a later spread.
+ */
+function toDetailDto(
+  row: DetailRow,
+  cancelLeadMinutes: number,
+): BookingDetailResponseDto {
+  return {
+    id: row.id,
+    code: row.code,
+    venue: {
+      id: row.venue.id,
+      name: row.venue.name,
+      location: row.venue.location,
+      capacity: row.venue.capacity,
+      isOpen: row.venue.isOpen,
+      venueType: toVenueTypeDto(row.venue.venueType),
+      photos: row.venue.photos,
+      amenities: row.venue.amenities.map((a) => a.amenity),
+    },
+    purpose: row.purpose,
+    attendees: row.attendees,
+    status: row.status,
+    rejectReason: row.rejectReason,
+    firstStartAt: row.firstStartAt,
+    lastEndAt: row.lastEndAt,
+    approvedAt: row.approvedAt,
+    slots: row.slots.map(toSlotDto),
+    cancelLeadMinutes,
     createdAt: row.createdAt,
   };
 }

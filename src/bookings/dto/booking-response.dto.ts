@@ -1,5 +1,10 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { BookingStatus } from '@prisma/client';
+import {
+  VenueAmenityDto,
+  VenuePhotoDto,
+  VenueTypeSummaryDto,
+} from '../../venues/dto/venue.dto';
 
 /**
  * One span of a request, as echoed back to its own requester.
@@ -29,6 +34,239 @@ export class BookingSlotResponseDto {
       'Per-slot cancellation (`Q-C4`). Always `false` on a freshly submitted request; a three-slot request may later have one slot cancelled and keep the other two.',
   })
   isCancelled!: boolean;
+
+  /**
+   * ⚠️ THE FLAG AND THE TIMESTAMP ARE WRITTEN TOGETHER, ALWAYS (`schema.prisma`). `isCancelled: true`
+   * with a null `cancelledAt` is a corrupt row, so a client may read either one as the answer to
+   * "is this cancelled" — but it should read the FLAG, because that is the one the overlap index
+   * covers and the one the server filters on.
+   */
+  @ApiProperty({
+    type: String,
+    format: 'date-time',
+    nullable: true,
+    description: 'When it was cancelled. Null unless `isCancelled` is true.',
+  })
+  cancelledAt!: Date | null;
+
+  /**
+   * ⚠️ NOT WRITTEN BY THE CLIENT CANCEL ROUTES, and its absence there is deliberate: `Q-C4` gives a
+   * LINE user an unconditional right to cancel a pending request and a lead-time-bounded right to
+   * drop an approved slot, and neither is contingent on explaining themselves. The column exists for
+   * the STAFF side, where a cancellation happens TO somebody and has to be accountable.
+   */
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description:
+      'Free-text reason, written only by the staff cancellation path. Always null for a cancellation the user made themselves.',
+  })
+  cancelReason!: string | null;
+}
+
+/**
+ * The venue as a booking CARD needs it — enough to recognise the room, not enough to re-decide on
+ * it. `#/bookings` shows the cover photo, the name and the category badge.
+ *
+ * ⚠️ `photos` IS THE WHOLE ORDERED ARRAY, not just the cover, because `position === 0` IS the cover
+ * and there is no `isCover` flag to send instead (`VenuePhoto`). A list of tens of bookings carries
+ * a handful of URLs per row; a `coverUrl` string would be a second encoding of `position` and free
+ * to disagree with it.
+ *
+ * ⚠️ THE NESTED READS CARRY NO `deletedAt` FILTER — this repo's read/write asymmetry. A booking made
+ * against a venue whose category was later retired must still render its category name; filtering
+ * would return `null` into a non-nullable field and 500 the list.
+ */
+export class BookingVenueSummaryDto {
+  @ApiProperty()
+  id!: string;
+
+  @ApiProperty({ example: 'หอประชุมวารณ' })
+  name!: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    example: 'อาคารหอประชุม ชั้น 1',
+  })
+  location!: string | null;
+
+  @ApiProperty({ type: VenueTypeSummaryDto })
+  venueType!: VenueTypeSummaryDto;
+
+  @ApiProperty({
+    type: [VenuePhotoDto],
+    description: 'Ordered. Index 0 is the cover. Empty for a venue with none.',
+  })
+  photos!: VenuePhotoDto[];
+}
+
+/**
+ * The venue as the DETAIL screen needs it: the summary plus what the user is checking against
+ * ("does the room I was given still have a projector, and how many people does it hold").
+ *
+ * ⚠️ IT DOES NOT EXTEND {@link BookingVenueSummaryDto}. The two are read by different endpoints with
+ * different `select`s, and a subclass would let a field added to the summary reach the list's
+ * response without anyone choosing to put it there.
+ */
+export class BookingVenueDetailDto {
+  @ApiProperty()
+  id!: string;
+
+  @ApiProperty({ example: 'หอประชุมวารณ' })
+  name!: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    example: 'อาคารหอประชุม ชั้น 1',
+  })
+  location!: string | null;
+
+  @ApiProperty({ example: 900 })
+  capacity!: number;
+
+  /**
+   * ⚠️ A CLOSED VENUE DOES NOT INVALIDATE AN EXISTING BOOKING. `isOpen: false` means "accepts no NEW
+   * requests"; a booking already approved against it still happens. The screen uses this to explain
+   * why the "จองอีกครั้ง" affordance is unavailable, never to grey out the booking itself.
+   */
+  @ApiProperty({ example: true })
+  isOpen!: boolean;
+
+  @ApiProperty({ type: VenueTypeSummaryDto })
+  venueType!: VenueTypeSummaryDto;
+
+  @ApiProperty({ type: [VenuePhotoDto] })
+  photos!: VenuePhotoDto[];
+
+  @ApiProperty({ type: [VenueAmenityDto], description: 'Ordered `name ASC`.' })
+  amenities!: VenueAmenityDto[];
+}
+
+/**
+ * One row of `#/bookings` — the caller's own booking request.
+ *
+ * ── 🔴 THE STATUS ON THIS ROW IS ONE OF FOUR; THE SCREEN PAINTS SIX ──
+ * `สิ้นสุดแล้ว` (a past `APPROVED`) and `หมดเวลาพิจารณา` (a past `PENDING`) are **derived at read
+ * time from `status` and `lastEndAt`, and never stored** (`CHECKLIST.md`, Phase 6). That is why
+ * `lastEndAt` is on this DTO even though no card prints it directly: it is the input to two of the
+ * six badges. A server-side `expired` enum value would be a scheduled job's problem for a fact that
+ * a subtraction answers exactly.
+ *
+ * ⚠️ `lastEndAt` IS THE **LATEST** SLOT'S END, not the first. A three-day repeat has not finished
+ * until the third day has.
+ */
+export class BookingListItemDto {
+  @ApiProperty()
+  id!: string;
+
+  @ApiProperty({ example: 'BR-25690902-001' })
+  code!: string;
+
+  @ApiProperty({ type: BookingVenueSummaryDto })
+  venue!: BookingVenueSummaryDto;
+
+  @ApiProperty()
+  purpose!: string;
+
+  @ApiProperty()
+  attendees!: number;
+
+  @ApiProperty({ enum: BookingStatus })
+  status!: BookingStatus;
+
+  /**
+   * ⚠️ WRITTEN ON BOTH REFUSAL PATHS — an operator's explicit reject AND the auto-rejection that
+   * fires when a competing request wins the slot (`D-C13` rule 5). The second is the common one.
+   * 🔴 It may say the slot went to someone else; it must NEVER say who, or what for.
+   */
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: 'Why it was refused. Null unless `status` is `REJECTED`.',
+  })
+  rejectReason!: string | null;
+
+  @ApiProperty({ format: 'date-time' })
+  firstStartAt!: Date;
+
+  @ApiProperty({ format: 'date-time' })
+  lastEndAt!: Date;
+
+  @ApiProperty({ type: [BookingSlotResponseDto] })
+  slots!: BookingSlotResponseDto[];
+
+  @ApiProperty({ format: 'date-time' })
+  createdAt!: Date;
+}
+
+/**
+ * `GET /line-users/bookings/:id` — the caller's own booking in full.
+ *
+ * ⚠️ NO APPROVER IDENTITY. `approvedAt` is here and `approvedById` is not: a LINE user is entitled
+ * to know their request was ruled on and when, and is not entitled to a named staff member. The
+ * same asymmetry `D-C13`'s privacy clause applies in the other direction.
+ */
+export class BookingDetailResponseDto {
+  @ApiProperty()
+  id!: string;
+
+  @ApiProperty({ example: 'BR-25690902-001' })
+  code!: string;
+
+  @ApiProperty({ type: BookingVenueDetailDto })
+  venue!: BookingVenueDetailDto;
+
+  @ApiProperty()
+  purpose!: string;
+
+  @ApiProperty()
+  attendees!: number;
+
+  @ApiProperty({ enum: BookingStatus })
+  status!: BookingStatus;
+
+  @ApiProperty({ type: String, nullable: true })
+  rejectReason!: string | null;
+
+  @ApiProperty({ format: 'date-time' })
+  firstStartAt!: Date;
+
+  @ApiProperty({ format: 'date-time' })
+  lastEndAt!: Date;
+
+  @ApiProperty({
+    type: String,
+    format: 'date-time',
+    nullable: true,
+    description:
+      'When the request was approved. Null while pending, and on a rejected or cancelled request.',
+  })
+  approvedAt!: Date | null;
+
+  @ApiProperty({ type: [BookingSlotResponseDto] })
+  slots!: BookingSlotResponseDto[];
+
+  /**
+   * 🔴 THE SETTING, SENT SO THE CLIENT CAN WORD ITS OWN SENTENCE (`Q-C4` ①). The screen needs this
+   * number twice — to decide whether a slot's cancel button is offered at all, and to write
+   * `ต้องยกเลิกล่วงหน้าอย่างน้อย N นาที…` with the real N in it. Sending the number instead of a
+   * pre-rendered message is what keeps the Thai copy in the Thai codebase (`I18N-ERR-1`) and keeps
+   * it true after an operator edits `booking.cancel_lead_minutes`.
+   *
+   * ⚠️ IT IS NOT THE BOUNDARY. The server refuses a late cancellation whatever the client did with
+   * this value; a hidden button is UX, and UX is not an authorisation boundary.
+   */
+  @ApiProperty({
+    example: 30,
+    description:
+      'Cancellation lead time in minutes, from `app_settings`. A slot may be cancelled only while it starts more than this far in the future.',
+  })
+  cancelLeadMinutes!: number;
+
+  @ApiProperty({ format: 'date-time' })
+  createdAt!: Date;
 }
 
 /**

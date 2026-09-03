@@ -66,6 +66,96 @@ export const SLOT_TAKEN =
   'One or more of the requested times is already booked.';
 
 /**
+ * 404. The booking does not exist, **or it is not the caller's**.
+ *
+ * 🔴 ONE ANSWER FOR BOTH, AND NEVER A 403. A 403 on somebody else's booking would confirm that the
+ * id exists, which turns `GET /line-users/bookings/:id` into an enumeration oracle over every
+ * booking in the product — and `code` is a GUESSABLE label (`BR-` + a date + a three-digit counter),
+ * so the oracle would be walkable by hand rather than needing a cuid. Ownership is therefore part
+ * of the `where`, not a check after the read: a query that cannot return somebody else's row cannot
+ * leak one by accident.
+ */
+export const BOOKING_NOT_FOUND = 'Booking not found.';
+
+/**
+ * 422. Whole-request cancellation attempted on a request that is not `PENDING` (`Q-C4`).
+ *
+ * ⚠️ 422, NOT 409 — and the difference from {@link VENUE_CLOSED} is real. A closed venue is a fact
+ * about the WORLD that may change while the client is looking at it, which is what 409 means here.
+ * This is a fact about the REQUEST the caller just named: they addressed a resource whose state
+ * cannot accept this verb. `REJECTED` and `CANCELLED` are terminal, and an `APPROVED` request is
+ * cancelled per SLOT instead (`Q-C4` ②) — so this refusal is also a redirection, and the client
+ * words it as one.
+ */
+export const BOOKING_NOT_PENDING =
+  'Only a pending request can be cancelled as a whole.';
+
+/**
+ * 422. Per-slot cancellation attempted on a request that is not `APPROVED`.
+ *
+ * ⚠️ THE MIRROR OF {@link BOOKING_NOT_PENDING}, and the pair is the whole of `Q-C4`'s table: a
+ * PENDING request is cancelled whole (there is nothing to keep), an APPROVED one is cancelled per
+ * slot (the other days survive), and the two terminal states accept neither.
+ */
+export const BOOKING_NOT_APPROVED =
+  'Only an approved booking can be cancelled one slot at a time.';
+
+/** 404. No such slot on this booking. Same non-oracle reasoning as {@link BOOKING_NOT_FOUND}. */
+export const SLOT_NOT_FOUND = 'Booking slot not found.';
+
+/** 422. The slot is already cancelled — a no-op write, refused rather than faked as a success. */
+export const SLOT_ALREADY_CANCELLED = 'This slot is already cancelled.';
+
+/**
+ * 422. The slot starts inside the lead-time window, or has already begun.
+ *
+ * 🔴 THIS IS THE AUTHORISATION BOUNDARY, NOT THE DISABLED BUTTON (`Q-C4` ①). The client hides the
+ * control using the lead time it is told; that is UX. A late `PATCH` arrives here with no button
+ * involved.
+ *
+ * ⚠️ ENGLISH, LIKE EVERY OTHER MESSAGE IN THIS FILE — the Thai sentence the screen prints
+ * (`ต้องยกเลิกล่วงหน้าอย่างน้อย N นาทีก่อนเวลาเริ่มใช้งาน`) is the CLIENT's, per the file header.
+ * It HAS to be, because **N is a setting**: a Thai string frozen at 30 here would still say 30
+ * after an operator changed the row, and the one number the sentence exists to communicate would be
+ * the only part of it that was wrong. The client words it from `cancelLeadMinutes`, which the
+ * booking detail response carries for exactly this purpose.
+ */
+export const SLOT_CANCEL_TOO_LATE =
+  'This slot starts too soon to be cancelled.';
+
+/**
+ * ── THE CANCELLATION LEAD TIME (`Q-C4` ①) ──
+ * The `app_settings` key, seeded to `'30'` by `20260902085811_add_booking_domain_and_settings`.
+ *
+ * ⚠️ A SETTING, NOT A CONSTANT — that is the entire ruling, and the reason the value below is named
+ * a DEFAULT. `CLIENT-SETTINGS-1` (the admin screen that edits the row) is undesigned; reading the
+ * table with a documented default from day one is what stops that screen's arrival being a rework.
+ */
+export const CANCEL_LEAD_MINUTES_KEY = 'booking.cancel_lead_minutes';
+
+/**
+ * Used when the row is missing or unparseable. Thirty minutes, matching the seed.
+ *
+ * ⚠️ FALLING BACK RATHER THAN THROWING IS DELIBERATE. A missing settings row must not take the
+ * cancel button away from every user at once; it is a configuration gap, and the safe reading of a
+ * gap here is the documented default, not a 500 on a screen the user is trying to fix something on.
+ */
+export const CANCEL_LEAD_MINUTES_DEFAULT = 30;
+
+/**
+ * `BookingSlot.cancelledByRole` for a cancellation made through the LIFF app.
+ *
+ * ⚠️ IT IS NOT A FOREIGN KEY AND RESOLVES NOTHING ON ITS OWN. `cancelledById` may point into
+ * `line_users` OR `system_users` — two tables this schema deliberately gives no bridge — and this
+ * column is the only thing that says which. The schema's writer's contract is that the pair is
+ * written together, always.
+ */
+export const CANCELLED_BY_LINE_USER = 'LINE_USER';
+
+/** `q` on the My Bookings list. The same ceiling every other search box in this service uses. */
+export const BOOKING_SEARCH_MAX = 100;
+
+/**
  * 400. `from` later than `to` on the availability query.
  *
  * The range is otherwise permissive — see {@link AVAILABILITY_MAX_DAYS} for the only other bound.
