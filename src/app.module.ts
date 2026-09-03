@@ -4,6 +4,7 @@ import { ThrottlerModule } from '@nestjs/throttler';
 import type { Redis } from 'ioredis';
 import { AppController } from './app.controller';
 import { AuthModule } from './auth/auth.module';
+import { BookingsModule } from './bookings/bookings.module';
 import {
   LOGIN_IP_EMAIL_LIMIT,
   LOGIN_IP_LIMIT,
@@ -92,8 +93,16 @@ const throttlerModule: DynamicModule = {
     // irrelevant to the injector) but because that is the dependency direction on paper: a venue
     // points at a category and ticks amenities, never the reverse.
     VenuesModule,
+    // The second domain module, and the one the product is actually for (`CLIENT-BOOKING-1`). It
+    // comes after `VenuesModule` for the same paper reason: a booking points at a venue, never the
+    // reverse. Nest's injector does not care about the order, but two things here do — the guard
+    // grouping documented on `LineBookingsController`, and the fact that its `line-users/*` routes
+    // register after both `LineModule` controllers. That is proven safe in a table on that file; it
+    // is not luck, and it is the thing to re-read before adding a route to either.
+    BookingsModule,
     SystemModule,
-    // BookingModule and the rest of the booking core are still their own future tasks.
+    // Still future tasks: the admin approval + direct-booking surface (`SessionGuard`), the
+    // `/client` realtime namespace, and LINE chat notifications.
   ],
   controllers: [AppController],
 })

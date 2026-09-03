@@ -22,11 +22,24 @@ import { isCookieSecure, resolveSameSite } from '../config/env.validation';
  * double-submit CSRF that protects the cookie-session admin surface is irrelevant to them (same
  * reasoning as the webhook). The two option GETs and `GET /line-users/status` are GETs and already
  * CSRF-safe via `ignoredMethods`. The admin option CRUD is cookie-session and is NOT exempt.
+ *
+ * `POST /line-users/bookings` (`CLIENT-BOOKING-1`) joins the list on exactly the same grounds: same
+ * `LineIdTokenGuard`, same bearer token, same absence of a cookie.
+ *
+ * 🔴 THE TEST FOR THIS LIST IS "IS THERE AMBIENT AUTHORITY?", NEVER "IS IT INCONVENIENT?". A path
+ * belongs here only when the request carries no cookie a foreign origin could ride — a bearer token
+ * has to be read and attached by script, which the same-origin policy already prevents. Adding a
+ * cookie-session route here would silently remove its CSRF protection with no test failing.
+ *
+ * ⚠️ MATCHED BY EXACT `req.path`, so every entry is a literal with no parameters. A route with a
+ * path parameter cannot be exempted this way, which is a useful accident: the two GET availability
+ * and venue reads need no entry because GETs are already ignored by method.
  */
 export const CSRF_EXEMPT_PATHS: readonly string[] = [
   `${API_BASE_PATH}/line/webhook`,
   `${API_BASE_PATH}/line-users/register`,
   `${API_BASE_PATH}/line-users/registration`,
+  `${API_BASE_PATH}/line-users/bookings`,
 ];
 
 export const CSRF_COOKIE_NAME = 'eb.csrf';
