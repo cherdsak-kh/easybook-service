@@ -142,6 +142,115 @@ export const CANCEL_LEAD_MINUTES_KEY = 'booking.cancel_lead_minutes';
  */
 export const CANCEL_LEAD_MINUTES_DEFAULT = 30;
 
+// ── THE ADMIN SURFACE (`booking-requests`) ───────────────────────────────────────────────────────
+
+/**
+ * 409. `approve`/`reject` on a request that is not `PENDING`.
+ *
+ * ⚠️ 409 HERE, WHERE THE LIFF PAIR ABOVE USES 422, AND THE SPLIT IS DELIBERATE. `BOOKING_NOT_PENDING`
+ * answers an end-user who addressed their own request with the wrong verb — a fact about the
+ * resource they named. This answers a staff member whose queue was accurate when it rendered and is
+ * not any more, because somebody else ruled first: a fact about the WORLD that changed under them,
+ * which is what 409 means on this surface. The screen re-fetches and shows the new state.
+ */
+export const BOOKING_NOT_PENDING_FOR_DECISION =
+  'Only a pending request can be approved or rejected.';
+
+/**
+ * 409. `cancel` on a request that is not `APPROVED`.
+ *
+ * ⚠️ IT IS ALSO A REDIRECTION: a `PENDING` request is refused with `reject`, which is the path that
+ * demands a reason and notifies the requester. Accepting `PENDING` here would open a second road to
+ * `CANCELLED` that no button on the screen drives.
+ */
+export const BOOKING_NOT_APPROVED_FOR_CANCEL =
+  'Only an approved booking can be cancelled.';
+
+/** 409. Every slot is already cancelled — there is nothing left to approve or to cancel. */
+export const BOOKING_ALREADY_CANCELLED =
+  'Every slot of this booking is already cancelled.';
+
+/**
+ * 400. A `slotIds` entry that belongs to a different booking.
+ *
+ * 🔴 REFUSED, NEVER SKIPPED (AC-BR9). Silently ignoring an unknown id would let a client that sent
+ * three ids and meant three cancellations get one, report success, and leave two days standing that
+ * the operator believes are gone.
+ */
+export const SLOT_NOT_ON_THIS_BOOKING =
+  'A requested slot does not belong to this booking.';
+
+/**
+ * 400. A `departmentId` that does not exist or has been soft-deleted (AC-BR13).
+ *
+ * ⚠️ A CONSTANT OF THE SAME NAME EXISTS IN `line-users.errors.ts` AND `system-users.errors.ts` with
+ * different wording. Each module owning its own copy is the house pattern here, not duplication:
+ * importing one module's user-facing string into another couples two screens' copy together.
+ */
+export const INVALID_DEPARTMENT = 'The selected department is not available.';
+
+/**
+ * 400. A `lineUserId` on a direct booking that is unknown, soft-deleted, or not `ALLOWED`.
+ *
+ * ⚠️ ONE MESSAGE FOR THREE STATES, and never a 404: the id is an INPUT to this write, not the
+ * resource being addressed, so distinguishing "no such user" from "blocked user" would answer a
+ * question the caller did not ask and hand them an enumeration oracle over `line_users`.
+ */
+export const INVALID_LINE_USER = 'The selected LINE user is not available.';
+
+/**
+ * 409. SQLSTATE `40P01` / `40001` — two decisions on one venue collided.
+ *
+ * ⚠️ IT MEANS "TRY AGAIN", which is why it is not a 500: nothing was written, the caller's intent is
+ * still valid, and the advisory lock makes a second attempt very likely to succeed.
+ */
+export const BOOKING_DECISION_RACE =
+  'Another decision on an overlapping booking was in progress. Please try again.';
+
+/** Maximum length of a reject / cancel reason. */
+export const BOOKING_REASON_MAX = 500;
+
+/** `requesterName` on a direct booking — the `D-C18` override, long enough for a Thai full name. */
+export const BOOKING_REQUESTER_NAME_MAX = 120;
+
+/** `contactPhone` on a direct booking. Wide enough for separators and an extension. */
+export const BOOKING_CONTACT_PHONE_MAX = 30;
+
+/**
+ * The `rejectReason` written onto every loser of an ADR-001 auto-rejection.
+ *
+ * 🔴 THAI, WHERE EVERY OTHER STRING IN THIS FILE IS ENGLISH — and that is not an inconsistency. The
+ * file header governs ERROR MESSAGES, which a client pairs with a status code before writing its own
+ * Thai sentence (`I18N-ERR-1`). This is not an error: it is CONTENT stored in the `rejectReason`
+ * column — the same column a staff member types their own reason into — and it is rendered RAW to
+ * the requester on My Bookings and in their LINE chat. English here would be an English sentence on
+ * a Thai end-user's screen.
+ *
+ * 🔴 IT NAMES NOBODY (`D-C13`, AC-BR15): no person, no department, no purpose, no winning request's
+ * code. Its reader is a DIFFERENT end-user from the winner, and they are not entitled to know who
+ * took the room or what for.
+ */
+export const AUTO_REJECTED_REASON =
+  'ช่วงเวลาที่ขอถูกจัดสรรให้การจองอื่นแล้ว จึงไม่สามารถอนุมัติคำขอนี้ได้';
+
+/**
+ * The `pg_advisory_xact_lock` namespace for booking decisions, keyed by `hashtext(venueId)`.
+ *
+ * 🔴 WITHOUT IT, TWO SIMULTANEOUS APPROVALS OF OVERLAPPING REQUESTS DEADLOCK rather than one losing
+ * politely: each transaction flips its own request (taking a row lock and an index entry) and then
+ * tries to reject the other's, which the other already holds. No ordering of the two writes escapes
+ * it, because both transactions write the same two rows in opposite directions.
+ *
+ * ⚠️ IT DOES NOT REPLACE THE CONSTRAINT AND MUST NEVER BE READ AS DOING SO. The lock makes the
+ * refusal POLITE; `booking_slots_no_overlap` makes it CERTAIN. A future route that forgets the lock
+ * still cannot double-book — it just gets a raw `23P01` instead of a considered `409`.
+ *
+ * A fixed namespace so a later feature's advisory lock cannot collide with this one. `hashtext`
+ * returns `int4`, so two venue ids can hash together and serialise unnecessarily: that costs
+ * throughput on a product with dozens of rooms, and costs no correctness.
+ */
+export const BOOKING_VENUE_LOCK_NS = 4210;
+
 /**
  * `BookingSlot.cancelledByRole` for a cancellation made through the LIFF app.
  *

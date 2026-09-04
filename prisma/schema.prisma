@@ -869,14 +869,43 @@ model BookingSlot {
   /// 🔴 THE ACTOR MAY BE EITHER DOMAIN, and this schema has no bridge between them: a LineUser and
   /// a SystemUser share no table, no session and no authentication surface. Two nullable FKs plus an
   /// "exactly one is set" rule would be a third invariant to police for an AUDIT field that no query
-  /// joins on. `cancelledByRole` says which table `cancelledById` points into — "LINE_USER" |
-  /// "STAFF" | "ADMIN" — and the service writes both.
+  /// joins on. `cancelledByRole` says which table `cancelledById` points into, and the service writes
+  /// both.
+  ///
+  /// ⚠️ THE LIVE VALUE SET IS "LINE_USER" | "SUPER_ADMIN" | "ADMIN" (G3, 2026-09-04). It used to read
+  /// "STAFF" here, which no longer exists: `SystemRole`'s third slot is `VIEWER`, and a VIEWER cannot
+  /// cancel anything — every staff write route is `@Roles(SUPER_ADMIN, ADMIN)`. The staff paths write
+  /// the actor's REAL `SystemRole`, so "STAFF" can never be produced by any code path in this repo.
   /// ⚠️ It is therefore NOT a foreign key and resolves nothing on its own. Do not `include` it.
   cancelledById   String?
   cancelledByRole String?
 
   /// Optional free text. PDPA: may name a person or a reason; never logged.
   cancelReason String?
+
+  /// 🔴 NOT DATA — AN INDEX KEY, AND THE DATABASE IS ITS ONLY WRITER.
+  ///
+  /// It mirrors exactly one derived fact: `(NOT isCancelled) AND bookingRequest.status = APPROVED`
+  /// — "this row is currently occupying the calendar". It exists because the double-booking rule is
+  /// enforced by a partial GiST exclusion constraint (`booking_slots_no_overlap`), a partial index
+  /// predicate may only read columns OF THE SAME ROW, and the parent's status is in another table.
+  /// A generated column cannot reach it either (same-row restriction), which is why this is a
+  /// trigger-maintained column and not `GENERATED ALWAYS AS`.
+  ///
+  /// 🔴 THIS IS NOT THE `status` COLUMN `Q-C4` sub-ruling 2 FORBIDS, and the difference is that this
+  /// one is not FREE TO DISAGREE:
+  ///   1. `booking_slots_holds_slot_biu` is a BEFORE INSERT OR UPDATE trigger that OVERWRITES `NEW`
+  ///      unconditionally — a value written by Prisma, psql or Studio is recomputed and discarded.
+  ///   2. `booking_requests_holds_slot_au` refreshes every child the moment the parent's status
+  ///      changes, in that same transaction.
+  ///   3. NOTHING IN `src/` READS IT. The application's overlap predicate still asks
+  ///      `bookingRequest.status = APPROVED AND isCancelled = false` (`booking-overlap.ts`), which is
+  ///      the single owner AC-BR19 requires. A request's status remains DERIVED from its slots.
+  ///
+  /// ⚠️ NEVER add it to a DTO, a `select`, or a `where`. It is not a fact about the domain; it is the
+  /// materialised predicate an index cannot compute for itself. If you find yourself reading it, the
+  /// thing you actually want is `booking-overlap.ts`.
+  holdsSlot Boolean @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

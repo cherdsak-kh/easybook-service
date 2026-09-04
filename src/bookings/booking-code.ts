@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 import {
   BANGKOK_UTC_OFFSET_MINUTES,
   BOOKING_CODE_PREFIX,
@@ -65,4 +66,42 @@ export function formatBookingCode(at: Date, sameDayCount: number): string {
     '0',
   );
   return `${BOOKING_CODE_PREFIX}-${bookingCodeDatePart(at)}-${seq}`;
+}
+
+/**
+ * The next `code` for a request being written at `now`, counted INSIDE the caller's transaction.
+ *
+ * ⚠️ COUNTED, NOT RESERVED — see `BOOKING_CODE_MAX_ATTEMPTS`. Two requests written in the same
+ * instant compute the same number, the loser takes a `P2002`, and the fix is to run the whole
+ * transaction again so the count sees the row that beat it. The counter is over EVERY request created
+ * that Bangkok day, admin direct bookings included, which only ever skips a number.
+ *
+ * 🔴 THE `where` SHAPE IS FROZEN: `{ createdAt: { gte, lt } }` over `bangkokDayRange(now)`. Both the
+ * LIFF path and the admin direct path mint codes from this one function so a single day's sequence
+ * cannot fork into two counters that each think they are authoritative.
+ */
+export async function nextBookingCode(
+  tx: Prisma.TransactionClient,
+  now: Date,
+): Promise<string> {
+  const { start, end } = bangkokDayRange(now);
+  const sameDayCount = await tx.bookingRequest.count({
+    where: { createdAt: { gte: start, lt: end } },
+  });
+  return formatBookingCode(now, sameDayCount);
+}
+
+/**
+ * A `P2002` naming the `code` column — the only unique constraint a booking create can trip.
+ *
+ * ⚠️ IT MUST NOT WIDEN. An exclusion violation (`23P01`) is a DIFFERENT failure with a different
+ * answer: retrying it just loses the same race again, and the caller owes the client a `409`. That
+ * separation is why this checks the error code AND the target column rather than "something was
+ * unique-ish".
+ */
+export function isCodeCollision(err: unknown): boolean {
+  if (!(err instanceof Prisma.PrismaClientKnownRequestError)) return false;
+  if (err.code !== 'P2002') return false;
+  const target = err.meta?.target;
+  return Array.isArray(target) ? target.includes('code') : target === 'code';
 }

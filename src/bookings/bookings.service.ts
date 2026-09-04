@@ -11,7 +11,12 @@ import {
 import { AppAccess, BookingStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { TOMBSTONE_VENUE_TYPE_NAME } from '../venue-types/venue-types.constants';
-import { bangkokDayRange, formatBookingCode } from './booking-code';
+import { isCodeCollision, nextBookingCode } from './booking-code';
+import {
+  assertNoApprovedClash,
+  parseSlots,
+  type SlotSpan,
+} from './booking-overlap';
 import {
   AVAILABILITY_MAX_DAYS,
   AVAILABILITY_RANGE_INVALID,
@@ -27,11 +32,7 @@ import {
   CANCELLED_BY_LINE_USER,
   SLOT_ALREADY_CANCELLED,
   SLOT_CANCEL_TOO_LATE,
-  SLOT_IN_THE_PAST,
   SLOT_NOT_FOUND,
-  SLOT_RANGE_INVALID,
-  SLOT_SELF_OVERLAP,
-  SLOT_TAKEN,
   VENUE_CLOSED,
   VENUE_NOT_FOUND,
 } from './bookings.constants';
@@ -48,9 +49,6 @@ import type {
   ListLineBookingsQueryDto,
 } from './dto/list-line-bookings-query.dto';
 import type { VenueAvailabilityQueryDto } from './dto/venue-availability-query.dto';
-
-/** A slot after parsing, with real `Date`s instead of the DTO's strings. */
-type ParsedSlot = { start: Date; end: Date };
 
 /**
  * ⚠️ ONLY THESE TWO STATUSES OCCUPY A CALENDAR. `REJECTED` and `CANCELLED` requests hold nothing and
@@ -184,15 +182,20 @@ const SORT_ORDER: Record<
  * `SERVICE_CHANGES.md` §2.3.1 describes two lifecycles over one table. This file implements the
  * FIRST one only: a LINE user submits a `PENDING` request, and anybody may read a venue's occupied
  * spans. The second — the admin direct booking, approval, and the auto-rejection of every
- * overlapping `PENDING` request inside the approval transaction — is a `SessionGuard` surface that
- * does not exist yet and is a separate task. Nothing here approves anything.
+ * overlapping `PENDING` request inside the approval transaction — is `AdminBookingsService`, behind
+ * `SessionGuard`. Nothing here approves anything.
  *
- * 🔴 THE CONSEQUENCE, STATED PLAINLY: `assertNoApprovedClash` below is a COURTESY, not the
+ * 🔴 THE CONSEQUENCE, STATED PLAINLY: `assertNoApprovedClash` is a COURTESY on this path, not the
  * correctness boundary ADR-001 talks about. It has to be, because of `D-C13` rule 4 — a `PENDING`
  * request holds nothing, several people may hold overlapping pending requests at once, and that is
  * the designed behaviour rather than a race to be closed. The real double-booking boundary is the
- * approval transaction, and it needs a database-level exclusion constraint that this migration does
- * not yet carry. Do not read the check below as that constraint arriving early.
+ * partial GiST exclusion constraint `booking_slots_no_overlap`, added by
+ * `20260904061248_add_booking_overlap_constraint`, which only admits slots whose parent is
+ * `APPROVED`. Do not read the courtesy check as that constraint.
+ *
+ * ⚠️ THE OVERLAP PREDICATE AND `parseSlots` NOW LIVE IN `booking-overlap.ts` (AC-BR19). They were
+ * module-private here; the admin surface needs the same rule, and a second copy would be a second
+ * chance to type `<` as `<=`. The move was behaviour-preserving — this file's spec was not touched.
  */
 @Injectable()
 export class BookingsService {
@@ -527,7 +530,7 @@ export class BookingsService {
     venueId: string,
     lineUserId: string,
     dto: CreateLineBookingDto,
-    slots: ParsedSlot[],
+    slots: SlotSpan[],
   ): Promise<CreatedRow> {
     for (let attempt = 1; attempt <= BOOKING_CODE_MAX_ATTEMPTS; attempt++) {
       try {
@@ -550,20 +553,17 @@ export class BookingsService {
     venueId: string,
     lineUserId: string,
     dto: CreateLineBookingDto,
-    slots: ParsedSlot[],
+    slots: SlotSpan[],
   ): Promise<CreatedRow> {
     return this.prisma.$transaction(async (tx) => {
       await assertNoApprovedClash(tx, venueId, slots);
 
       const now = new Date();
-      const { start, end } = bangkokDayRange(now);
-      const sameDayCount = await tx.bookingRequest.count({
-        where: { createdAt: { gte: start, lt: end } },
-      });
+      const code = await nextBookingCode(tx, now);
 
       return tx.bookingRequest.create({
         data: {
-          code: formatBookingCode(now, sameDayCount),
+          code,
           venueId,
           // 🔴 The LIFF origin writes `lineUserId` and NOTHING ELSE about the requester (`D-C18`).
           // `createdById`, `requesterName`, `contactPhone` and `departmentId` are the ADMIN origin's
@@ -600,75 +600,6 @@ export class BookingsService {
 type CreatedRow = Prisma.BookingRequestGetPayload<{
   include: { slots: true };
 }>;
-
-/**
- * Refuses a request that collides with an APPROVED, non-cancelled slot at the same venue.
- *
- * 🔴 APPROVED ONLY. A `PENDING` clash is NOT an error (`D-C13` rule 4) — several people may request
- * the same hours and all of them get `PENDING`; the approver picks one and the losers are
- * auto-rejected. Refusing here on a pending clash would silently turn the product into
- * first-to-submit-wins and delete the decision approval exists to make.
- *
- * ⚠️ Half-open intervals: `a.start < b.end && a.end > b.start`. A slot ending 12:00 and one starting
- * 12:00 do not overlap, and writing this with `<=` produces phantom conflicts nobody can reproduce.
- *
- * ⚠️ The refusal names nothing — not who holds the slot, not what for (`D-C13`).
- */
-async function assertNoApprovedClash(
-  tx: Prisma.TransactionClient,
-  venueId: string,
-  slots: ParsedSlot[],
-): Promise<void> {
-  const clash = await tx.bookingSlot.findFirst({
-    where: {
-      venueId,
-      isCancelled: false,
-      bookingRequest: { status: BookingStatus.APPROVED },
-      OR: slots.map((s) => ({
-        startAt: { lt: s.end },
-        endAt: { gt: s.start },
-      })),
-    },
-    select: { id: true },
-  });
-  if (clash) throw new ConflictException(SLOT_TAKEN);
-}
-
-/**
- * Strings → `Date`s, with the three semantic checks `class-validator` cannot express: a span must
- * end after it starts, must not start in the past, and must not overlap another span of the SAME
- * request.
- */
-function parseSlots(
-  input: readonly { startAt: string; endAt: string }[],
-): ParsedSlot[] {
-  const now = Date.now();
-  const slots = input.map(({ startAt, endAt }) => {
-    const start = new Date(startAt);
-    const end = new Date(endAt);
-    if (end.getTime() <= start.getTime()) {
-      throw new BadRequestException(SLOT_RANGE_INVALID);
-    }
-    // 🔴 `D-C16` — compared against NOW, never against midnight today. It is still legitimate at
-    // 09:00 to book this afternoon, and a same-day comparison would refuse it.
-    if (start.getTime() <= now) {
-      throw new BadRequestException(SLOT_IN_THE_PAST);
-    }
-    return { start, end };
-  });
-
-  // n² over at most `BOOKING_SLOTS_MAX` entries — 60 is 1,770 comparisons, and sorting first to get
-  // an O(n log n) sweep would mean reordering the caller's slots or carrying indices to report on.
-  const sorted = [...slots].sort(
-    (a, b) => a.start.getTime() - b.start.getTime(),
-  );
-  for (let i = 1; i < sorted.length; i++) {
-    if (sorted[i].start.getTime() < sorted[i - 1].end.getTime()) {
-      throw new BadRequestException(SLOT_SELF_OVERLAP);
-    }
-  }
-  return slots;
-}
 
 /**
  * The availability window: what the caller asked for, or the current Bangkok calendar month.
@@ -917,12 +848,4 @@ function requesterNameOf(
   const reg = req.lineUser?.registration;
   if (reg) return `${reg.firstName} ${reg.lastName}`.trim() || null;
   return req.requesterName ?? null;
-}
-
-/** A `P2002` naming the `code` column — the only unique constraint a create here can trip. */
-function isCodeCollision(err: unknown): boolean {
-  if (!(err instanceof Prisma.PrismaClientKnownRequestError)) return false;
-  if (err.code !== 'P2002') return false;
-  const target = err.meta?.target;
-  return Array.isArray(target) ? target.includes('code') : target === 'code';
 }
