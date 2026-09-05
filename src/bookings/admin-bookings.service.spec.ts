@@ -6,6 +6,7 @@ import {
 import { Test, TestingModule } from '@nestjs/testing';
 import { AppAccess, BookingStatus, SystemRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { AdminBookingsService } from './admin-bookings.service';
 import {
   AUTO_REJECTED_REASON,
@@ -37,7 +38,17 @@ const LOSER_ID = 'clx_loser_cuid';
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
 
-const ACTOR = { id: 'clx_staff_cuid', role: SystemRole.ADMIN };
+/**
+ * ⚠️ IT CARRIES A `name` SINCE `ADMIN-REALTIME-BOOKINGS-1`. The realtime event answers "who just did
+ * that?", so the actor had to widen from `{ id, role }`; `role` is still the only half any WRITE
+ * reads. The Thai display name is deliberate — the emit assertions check it reaches the socket and
+ * the PII assertions check it never reaches a log line.
+ */
+const ACTOR = {
+  id: 'clx_staff_cuid',
+  name: 'วีระ ทองดี',
+  role: SystemRole.ADMIN,
+};
 
 const iso = (msFromNow: number) =>
   new Date(Date.now() + msFromNow).toISOString();
@@ -85,6 +96,15 @@ describe('AdminBookingsService', () => {
   const lineUser = { findFirst: jest.fn() };
   const department = { findFirst: jest.fn() };
   const $executeRaw = jest.fn();
+
+  /**
+   * The gateway is MOCKED, never the socket. `RealtimeGateway`'s own fail-soft behaviour is its
+   * spec's job; what this file measures is WHICH rows this service announces, and when.
+   */
+  const realtime = {
+    emitBookingRequestCreated: jest.fn(),
+    emitBookingRequestUpdated: jest.fn(),
+  };
 
   const tx = {
     bookingRequest,
@@ -142,6 +162,10 @@ describe('AdminBookingsService', () => {
   beforeEach(async () => {
     jest.clearAllMocks();
     $executeRaw.mockResolvedValue(1);
+    // The realtime re-read (`readBookingListDtos`) lands on this delegate AFTER every write path
+    // commits. Defaulting it to "no rows" keeps the tests that are not about the fan-out silent —
+    // a test that IS about it queues its own rows with `mockResolvedValueOnce`.
+    bookingRequest.findMany.mockResolvedValue([]);
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AdminBookingsService,
@@ -157,6 +181,7 @@ describe('AdminBookingsService', () => {
             $executeRaw,
           },
         },
+        { provide: RealtimeGateway, useValue: realtime },
       ],
     }).compile();
     service = module.get(AdminBookingsService);
@@ -427,7 +452,9 @@ describe('AdminBookingsService', () => {
      */
     it('reads the losers BEFORE the flip and rejects them AFTER it', async () => {
       pendingBooking();
-      bookingRequest.findMany.mockResolvedValue([
+      // `…Once`: the SECOND `findMany` on this delegate is the post-commit realtime re-read, which
+      // wants queue rows rather than loser rows and is covered by its own tests below.
+      bookingRequest.findMany.mockResolvedValueOnce([
         {
           id: LOSER_ID,
           code: 'BR-25690903-002',
@@ -797,7 +824,7 @@ describe('AdminBookingsService', () => {
       await service.cancel(
         BOOKING_ID,
         { reason: 'x' },
-        { id: 'su', role: SystemRole.SUPER_ADMIN },
+        { id: 'su', name: 'ผู้ดูแลระบบ', role: SystemRole.SUPER_ADMIN },
       );
       const args = callArg<{
         data: { cancelledByRole: string };
@@ -880,7 +907,9 @@ describe('AdminBookingsService', () => {
 
     it('auto-rejects overlapping PENDING requests here too (AC-BR16)', async () => {
       happyPath();
-      bookingRequest.findMany.mockResolvedValue([
+      // `…Once` for the same reason as on the approve path: the next `findMany` is the realtime
+      // re-read, not a second loser query.
+      bookingRequest.findMany.mockResolvedValueOnce([
         {
           id: LOSER_ID,
           code: 'BR-25690903-009',
@@ -1268,6 +1297,261 @@ describe('AdminBookingsService', () => {
       });
       // `conflictsOf` keeps its own early-outs; the shared core is never reached.
       expect(bookingSlot.count).not.toHaveBeenCalled();
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────────
+  // ADMIN-REALTIME-BOOKINGS-1 — the `/admin` fan-out (design constraint `Q4`)
+  // ────────────────────────────────────────────────────────────────────────────────
+  describe('realtime fan-out', () => {
+    const LOSER_2_ID = 'clx_loser2_cuid';
+
+    /** Exactly `AdminBookingRequestListItemDto`'s keys — the payload contract, in one list. */
+    const LIST_ITEM_KEYS = [
+      'attendees',
+      'code',
+      'createdAt',
+      'firstStartAt',
+      'id',
+      'isExpired',
+      'lastEndAt',
+      'origin',
+      'purpose',
+      'rejectReason',
+      'requester',
+      'slots',
+      'status',
+      'venue',
+    ].sort();
+
+    /** `[booking, actor]` of the Nth emit, typed — a bare `jest.fn()` call tuple is `any`. */
+    const emitted = (fn: jest.Mock, call = 0) =>
+      (
+        fn.mock.calls as unknown as [
+          Record<string, unknown> & { id: string },
+          Record<string, unknown> | null,
+        ][]
+      )[call];
+
+    const loser = (id: string, code: string) => ({
+      id,
+      code,
+      firstStartAt: at(DAY),
+      lastEndAt: at(DAY + HOUR),
+    });
+
+    /** An approval that bumps TWO overlapping pending requests. */
+    const approveBumpingTwo = () => {
+      bookingRequest.findUnique
+        .mockResolvedValueOnce({
+          id: BOOKING_ID,
+          venueId: VENUE_ID,
+          status: BookingStatus.PENDING,
+        })
+        .mockResolvedValueOnce({ status: BookingStatus.PENDING });
+      bookingSlot.findMany.mockResolvedValue([
+        { startAt: at(DAY), endAt: at(DAY + HOUR) },
+      ]);
+      bookingSlot.findFirst.mockResolvedValue(null);
+      bookingRequest.findMany
+        // 1. the loser read, inside the transaction
+        .mockResolvedValueOnce([
+          loser(LOSER_ID, 'BR-25690903-002'),
+          loser(LOSER_2_ID, 'BR-25690903-003'),
+        ])
+        // 2. the post-commit re-read. Returned SHUFFLED on purpose: the emit order is the caller's
+        //    (subject first, then the losers it displaced), never whatever Postgres hands back.
+        .mockResolvedValueOnce([
+          detailRow({ id: LOSER_2_ID, status: BookingStatus.REJECTED }),
+          detailRow({ id: BOOKING_ID }),
+          detailRow({ id: LOSER_ID, status: BookingStatus.REJECTED }),
+        ]);
+      bookingRequest.updateMany.mockResolvedValue({ count: 1 });
+      bookingRequest.findUnique.mockResolvedValue(detailRow());
+    };
+
+    /**
+     * 🔴 THE DEFECT THIS TICKET EXISTS TO FIX. An approval changes the subject AND every request
+     * ADR-001 auto-rejects — rows that belong to other people and are open on other people's
+     * screens. Emitting only the subject leaves them stale.
+     */
+    it('emits ONE `updated` per changed row — the subject AND every auto-rejected loser', async () => {
+      approveBumpingTwo();
+
+      const result = await service.approve(BOOKING_ID, ACTOR);
+
+      expect(result.autoRejected).toHaveLength(2);
+      expect(realtime.emitBookingRequestUpdated).toHaveBeenCalledTimes(3);
+      expect(realtime.emitBookingRequestCreated).not.toHaveBeenCalled();
+      expect(
+        [0, 1, 2].map(
+          (n) => emitted(realtime.emitBookingRequestUpdated, n)[0].id,
+        ),
+      ).toEqual([BOOKING_ID, LOSER_ID, LOSER_2_ID]);
+    });
+
+    it('emits AFTER the transaction commits, never inside it', async () => {
+      approveBumpingTwo();
+
+      await service.approve(BOOKING_ID, ACTOR);
+
+      // The loser rejection is the last write of the transaction; every emit follows it, and follows
+      // the post-commit re-read that feeds it.
+      const lastWrite = bookingRequest.updateMany.mock.invocationCallOrder[1];
+      const reread = bookingRequest.findMany.mock.invocationCallOrder[1];
+      for (const order of realtime.emitBookingRequestUpdated.mock
+        .invocationCallOrder) {
+        expect(order).toBeGreaterThan(lastWrite);
+        expect(order).toBeGreaterThan(reread);
+      }
+    });
+
+    /** ONE query for the whole batch — an approval that bumps five losers is still one re-read. */
+    it('re-reads every announced row in ONE query, in the queue-row shape', async () => {
+      approveBumpingTwo();
+
+      await service.approve(BOOKING_ID, ACTOR);
+
+      const read = callArg<{ where: { id: { in: string[] } } }>(
+        bookingRequest.findMany,
+        1,
+      );
+      expect(read.where.id.in).toEqual([BOOKING_ID, LOSER_ID, LOSER_2_ID]);
+      // 🔴 The payload is the LIST item, not the richer detail DTO the response carries: the
+      // generated client is typed from this shape, and an extra field would be contract drift.
+      const [booking] = emitted(realtime.emitBookingRequestUpdated);
+      expect(Object.keys(booking).sort()).toEqual(LIST_ITEM_KEYS);
+    });
+
+    /** The actor answers "who just did that?" — and carries nothing more, `role` included. */
+    it('puts id + name on the wire and NOT the operator’s role', async () => {
+      approveBumpingTwo();
+
+      await service.approve(BOOKING_ID, ACTOR);
+
+      for (const call of [0, 1, 2]) {
+        const [, actor] = emitted(realtime.emitBookingRequestUpdated, call);
+        expect(actor).toEqual({ id: ACTOR.id, name: ACTOR.name });
+        expect(actor).not.toHaveProperty('role');
+      }
+    });
+
+    it('announces NOTHING when the decision was refused', async () => {
+      bookingRequest.findUnique
+        .mockResolvedValueOnce({
+          id: BOOKING_ID,
+          venueId: VENUE_ID,
+          status: BookingStatus.APPROVED,
+        })
+        .mockResolvedValueOnce({ status: BookingStatus.APPROVED });
+
+      await expect(service.approve(BOOKING_ID, ACTOR)).rejects.toThrow(
+        new ConflictException(BOOKING_NOT_PENDING_FOR_DECISION),
+      );
+      expect(realtime.emitBookingRequestUpdated).not.toHaveBeenCalled();
+      expect(realtime.emitBookingRequestCreated).not.toHaveBeenCalled();
+    });
+
+    /** Fail-soft: the write is already durable, so a dead transport must not surface as a 500. */
+    it('never fails the request when the transport throws', async () => {
+      approveBumpingTwo();
+      realtime.emitBookingRequestUpdated.mockImplementationOnce(() => {
+        throw new Error('transport down');
+      });
+
+      await expect(service.approve(BOOKING_ID, ACTOR)).resolves.toBeDefined();
+    });
+
+    it('reject emits one `updated` for the request it refused', async () => {
+      bookingRequest.findUnique
+        .mockResolvedValueOnce({
+          id: BOOKING_ID,
+          status: BookingStatus.PENDING,
+        })
+        .mockResolvedValue(detailRow({ status: BookingStatus.REJECTED }));
+      bookingRequest.updateMany.mockResolvedValue({ count: 1 });
+      bookingRequest.findMany.mockResolvedValueOnce([
+        detailRow({ status: BookingStatus.REJECTED }),
+      ]);
+
+      await service.reject(BOOKING_ID, { reason: 'ห้องไม่ว่าง' }, ACTOR);
+
+      expect(realtime.emitBookingRequestUpdated).toHaveBeenCalledTimes(1);
+      expect(emitted(realtime.emitBookingRequestUpdated)[0].id).toBe(
+        BOOKING_ID,
+      );
+    });
+
+    it('cancel emits one `updated` — the freed room has to reach every other queue', async () => {
+      bookingRequest.findUnique
+        .mockResolvedValueOnce({
+          id: BOOKING_ID,
+          venueId: VENUE_ID,
+          status: BookingStatus.APPROVED,
+        })
+        .mockResolvedValueOnce({ status: BookingStatus.APPROVED });
+      bookingSlot.findMany.mockResolvedValue([
+        {
+          id: 's1',
+          startAt: at(DAY),
+          endAt: at(DAY + HOUR),
+          isCancelled: false,
+        },
+      ]);
+      bookingSlot.updateMany.mockResolvedValue({ count: 1 });
+      bookingRequest.update.mockResolvedValue({});
+      bookingRequest.findUnique.mockResolvedValue(
+        detailRow({ status: BookingStatus.CANCELLED }),
+      );
+      bookingRequest.findMany.mockResolvedValueOnce([
+        detailRow({ status: BookingStatus.CANCELLED }),
+      ]);
+
+      await service.cancel(BOOKING_ID, { reason: 'ท่อน้ำแตก' }, ACTOR);
+
+      expect(realtime.emitBookingRequestUpdated).toHaveBeenCalledTimes(1);
+      expect(emitted(realtime.emitBookingRequestUpdated)[0].id).toBe(
+        BOOKING_ID,
+      );
+    });
+
+    /**
+     * A direct booking is BOTH kinds at once: a row that did not exist (`created`) and every request
+     * it took the room from (`updated`). Collapsing them would make the queue either miss the new
+     * row or re-insert a loser it already has.
+     */
+    it('direct emits `created` for the new booking and `updated` for every loser', async () => {
+      venue.findFirst.mockResolvedValue({ id: VENUE_ID });
+      bookingSlot.findFirst.mockResolvedValue(null);
+      bookingRequest.count.mockResolvedValue(0);
+      bookingRequest.create.mockResolvedValue({ id: BOOKING_ID });
+      bookingRequest.updateMany.mockResolvedValue({ count: 1 });
+      bookingRequest.findUnique.mockResolvedValue(detailRow());
+      bookingRequest.findMany
+        .mockResolvedValueOnce([loser(LOSER_ID, 'BR-25690903-009')])
+        .mockResolvedValueOnce([detailRow({ id: BOOKING_ID })])
+        .mockResolvedValueOnce([
+          detailRow({ id: LOSER_ID, status: BookingStatus.REJECTED }),
+        ]);
+
+      await service.createDirect(
+        {
+          venueId: VENUE_ID,
+          purpose: 'ประชุมคณะกรรมการ',
+          attendees: 20,
+          slots: [{ startAt: iso(DAY), endAt: iso(DAY + HOUR) }],
+          requesterName: 'สพท.',
+          contactPhone: '02-000-0000',
+        },
+        ACTOR,
+      );
+
+      expect(realtime.emitBookingRequestCreated).toHaveBeenCalledTimes(1);
+      expect(emitted(realtime.emitBookingRequestCreated)[0].id).toBe(
+        BOOKING_ID,
+      );
+      expect(realtime.emitBookingRequestUpdated).toHaveBeenCalledTimes(1);
+      expect(emitted(realtime.emitBookingRequestUpdated)[0].id).toBe(LOSER_ID);
     });
   });
 });

@@ -8,6 +8,7 @@ import {
 import { Test, TestingModule } from '@nestjs/testing';
 import { AppAccess, BookingStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { BookingsService } from './bookings.service';
 import {
   BOOKING_NOT_ALLOWED,
@@ -185,6 +186,15 @@ describe('BookingsService', () => {
     cb({ bookingSlot, bookingRequest }),
   );
 
+  /**
+   * `ADMIN-REALTIME-BOOKINGS-1`. The LIFF side emits exactly one event — a new request landing in
+   * the queue an operator is watching — and the gateway is mocked, never the socket.
+   */
+  const realtime = {
+    emitBookingRequestCreated: jest.fn(),
+    emitBookingRequestUpdated: jest.fn(),
+  };
+
   /** The happy path's collaborators, so each test overrides only the one it is about. */
   const allowAndOpen = () => {
     lineUser.findFirst.mockResolvedValue({
@@ -219,6 +229,9 @@ describe('BookingsService', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    // The post-commit realtime re-read lands here. Defaulted to "no rows" so the tests that are not
+    // about the fan-out stay silent; the one that IS queues its own row.
+    bookingRequest.findMany.mockResolvedValue([]);
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         BookingsService,
@@ -233,6 +246,7 @@ describe('BookingsService', () => {
             $transaction,
           },
         },
+        { provide: RealtimeGateway, useValue: realtime },
       ],
     }).compile();
     service = module.get(BookingsService);
@@ -283,6 +297,107 @@ describe('BookingsService', () => {
       expect(result.venueName).toBe('ห้องประชุมใหญ่');
       expect(result.code).toMatch(/^BR-\d{8}-\d{3,}$/);
       expect(result.slots).toHaveLength(3);
+    });
+
+    // ── ADMIN-REALTIME-BOOKINGS-1 — the one emit on the LIFF side ──────────────────
+    describe('realtime', () => {
+      /** One row in the QUEUE-ROW shape, i.e. what the post-commit re-read returns. */
+      const queueRow = {
+        id: BOOKING_ID,
+        code: CODE,
+        status: BookingStatus.PENDING,
+        // Null ⇒ nobody on staff typed it ⇒ the mapper must read `origin: 'LINE'`.
+        createdById: null,
+        purpose: 'ประชุมเตรียมงานกีฬาสี',
+        attendees: 25,
+        firstStartAt: new Date(Date.now() + DAY),
+        lastEndAt: new Date(Date.now() + DAY + HOUR),
+        rejectReason: null,
+        createdAt: new Date(),
+        requesterName: null,
+        contactPhone: null,
+        department: null,
+        lineUser: {
+          registration: {
+            firstName: 'สมชาย',
+            lastName: 'ใจดี',
+            phone: '081-234-5678',
+            department: null,
+          },
+        },
+        venue: { id: VENUE_ID, name: 'ห้องประชุมใหญ่', location: null },
+        slots: [
+          {
+            id: SLOT_ID,
+            startAt: new Date(Date.now() + DAY),
+            endAt: new Date(Date.now() + DAY + HOUR),
+            isCancelled: false,
+            cancelledAt: null,
+            cancelReason: null,
+            cancelledByRole: null,
+          },
+        ],
+      };
+
+      const emitted = () =>
+        (
+          realtime.emitBookingRequestCreated.mock.calls as unknown as [
+            Record<string, unknown> & { id: string; origin: string },
+            unknown,
+          ][]
+        )[0];
+
+      it('announces the new request to the admin queue, with NO actor', async () => {
+        allowAndOpen();
+        echoCreate();
+        bookingRequest.findMany.mockResolvedValueOnce([queueRow]);
+
+        await service.createFromLine(
+          SUB,
+          dto([{ startAt: iso(DAY), endAt: iso(DAY + HOUR) }]),
+        );
+
+        expect(realtime.emitBookingRequestCreated).toHaveBeenCalledTimes(1);
+        const [booking, actor] = emitted();
+        expect(booking.id).toBe(BOOKING_ID);
+        // 🔴 `null`, not a fabricated operator: a LINE user submitted this through LIFF and nobody
+        // on staff did anything. That is exactly the case `RealtimeActor | null` exists for.
+        expect(actor).toBeNull();
+        expect(booking.origin).toBe('LINE');
+        expect(realtime.emitBookingRequestUpdated).not.toHaveBeenCalled();
+      });
+
+      it('emits only after the insert has committed', async () => {
+        allowAndOpen();
+        echoCreate();
+        bookingRequest.findMany.mockResolvedValueOnce([queueRow]);
+
+        await service.createFromLine(
+          SUB,
+          dto([{ startAt: iso(DAY), endAt: iso(DAY + HOUR) }]),
+        );
+
+        expect(
+          realtime.emitBookingRequestCreated.mock.invocationCallOrder[0],
+        ).toBeGreaterThan(bookingRequest.create.mock.invocationCallOrder[0]);
+      });
+
+      /** Fail-soft: the booking is already in the database, so a dead socket is not a 500. */
+      it('still returns the booking when the transport throws', async () => {
+        allowAndOpen();
+        echoCreate();
+        bookingRequest.findMany.mockResolvedValueOnce([queueRow]);
+        realtime.emitBookingRequestCreated.mockImplementationOnce(() => {
+          throw new Error('transport down');
+        });
+
+        await expect(
+          service.createFromLine(
+            SUB,
+            dto([{ startAt: iso(DAY), endAt: iso(DAY + HOUR) }]),
+          ),
+        ).resolves.toBeDefined();
+      });
     });
 
     it('computes firstStartAt / lastEndAt across ALL slots, whatever order they arrive in', async () => {

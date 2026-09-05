@@ -10,6 +10,7 @@ import {
 } from '@nestjs/common';
 import { AppAccess, BookingStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { TOMBSTONE_VENUE_TYPE_NAME } from '../venue-types/venue-types.constants';
 import { isCodeCollision, nextBookingCode } from './booking-code';
 import {
@@ -17,6 +18,7 @@ import {
   parseSlots,
   type SlotSpan,
 } from './booking-overlap';
+import { publishBookingRequests } from './booking-realtime';
 import {
   AVAILABILITY_MAX_DAYS,
   AVAILABILITY_RANGE_INVALID,
@@ -201,7 +203,10 @@ const SORT_ORDER: Record<
 export class BookingsService {
   private readonly logger = new Logger(BookingsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly realtime: RealtimeGateway,
+  ) {}
 
   /**
    * `POST /line-users/bookings`.
@@ -227,6 +232,20 @@ export class BookingsService {
     if (!venue.isOpen) throw new ConflictException(VENUE_CLOSED);
 
     const row = await this.insertWithCode(venue.id, requester.id, dto, slots);
+
+    // 🔴 THE ONLY REALTIME EMIT ON THE LIFF SIDE (`ADMIN-REALTIME-BOOKINGS-1`), and it goes to the
+    // ADMIN namespace: a new request has just landed in the approval queue somebody is watching.
+    // `actor` is `null` because nobody on staff did this — a LINE user submitted it, which is exactly
+    // the case `RealtimeActor | null` exists for. After the insert transaction has committed, and
+    // fail-soft inside, so a socket problem can never fail a booking the database already accepted.
+    // ⛔ Nothing here reaches a `/client` namespace: that is `CLIENT-REALTIME-1`'s job (P7c).
+    await publishBookingRequests(
+      this.prisma,
+      this.realtime,
+      'created',
+      [row.id],
+      null,
+    );
     return toRequestDto(row, venue.name);
   }
 

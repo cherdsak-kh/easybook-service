@@ -8,7 +8,15 @@ import {
 } from '@nestjs/common';
 import { AppAccess, BookingStatus, Prisma, SystemRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import type { RealtimeActor } from '../realtime/realtime.constants';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { isCodeCollision, nextBookingCode } from './booking-code';
+import {
+  BOOKING_LIST_SELECT,
+  BOOKING_REQUESTER_SELECT,
+  requesterOf,
+  toBookingListDto,
+} from './booking-list-view';
 import {
   approvedClashWhere,
   assertNoApprovedClash,
@@ -18,6 +26,7 @@ import {
   parseSlots,
   type SlotSpan,
 } from './booking-overlap';
+import { publishBookingRequests } from './booking-realtime';
 import {
   AUTO_REJECTED_REASON,
   BOOKING_ALREADY_CANCELLED,
@@ -36,9 +45,6 @@ import {
 } from './bookings.constants';
 import type {
   AdminBookingRequestDetailDto,
-  AdminBookingRequesterDto,
-  AdminBookingRequestListItemDto,
-  AdminBookingSlotDto,
   ApproveBookingResponseDto,
   AutoRejectedBookingDto,
   BookingConflictsDto,
@@ -57,81 +63,24 @@ import {
   type ListBookingRequestsQueryDto,
 } from './dto/list-booking-requests-query.dto';
 
-/** The actor, narrowed to the two facts every write on this surface records. */
-type Actor = { id: string; role: SystemRole };
-
 /**
- * Every slot of the booking, cancelled ones included, oldest first.
+ * The actor, narrowed to the facts every write on this surface records.
  *
- * ⚠️ THE OPPOSITE OF THE AVAILABILITY READ, deliberately. The calendar must not paint a freed hour;
- * the approval screen must show that Wednesday was dropped and why, or a three-day booking silently
- * becomes a two-day one with no trace of the decision.
+ * ⚠️ IT CARRIES A `name` SINCE `ADMIN-REALTIME-BOOKINGS-1`, and widening the existing type is
+ * deliberate rather than adding a second, optional parameter — the same argument `AdminActor`
+ * records in `line-user.service.ts`. An optional actor is one a future route forgets, and the
+ * failure is silent: the write succeeds, the event fans out, and it simply says nobody did it.
+ * Widening makes the type checker name every call site instead.
+ *
+ * `role` is still the only thing a write reads (`cancelledByRole`); the identity half is for the
+ * realtime event, and it is `id` + display name only — never an email, never the role.
  */
-const ADMIN_SLOTS = {
-  orderBy: [{ startAt: 'asc' }, { id: 'asc' }],
-} satisfies Prisma.BookingRequest$slotsArgs;
-
-/**
- * ⚠️ NOT ONE NESTED READ CARRIES A `deletedAt` FILTER, and that is this repo's read/write asymmetry
- * rather than an oversight (`CLAUDE.md`, `SystemUser.departmentId`). A LINE user who unfollowed, a
- * department that was retired, a staff member who was soft-deleted: each must still resolve on a
- * booking that already happened. Filtering here would blank a name on a historical row — and on the
- * non-nullable staff fields it would 500 the list instead.
- */
-const REQUESTER_SELECT = {
-  requesterName: true,
-  contactPhone: true,
-  department: { select: { name: true } },
-  lineUser: {
-    select: {
-      registration: {
-        select: {
-          firstName: true,
-          lastName: true,
-          phone: true,
-          // ⚠️ THE REGISTRATION'S OWN DEPARTMENT, not `BookingRequest.departmentId`. That column is
-          // the ADMIN origin's override and is null on every LIFF request; a LINE user's department
-          // is the one they registered with, resolved through this FK and nowhere else.
-          department: { select: { name: true } },
-        },
-      },
-    },
-  },
-} satisfies Prisma.BookingRequestSelect;
-
-/**
- * ⛔ `holdsSlot` IS ABSENT AND MUST STAY ABSENT. It is the index key the database owns, not a fact
- * about the domain (`schema.prisma`). ⛔ `cancelledById` is absent too: a raw id into one of two
- * unbridged tables that no client can resolve — the schema says outright "Do not `include` it".
- */
-const SLOT_SELECT = {
-  id: true,
-  startAt: true,
-  endAt: true,
-  isCancelled: true,
-  cancelledAt: true,
-  cancelReason: true,
-  cancelledByRole: true,
-} satisfies Prisma.BookingSlotSelect;
-
-const LIST_SELECT = {
-  id: true,
-  code: true,
-  status: true,
-  createdById: true,
-  purpose: true,
-  attendees: true,
-  firstStartAt: true,
-  lastEndAt: true,
-  rejectReason: true,
-  createdAt: true,
-  ...REQUESTER_SELECT,
-  venue: { select: { id: true, name: true, location: true } },
-  slots: { ...ADMIN_SLOTS, select: SLOT_SELECT },
-} satisfies Prisma.BookingRequestSelect;
+export interface Actor extends RealtimeActor {
+  role: SystemRole;
+}
 
 const DETAIL_SELECT = {
-  ...LIST_SELECT,
+  ...BOOKING_LIST_SELECT,
   venueId: true,
   approvedAt: true,
   venue: {
@@ -147,7 +96,6 @@ const DETAIL_SELECT = {
   approvedBy: { select: { id: true, firstName: true, lastName: true } },
 } satisfies Prisma.BookingRequestSelect;
 
-type ListRow = Prisma.BookingRequestGetPayload<{ select: typeof LIST_SELECT }>;
 type DetailRow = Prisma.BookingRequestGetPayload<{
   select: typeof DETAIL_SELECT;
 }>;
@@ -194,12 +142,21 @@ const SORT_ORDER: Record<
  * ⚠️ ISOLATION LEVEL IS `READ COMMITTED`, Prisma's and Postgres's default, RECORDED HERE ON PURPOSE
  * (plan R6). `Serializable` is not used: the correctness boundary is an index-level constraint that
  * does not care about isolation, so it would buy nothing and hand every approval a `40001` to retry.
+ *
+ * ── 🔴 REALTIME (`ADMIN-REALTIME-BOOKINGS-1`, design constraint `Q4`) ──
+ * Every write here ends with {@link publish}, and TWO rules govern where that call may sit:
+ * **after the commit**, because a rolled-back transaction that already announced itself makes every
+ * other operator's screen wrong; and **once per row that changed**, because ADR-001 changes other
+ * people's rows — an approval that auto-rejects two overlapping requests emits three events, not one.
  */
 @Injectable()
 export class AdminBookingsService {
   private readonly logger = new Logger(AdminBookingsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly realtime: RealtimeGateway,
+  ) {}
 
   /**
    * `GET /booking-requests` — the queue.
@@ -234,7 +191,7 @@ export class AdminBookingsService {
     const [rows, total, grouped] = await Promise.all([
       this.prisma.bookingRequest.findMany({
         where,
-        select: LIST_SELECT,
+        select: BOOKING_LIST_SELECT,
         orderBy: SORT_ORDER[query.sort],
         skip,
         take: query.limit,
@@ -251,7 +208,7 @@ export class AdminBookingsService {
 
     const now = new Date();
     return {
-      data: rows.map((row) => toListDto(row, now)),
+      data: rows.map((row) => toBookingListDto(row, now)),
       meta: {
         page: query.page,
         limit: query.limit,
@@ -357,10 +314,21 @@ export class AdminBookingsService {
     });
 
     // 8. Read the settled state back, outside the transaction.
-    return {
+    const response = {
       booking: await this.readDetail(this.prisma, bookingId),
       autoRejected,
     };
+
+    // 9. 🔴 THE FAN-OUT, AND IT IS THE LAST THING THAT HAPPENS. Outside the transaction because the
+    //    write must be durable before any screen is told about it, and ONE EVENT PER LOSER because
+    //    ADR-001 just changed rows that belong to other people's requests — the whole reason
+    //    `ADMIN-REALTIME-BOOKINGS-1` exists. The subject leads; the losers follow in decision order.
+    await this.publish(
+      'updated',
+      [bookingId, ...autoRejected.map((loser) => loser.id)],
+      actor,
+    );
+    return response;
   }
 
   /**
@@ -401,7 +369,10 @@ export class AdminBookingsService {
 
     // id only — `purpose`, `reason`, the requester's name and their phone are PII (PDPA).
     this.logger.log(`Booking rejected id=${id} by=${actor.id}`);
-    return this.readDetail(this.prisma, id);
+    const booking = await this.readDetail(this.prisma, id);
+    // One row changed, so one event — after the commit, never inside it.
+    await this.publish('updated', [id], actor);
+    return booking;
   }
 
   /**
@@ -512,7 +483,10 @@ export class AdminBookingsService {
     this.logger.log(
       `Booking slots cancelled id=${id} slots=${dto.slotIds?.length ?? 'all'} by=${actor.id}`,
     );
-    return this.readDetail(this.prisma, id);
+    const booking = await this.readDetail(this.prisma, id);
+    // Cancelling frees the room for everyone, so every queue looking at this venue must move.
+    await this.publish('updated', [id], actor);
+    return booking;
   }
 
   /**
@@ -534,10 +508,22 @@ export class AdminBookingsService {
         const { bookingId, autoRejected } = await this.runDecision((tx) =>
           this.createDirectOnce(tx, dto, spans, actor),
         );
-        return {
+        const response = {
           booking: await this.readDetail(this.prisma, bookingId),
           autoRejected,
         };
+
+        // 🔴 TWO EVENTS OF DIFFERENT KINDS, both after the commit: the new booking is a row that did
+        // not exist a moment ago (`created`), and every request it bumped is a row that CHANGED
+        // (`updated`). Collapsing them into one kind would make the queue either miss the new row or
+        // re-insert the losers it already has.
+        await this.publish('created', [bookingId], actor);
+        await this.publish(
+          'updated',
+          autoRejected.map((loser) => loser.id),
+          actor,
+        );
+        return response;
       } catch (err) {
         if (!isCodeCollision(err) || attempt === BOOKING_CODE_MAX_ATTEMPTS) {
           throw err;
@@ -678,6 +664,25 @@ export class AdminBookingsService {
   }
 
   /**
+   * The realtime fan-out, delegated to {@link publishBookingRequests} so the LIFF service and this
+   * one can never build a different payload for the same row.
+   *
+   * 🔴 IT PASSES `this.prisma`, NOT A TRANSACTION CLIENT, AND IT CANNOT DO OTHERWISE — the helper's
+   * parameter type refuses one. That is the compile-time form of "emit after the commit".
+   *
+   * ⚠️ AWAITED, not fire-and-forget. It never rejects (fail-soft inside), so awaiting costs one round
+   * trip and buys a deterministic ordering: by the time the HTTP response leaves, the event has been
+   * handed to the transport. A floating promise here would also trip `no-floating-promises`.
+   */
+  private publish(
+    kind: 'created' | 'updated',
+    ids: readonly string[],
+    actor: Actor,
+  ): Promise<void> {
+    return publishBookingRequests(this.prisma, this.realtime, kind, ids, actor);
+  }
+
+  /**
    * The transaction wrapper every deciding path shares.
    *
    * 🔴 THE THREE SQLSTATE TRANSLATIONS LIVE HERE AND NOWHERE ELSE (AC-BR22). `23P01` has no Prisma
@@ -720,7 +725,7 @@ export class AdminBookingsService {
     });
     if (!row) throw new NotFoundException(BOOKING_NOT_FOUND);
     return {
-      ...toListDto(row, new Date()),
+      ...toBookingListDto(row, new Date()),
       venue: row.venue,
       createdBy: row.createdBy,
       approvedBy: row.approvedBy,
@@ -900,7 +905,7 @@ export class AdminBookingsService {
     if (ids.length === 0) return new Map();
     const rows = await client.bookingRequest.findMany({
       where: { id: { in: ids } },
-      select: { id: true, purpose: true, ...REQUESTER_SELECT },
+      select: { id: true, purpose: true, ...BOOKING_REQUESTER_SELECT },
     });
     return new Map(
       rows.map((r) => [
@@ -1012,87 +1017,5 @@ function toCounts(
     approved,
     rejected,
     cancelled,
-  };
-}
-
-/**
- * Who the booking is FOR, from whichever origin wrote the row (`D-C18`).
- *
- * 🔴 THE REGISTRATION WINS WHEN THERE IS ONE. The three override columns are null on a LIFF request
- * by contract, and on a staff booking made ON BEHALF OF a LINE user they are refused at the DTO
- * boundary — so "has a registration" is the only branch needed, and it never has to choose between
- * two populated sources.
- *
- * `null` is a legitimate answer throughout: a staff booking whose department was not filled in, or a
- * LINE user who has not registered yet, is an internal event rather than a broken row.
- */
-function requesterOf(row: {
-  requesterName: string | null;
-  contactPhone: string | null;
-  department: { name: string } | null;
-  lineUser: {
-    registration: {
-      firstName: string;
-      lastName: string;
-      phone: string;
-      department: { name: string } | null;
-    } | null;
-  } | null;
-}): AdminBookingRequesterDto {
-  const reg = row.lineUser?.registration;
-  if (reg) {
-    return {
-      name: `${reg.firstName} ${reg.lastName}`.trim() || null,
-      phone: reg.phone,
-      departmentName: reg.department?.name ?? null,
-    };
-  }
-  return {
-    name: row.requesterName,
-    phone: row.contactPhone,
-    departmentName: row.department?.name ?? null,
-  };
-}
-
-function toSlotDto(slot: {
-  id: string;
-  startAt: Date;
-  endAt: Date;
-  isCancelled: boolean;
-  cancelledAt: Date | null;
-  cancelReason: string | null;
-  cancelledByRole: string | null;
-}): AdminBookingSlotDto {
-  return {
-    id: slot.id,
-    startAt: slot.startAt,
-    endAt: slot.endAt,
-    isCancelled: slot.isCancelled,
-    cancelledAt: slot.cancelledAt,
-    cancelReason: slot.cancelReason,
-    cancelledByRole: slot.cancelledByRole,
-  };
-}
-
-function toListDto(row: ListRow, now: Date): AdminBookingRequestListItemDto {
-  return {
-    id: row.id,
-    code: row.code,
-    status: row.status,
-    // `createdById === null` ⇒ nobody on staff typed it ⇒ it came from LINE.
-    origin: row.createdById === null ? 'LINE' : 'ADMIN',
-    // Computed at read time against the SERVER's clock. No fifth status, no cron.
-    isExpired:
-      row.status === BookingStatus.PENDING &&
-      row.lastEndAt.getTime() < now.getTime(),
-    requester: requesterOf(row),
-    venue: row.venue,
-    purpose: row.purpose,
-    attendees: row.attendees,
-    firstStartAt: row.firstStartAt,
-    lastEndAt: row.lastEndAt,
-    slots: row.slots.map(toSlotDto),
-    rejectReason: row.rejectReason,
-    createdAt: row.createdAt,
   };
 }

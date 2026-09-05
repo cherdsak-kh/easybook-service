@@ -61,6 +61,26 @@ export const REALTIME_EVENTS = {
   lineUserUpdated: 'lineUser.updated',
   /** This row left the operator's list (soft delete). Payload: `{ id, actor }`. */
   lineUserDeleted: 'lineUser.deleted',
+  /**
+   * This booking request now exists in the approval queue. Payload: `{ booking, actor }`, where
+   * `booking` is an `AdminBookingRequestListItemDto` — byte for byte the row shape
+   * `GET /booking-requests` returns, so a live-inserted row and a refreshed one can never disagree.
+   *
+   * Two origins, and `actor` is what tells them apart: a LIFF submission (`actor: null` — a LINE
+   * user, not an operator) or a staff `POST /booking-requests/direct`, which is born `APPROVED`.
+   */
+  bookingRequestCreated: 'bookingRequest.created',
+  /**
+   * This booking request's contents changed — approved, rejected, cancelled, **or auto-rejected by
+   * ADR-001** because somebody else's overlapping request took the room. Payload:
+   * `{ booking, actor }`, the same shape as `bookingRequest.created`.
+   *
+   * 🔴 ONE EVENT PER ROW THAT CHANGED, NEVER ONE PER OPERATION. An approval that bumps two
+   * overlapping pending requests emits THREE of these: the subject and both losers. The losers are
+   * rows on other people's screens and they changed; announcing only the subject is precisely the
+   * defect this vocabulary was added to fix.
+   */
+  bookingRequestUpdated: 'bookingRequest.updated',
   /** Control plane — emitted immediately before the sweeper disconnects a socket. */
   sessionClosed: 'session.closed',
 } as const;

@@ -8,6 +8,7 @@ import type { Redis } from 'ioredis';
 import type { Namespace, Socket } from 'socket.io';
 import { SESSION_ABSOLUTE_MAX_AGE_MS } from '../auth/auth.constants';
 import { resolveSystemUserById } from '../auth/session-user.resolver';
+import type { AdminBookingRequestListItemDto } from '../bookings/dto/admin-booking-response.dto';
 import type { LineUserResponseDto } from '../line/dto/line-user-response.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { REDIS_CLIENT, SESSION_KEY_PREFIX } from '../redis/redis.constants';
@@ -148,6 +149,47 @@ export class RealtimeGateway
   /** Broadcasts a row that left the operator's list (unfollow → soft delete). */
   emitLineUserDeleted(id: string, actor: RealtimeActor | null): void {
     this.emit(REALTIME_EVENTS.lineUserDeleted, { id, actor }, id);
+  }
+
+  /**
+   * Broadcasts a booking request that now exists in the approval queue.
+   *
+   * ⚠️ `actor` is REQUIRED at the call site and nullable in value, for the same reason as the
+   * `lineUser*` pair: `null` is a real answer — a LINE user submitted it through LIFF, and no
+   * operator did anything.
+   *
+   * ⚠️ THE DTO IS `AdminBookingRequestListItemDto` AND NOTHING ELSE, including on the paths that
+   * already hold a richer detail DTO. The client's type is generated from this contract, so a
+   * payload that carried a few extra detail fields would be a shape the generated client does not
+   * describe — and one the next refresh would silently drop.
+   */
+  emitBookingRequestCreated(
+    dto: AdminBookingRequestListItemDto,
+    actor: RealtimeActor | null,
+  ): void {
+    this.emit(
+      REALTIME_EVENTS.bookingRequestCreated,
+      { booking: dto, actor },
+      dto.id,
+    );
+  }
+
+  /**
+   * Broadcasts a booking request whose contents changed.
+   *
+   * 🔴 CALLED ONCE PER CHANGED ROW. An approval that auto-rejects two overlapping requests calls
+   * this three times — once for the subject and once for each loser. See
+   * `REALTIME_EVENTS.bookingRequestUpdated`.
+   */
+  emitBookingRequestUpdated(
+    dto: AdminBookingRequestListItemDto,
+    actor: RealtimeActor | null,
+  ): void {
+    this.emit(
+      REALTIME_EVENTS.bookingRequestUpdated,
+      { booking: dto, actor },
+      dto.id,
+    );
   }
 
   /**

@@ -30,6 +30,7 @@ import { RolesGuard } from '../auth/guards/roles.guard';
 import { SessionGuard } from '../auth/guards/session.guard';
 import type { AuthenticatedSystemUser } from '../auth/auth.types';
 import { ErrorResponseDto } from '../common/dto/error-response.dto';
+import type { Actor } from './admin-bookings.service';
 import { AdminBookingsService } from './admin-bookings.service';
 import {
   AdminBookingRequestDetailDto,
@@ -44,6 +45,20 @@ import {
   RejectBookingRequestDto,
 } from './dto/admin-booking-write.dto';
 import { ListBookingRequestsQueryDto } from './dto/list-booking-requests-query.dto';
+
+/**
+ * The acting operator: for the write itself (`role` → `cancelledByRole`) AND for the realtime event
+ * (`ADMIN-REALTIME-BOOKINGS-1`).
+ *
+ * `name` is the display name a colleague already sees on the staff screen — no email, no role,
+ * nothing that would turn a "who just did that?" answer into an audit record. Identical to
+ * `line-users.controller.ts`'s `actorOf`, which is where the shape comes from.
+ */
+const actorOf = (user: AuthenticatedSystemUser): Actor => ({
+  id: user.id,
+  name: `${user.firstName} ${user.lastName}`.trim(),
+  role: user.role,
+});
 
 /**
  * `คำขอจองสถานที่` — route prefix `/api/v1/booking-requests`.
@@ -127,7 +142,7 @@ export class BookingRequestsController {
     @Body() dto: CreateDirectBookingDto,
     @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<ApproveBookingResponseDto> {
-    return this.bookings.createDirect(dto, { id: user.id, role: user.role });
+    return this.bookings.createDirect(dto, actorOf(user));
   }
 
   /**
@@ -275,7 +290,7 @@ export class BookingRequestsController {
     @Param('id') id: string,
     @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<ApproveBookingResponseDto> {
-    return this.bookings.approve(id, { id: user.id, role: user.role });
+    return this.bookings.approve(id, actorOf(user));
   }
 
   @Post(':id/reject')
@@ -317,7 +332,7 @@ export class BookingRequestsController {
     @Body() dto: RejectBookingRequestDto,
     @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<AdminBookingRequestDetailDto> {
-    return this.bookings.reject(id, dto, { id: user.id, role: user.role });
+    return this.bookings.reject(id, dto, actorOf(user));
   }
 
   @Post(':id/cancel')
@@ -361,6 +376,6 @@ export class BookingRequestsController {
     @Body() dto: CancelBookingRequestDto,
     @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<AdminBookingRequestDetailDto> {
-    return this.bookings.cancel(id, dto, { id: user.id, role: user.role });
+    return this.bookings.cancel(id, dto, actorOf(user));
   }
 }
