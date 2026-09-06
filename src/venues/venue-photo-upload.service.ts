@@ -34,7 +34,9 @@ import type { VenuePhotoUploadResponseDto } from './dto/venue.dto';
  * invisible, cheap, and collectable later — every venue photo the system has ever minted is under one
  * flat `venues/` prefix, so "objects with no row" is one `ListObjectsV2` plus one query.
  *
- * ⚠️ NO SWEEP JOB EXISTS YET. This is a known, bounded leak, not a solved problem.
+ * ⚠️ THE SWEEP IS MANUAL, NOT AUTOMATIC. `R2StorageService.sweepStagedPhotos`, driven by
+ * `npm run venues:sweep-photos`, deletes staged objects older than 24h — but nothing schedules it, so
+ * the leak is collected only when somebody (or a cron entry that does not exist yet) runs it.
  */
 @Injectable()
 export class VenuePhotoUploadService {

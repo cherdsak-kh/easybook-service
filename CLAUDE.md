@@ -43,6 +43,8 @@ npm run auth:create-superadmin    # create the first SUPER_ADMIN — interactive
                                   # (idempotent; --force RESETS the existing one's credentials)
 npm run auth:hash-password -- 'pw'  # print an argon2id hash for a password (debug/DB seeding; no DB, no endpoint by design)
 npm run options:seed              # seed baseline Department / PersonnelRole options (never writes isSystemReserved)
+npm run venue-types:seed          # seed the 5 starting VenueType categories + reserved tombstone row (idempotent)
+npm run venues:sweep-photos       # sweep orphan staged photos from venues/_new/ (--dry-run, --hours=N; default 24, min 1)
 ```
 
 Redis must be running for anything session-backed. A `Dockerfile` and a `docker-compose.staging.yml`

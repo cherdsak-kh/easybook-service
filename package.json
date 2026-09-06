@@ -24,6 +24,7 @@
     "auth:hash-password": "ts-node scripts/hash-password.ts",
     "options:seed": "ts-node scripts/seed-options.ts",
     "venue-types:seed": "ts-node scripts/seed-venue-types.ts",
+    "venues:sweep-photos": "ts-node scripts/sweep-orphan-photos.ts",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
     "test": "jest",
     "test:watch": "jest --watch",
