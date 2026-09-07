@@ -5,6 +5,7 @@ import { LineController } from './line.controller';
 import { LineService } from './line.service';
 import { LineSignatureGuard } from './line-signature.guard';
 import { LineRegistrationController } from './line-registration.controller';
+import { LineSettingsController } from './line-settings.controller';
 import { LineUsersController } from './line-users.controller';
 import { LineUserService } from './line-user.service';
 import { LineWebhookService } from './line-webhook.service';
@@ -27,9 +28,15 @@ import { LineIdTokenGuard } from './guards/line-id-token.guard';
   // admin `LineUsersController` so its literal `PATCH /line-users/registration` route is registered
   // before — and therefore wins over — the admin `PATCH /line-users/:id`. A real cuid still falls
   // through to `:id`. Reordering these two breaks the client self-edit endpoint.
+  //
+  // `LineSettingsController` (Phase 7a) sits between them for exactly the same reason and it is NOT
+  // cosmetic: its `PATCH /line-users/settings` is a 2-segment PATCH, and `settings` is a perfectly
+  // good `:id` as far as Express is concerned. Registered after the admin controller, every settings
+  // save would be routed into the admin access-change handler instead.
   controllers: [
     LineController,
     LineRegistrationController,
+    LineSettingsController,
     LineUsersController,
   ],
   providers: [

@@ -9,6 +9,7 @@ import {
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { SessionGuard } from '../auth/guards/session.guard';
+import { resolveAppVersion } from '../common/app-version';
 import { ErrorResponseDto } from '../common/dto/error-response.dto';
 import { VersionResponseDto } from './dto/version-response.dto';
 
@@ -64,25 +65,18 @@ export class SystemController {
     // `null` are honest answers — a deploy that forgot to stamp the build should say so, not
     // invent a plausible-looking commit.
     //
-    // ⚠️ `npm_package_version` is the DEV fallback, and it is not a nicety. npm sets it from this
-    // package's own `version` for anything launched with `npm run`, so a developer box reports the
-    // code it is actually running without anyone maintaining a second copy of the number in a
-    // `.env`. Without it every unstamped box answered `0.0.0`, and the version screen showed a
-    // permanent amber "the server is behind" — which is how a warning colour stops being read by
-    // the time a real mismatch appears. It is deliberately BELOW `APP_VERSION`: a container runs
-    // `node dist/main`, npm sets nothing, and the deploy's stamp must always win.
-    //
-    // ⚠️ `stamp()` treats EMPTY as unset, and `??` cannot: `.env.example` documents these three by
+    // ⚠️ `stamp()` treats EMPTY as unset, and `??` cannot: `.env.example` documents these two by
     // listing them blank, so a copied `.env` sets each to `''` — which is a value, so `??` keeps
-    // it and the endpoint answers `version: ""`. That is worse than the fallback it was meant to
+    // it and the endpoint answers `build: ""`. That is worse than the fallback it was meant to
     // avoid, and it appears only on a box configured exactly the way the docs say to.
     const stamp = (v: string | undefined) =>
       v && v.trim() ? v.trim() : undefined;
     return {
-      version:
-        stamp(process.env.APP_VERSION) ??
-        stamp(process.env.npm_package_version) ??
-        '0.0.0',
+      // ⚠️ THE SHARED RESOLVER, not a local copy of the fallback chain. The consumer endpoint
+      // `GET /line-users/version` answers the same question for the client portal's `#/version`
+      // screen, and that screen's whole job is comparing the bundle's version against this one —
+      // so the two must resolve it identically or the comparison reports on the resolver.
+      version: resolveAppVersion(),
       build: stamp(process.env.APP_BUILD) ?? 'unknown',
       releasedAt: stamp(process.env.APP_RELEASED_AT) ?? null,
     };

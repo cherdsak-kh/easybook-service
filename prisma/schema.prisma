@@ -100,6 +100,12 @@ model LineUser {
   /// VIRTUAL — adds no column to line_users. Nullable: a follower who never registered has none.
   registration LineUserRegistration? @relation("LineUserToRegistration")
 
+  /// Back-relation for the 1:1 client-portal settings row (Q-C9). VIRTUAL — adds no column to
+  /// line_users. NULL for the overwhelming majority of rows and that is the design, not a gap:
+  /// every existing follower predates the table and the read answers DEFAULTS rather than creating
+  /// one (see LineUserSettings). A user who never opens #/settings costs zero rows forever.
+  settings LineUserSettings? @relation("LineUserToSettings")
+
   /// Back-relation for BookingRequest.lineUserId (D-C18). VIRTUAL — adds no column to line_users.
   /// EMPTY for a follower who never booked, and empty forever for the staff-created half of the
   /// booking table: those rows carry `createdById` instead. This is the LIFF origin's list.
@@ -175,6 +181,55 @@ model LineUserRegistration {
   @@index([lastName, firstName])
   @@index([createdAt])
   @@map("line_user_registrations")
+}
+
+/// Client-portal settings for one LINE end-user (`Q-C9`). 1:1 with LineUser, and DELIBERATELY
+/// SPARSE: the row exists only once the user has actually changed something.
+///
+/// ⚠️ A MISSING ROW IS NOT AN ERROR AND MUST NOT BE LAZILY CREATED. Every follower predates this
+/// table, so `GET /line-users/settings` answers the defaults below WITHOUT writing — a backfill (or
+/// a create-on-read) would mint a row for every follower who may never open the settings screen.
+/// The only writer is `PATCH /line-users/settings`.
+///
+/// ⚠️ A GENERAL SETTINGS ROW, NOT A NOTIFICATION TABLE (PO ruling `Q-C9`): the next preference must
+/// not need a second migration. That is also why `preferences`/`privacy` exist while nothing reads
+/// them — with the rule stated at each column.
+model LineUserSettings {
+  id String @id @default(cuid())
+
+  /// FK -> LineUser.id (a cuid), NOT LineUser.lineUserId (the "U…" string) — the same footgun
+  /// LineUserRegistration warns about, and this is deliberately the identical shape. @unique makes
+  /// the relation 1:1: one settings row per LineUser.
+  lineUserId String   @unique
+  lineUser   LineUser @relation("LineUserToSettings", fields: [lineUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  /// light · dark · system. The LOCAL value stays authoritative for first paint (`Q-C9`); this
+  /// column is the cross-device sync, never a reason to block the app's first render on a fetch.
+  theme String @default("system")
+
+  /// Which LINE messages the user accepts: `announcements` · `decisions` · `reminders`, all `true`.
+  ///
+  /// 🔴 JSONB MOVES SHAPE-CHECKING OUT OF THE DATABASE, so the DTO is the only guard. Postgres will
+  /// happily store `{"decisions":"yes"}`. `UpdateLineUserSettingsDto` — a nested class with
+  /// `@ValidateNested()` + `@Type()`, never a bare object — plus the global `whitelist` +
+  /// `forbidNonWhitelisted` pipe is what refuses it. A `Record<string, unknown>` field would not.
+  ///
+  /// 🔴 WRITES MERGE PER KEY, NEVER REPLACE. `{ notifications: { decisions: false } }` against a
+  /// whole-column write would delete `announcements` and `reminders`; absence means UNCHANGED, the
+  /// same reading PATCH has everywhere else in this service.
+  notifications Json @default("{\"announcements\":true,\"decisions\":true,\"reminders\":true}")
+
+  /// Reserved. ⚠️ RULE: a key no document describes does not get written. Stays null through
+  /// Phase 7 — "reserved" is not an invitation to invent undocumented keys in a shapeless blob.
+  preferences Json?
+
+  /// Reserved, same rule as `preferences`.
+  privacy Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("line_user_settings")
 }
 
 /// Admin-curated department/faculty options for the LINE registration form. Soft-deleted, never

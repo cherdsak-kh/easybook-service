@@ -26,6 +26,10 @@ import { isCookieSecure, resolveSameSite } from '../config/env.validation';
  * `POST /line-users/bookings` (`CLIENT-BOOKING-1`) joins the list on exactly the same grounds: same
  * `LineIdTokenGuard`, same bearer token, same absence of a cookie.
  *
+ * `PATCH /line-users/settings` (Phase 7a, `Q-C9`) joins on those same grounds again. Its two
+ * neighbours — `GET /line-users/settings` and `GET /line-users/version` — need no entry: they are
+ * GETs and `ignoredMethods` already exempts them by method.
+ *
  * 🔴 THE TEST FOR THIS LIST IS "IS THERE AMBIENT AUTHORITY?", NEVER "IS IT INCONVENIENT?". A path
  * belongs here only when the request carries no cookie a foreign origin could ride — a bearer token
  * has to be read and attached by script, which the same-origin policy already prevents. Adding a
@@ -41,6 +45,7 @@ export const CSRF_EXEMPT_PATHS: readonly string[] = [
   `${API_BASE_PATH}/line-users/register`,
   `${API_BASE_PATH}/line-users/registration`,
   `${API_BASE_PATH}/line-users/bookings`,
+  `${API_BASE_PATH}/line-users/settings`,
 ];
 
 /** Escapes a literal so it can be embedded in a `RegExp` — `API_BASE_PATH` is configuration. */

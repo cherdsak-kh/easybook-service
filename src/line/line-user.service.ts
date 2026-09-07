@@ -10,6 +10,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { AppAccess, Prisma, SystemRole } from '@prisma/client';
 import type { LineUser, RichMenuType } from '@prisma/client';
+import { resolveAppVersion } from '../common/app-version';
 import { PrismaService } from '../prisma/prisma.service';
 import type { RealtimeActor } from '../realtime/realtime.constants';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
@@ -27,6 +28,14 @@ import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { LineUserRegistrationResponseDto } from './dto/line-user-registration-response.dto';
 import { LineUserResponseDto } from './dto/line-user-response.dto';
+import {
+  DEFAULT_LINE_USER_THEME,
+  LineUserSettingsResponseDto,
+  LineUserVersionResponseDto,
+  NotificationPreferencesDto,
+  UpdateLineUserSettingsDto,
+  UpdateNotificationPreferencesDto,
+} from './dto/line-user-settings.dto';
 import { LineUserStatusResponseDto } from './dto/line-user-status-response.dto';
 import { ListLineUsersQueryDto } from './dto/list-line-users-query.dto';
 import { PaginatedLineUsersResponseDto } from './dto/paginated-line-users-response.dto';
@@ -260,6 +269,71 @@ const REGISTRATION_OWNER_SELECT = {
 type OwnerRegistration = Prisma.LineUserRegistrationGetPayload<{
   select: typeof REGISTRATION_OWNER_SELECT;
 }>;
+
+/** The `status` the consumer version endpoint answers whenever the request reached the handler. */
+export const LINE_CLIENT_VERSION_STATUS = 'ok';
+
+/**
+ * THE defaults a LINE user with no `LineUserSettings` row sees (`Q-C9`: all three `true`).
+ *
+ * ⚠️ A FACTORY, NOT A SHARED CONSTANT. The object is handed straight into a response DTO, and one
+ * shared literal is one accidental mutation away from changing every future caller's defaults.
+ */
+export const defaultNotificationPreferences =
+  (): NotificationPreferencesDto => ({
+    announcements: true,
+    decisions: true,
+    reminders: true,
+  });
+
+/**
+ * Read the three documented booleans out of a JSONB value, defaulting anything else.
+ *
+ * 🔴 THIS IS WHERE JSONB'S MISSING SHAPE CHECK IS PAID FOR ON THE READ SIDE. The DTO guards writes,
+ * but the column already exists, `preferences`/`privacy` are explicitly reserved for future keys,
+ * and Postgres would happily hand back `{"decisions":"yes"}` or `null` from a row written by
+ * anything other than this service. A non-boolean is treated as *not set* and falls back to the
+ * documented default, so a malformed row degrades to "notifications on" rather than to a response
+ * whose declared type is a lie.
+ */
+const toNotificationPreferences = (
+  stored: Prisma.JsonValue | null | undefined,
+): NotificationPreferencesDto => {
+  const defaults = defaultNotificationPreferences();
+  if (typeof stored !== 'object' || stored === null || Array.isArray(stored)) {
+    return defaults;
+  }
+  const row = stored as Record<string, unknown>;
+  const read = (key: keyof NotificationPreferencesDto): boolean =>
+    typeof row[key] === 'boolean' ? row[key] : defaults[key];
+  return {
+    announcements: read('announcements'),
+    decisions: read('decisions'),
+    reminders: read('reminders'),
+  };
+};
+
+/**
+ * The keys a `PATCH` actually supplied — the merge's other half.
+ *
+ * 🔴 A PLAIN SPREAD OF THE DTO WOULD RESET THE OTHER TOGGLES, which is the exact failure `Q-C9`
+ * forbids. `useDefineForClassFields` is in effect (target ES2022), so a validated DTO instance
+ * carries ALL THREE properties whether or not the client sent them — the absent ones simply hold
+ * `undefined`. `{ ...stored, ...dto.notifications }` therefore writes `announcements: undefined`
+ * over a stored `true`, and JSON.stringify drops the key entirely. Absence must mean UNCHANGED, so
+ * the keys are copied one at a time behind an explicit `!== undefined` test.
+ */
+const definedPreferences = (
+  patch: UpdateNotificationPreferencesDto | undefined,
+): Partial<NotificationPreferencesDto> => {
+  const out: Partial<NotificationPreferencesDto> = {};
+  if (!patch) return out;
+  if (patch.announcements !== undefined)
+    out.announcements = patch.announcements;
+  if (patch.decisions !== undefined) out.decisions = patch.decisions;
+  if (patch.reminders !== undefined) out.reminders = patch.reminders;
+  return out;
+};
 
 @Injectable()
 export class LineUserService {
@@ -936,6 +1010,121 @@ export class LineUserService {
 
     await this.redis.setJson(key, dto);
     return dto;
+  }
+
+  /**
+   * The caller's own client-portal settings (`Q-C9`). Header-derived and param-less like
+   * `getStatus`: the identity is the verified `sub`, so a caller can only ever read their own row
+   * and cross-user reads are structurally impossible rather than merely checked.
+   *
+   * 🔴 IT NEVER WRITES, AND THAT IS THE FEATURE. Every existing follower predates this table, so a
+   * missing row is the NORMAL case, not an error — it means "has never opened `#/settings`" and the
+   * answer is the documented defaults. Creating the row here (a lazy upsert, or the backfill
+   * migration this replaced) would mint one for every follower who never visits the screen, which
+   * is precisely the database footprint the ruling refuses. `updatedAt: null` is how the response
+   * says so honestly.
+   *
+   * ONE query, through the relation rather than two round trips: `lineUser: { lineUserId,
+   * deletedAt: null }` reaches the settings row from the LINE-side `U…` id in a single statement.
+   * A soft-deleted (unfollowed) user answers defaults, matching every other read on this surface.
+   */
+  async getSettings(lineUserId: string): Promise<LineUserSettingsResponseDto> {
+    const row = await this.prisma.lineUserSettings.findFirst({
+      where: { lineUser: { lineUserId, deletedAt: null } },
+      select: { theme: true, notifications: true, updatedAt: true },
+    });
+
+    if (!row) {
+      return {
+        theme: DEFAULT_LINE_USER_THEME,
+        notifications: defaultNotificationPreferences(),
+        updatedAt: null,
+      };
+    }
+
+    return {
+      theme: row.theme,
+      notifications: toNotificationPreferences(row.notifications),
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  /**
+   * The caller's own settings write — the ONLY writer of `LineUserSettings` (`Q-C9`). Identity is
+   * the verified `sub`; there is no cross-user write and no id in the DTO to make one with.
+   *
+   * 🔴 MERGE, NEVER REPLACE, AT KEY LEVEL. `{ notifications: { decisions: false } }` must leave
+   * `announcements` and `reminders` exactly as they were — a whole-column write would delete them.
+   * An absent field means UNCHANGED, the same reading `PATCH` has everywhere else in this service;
+   * see `definedPreferences` for the `useDefineForClassFields` trap that makes a plain spread wrong.
+   *
+   * ⚠️ `preferences` and `privacy` are NEVER touched here. They are reserved columns with no DTO
+   * field, so `forbidNonWhitelisted` already 400s any attempt to send them — but the absence of a
+   * write is the second half of "a key that no document describes does not get written".
+   *
+   * ⚠️ NO `$transaction`, deliberately. `getOrCreateByLineUserId` may create the `LineUser` row for
+   * a LIFF-first caller, and the upsert below is the only other write — but a settings write that
+   * failed after that create would leave exactly the bare `UNREGISTERED` row `GET /line-users/status`
+   * creates on its own on the very next request. There is no inconsistent state to protect, so a
+   * transaction here would be ceremony.
+   */
+  async patchSettings(
+    lineUserId: string,
+    dto: UpdateLineUserSettingsDto,
+  ): Promise<LineUserSettingsResponseDto> {
+    // A LIFF-first caller may have no `LineUser` row at all, and the settings FK needs one. This is
+    // a WRITE the user explicitly asked for, so creating it here is not the footprint the read path
+    // refuses.
+    const user = await this.getOrCreateByLineUserId(lineUserId);
+
+    const existing = await this.prisma.lineUserSettings.findUnique({
+      where: { lineUserId: user.id },
+      select: { theme: true, notifications: true },
+    });
+
+    const notifications = {
+      ...toNotificationPreferences(existing?.notifications),
+      ...definedPreferences(dto.notifications),
+    };
+    // Absent theme = unchanged; unchanged with no row = the documented default.
+    const theme = dto.theme ?? existing?.theme ?? DEFAULT_LINE_USER_THEME;
+
+    const saved = await this.prisma.lineUserSettings.upsert({
+      where: { lineUserId: user.id },
+      create: { lineUserId: user.id, theme, notifications },
+      update: { theme, notifications },
+      select: { theme: true, notifications: true, updatedAt: true },
+    });
+
+    // PII discipline, as everywhere in this file: the id only. A preference is not a secret, but
+    // logging bodies is the habit that eventually logs one.
+    this.logger.log(`LineUser settings updated. id=${user.id}`);
+
+    return {
+      theme: saved.theme,
+      notifications: toNotificationPreferences(saved.notifications),
+      updatedAt: saved.updatedAt,
+    };
+  }
+
+  /**
+   * The consumer half of the version screen (`NEEDS_DESIGN.md` §3). Behind `LineIdTokenGuard`, so a
+   * build string is never published to the open internet — the same reasoning that keeps the admin
+   * endpoint off the public `/health` probe.
+   *
+   * ⚠️ It resolves through the SHARED `resolveAppVersion`, which the admin `GET /system/version`
+   * also uses. `#/version` compares the bundle's build-time constant against this answer and reports
+   * whether they agree; two resolvers could disagree about the server's own number and the screen
+   * would be reporting on the resolver instead of on the deploy.
+   *
+   * No Prisma, no I/O, nothing per-user — but it lives here rather than in the controller because
+   * the controller layer holds no logic in this service.
+   */
+  getClientVersion(): LineUserVersionResponseDto {
+    return {
+      version: resolveAppVersion(),
+      status: LINE_CLIENT_VERSION_STATUS,
+    };
   }
 
   /**

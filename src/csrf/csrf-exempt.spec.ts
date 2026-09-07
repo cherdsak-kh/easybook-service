@@ -19,6 +19,22 @@ describe('isCsrfExempt', () => {
     }
   });
 
+  it('exempts the cookieless bearer settings write (Phase 7a)', () => {
+    // Named explicitly rather than left to the loop above: the loop passes whatever the list
+    // happens to contain, so it can never catch this entry being dropped. `PATCH
+    // /line-users/settings` is bearer-authenticated and carries no cookie, and the CSRF middleware
+    // runs BEFORE the router — without this entry every settings save is a 403 that never reaches
+    // `LineIdTokenGuard`.
+    expect(isCsrfExempt(p('/line-users/settings'))).toBe(true);
+  });
+
+  it('does not extend the settings exemption to a sub-path', () => {
+    // Literal, exact-`req.path` matching — the guarantee that adding one settings route does not
+    // quietly exempt a family of them.
+    expect(isCsrfExempt(p('/line-users/settings/notifications'))).toBe(false);
+    expect(isCsrfExempt(p('/line-users/settingsX'))).toBe(false);
+  });
+
   it('exempts the two parameterised booking cancellations', () => {
     // The reason the pattern list had to exist: neither of these is a fixed string.
     expect(isCsrfExempt(p('/line-users/bookings/clx_abc123/cancel'))).toBe(
