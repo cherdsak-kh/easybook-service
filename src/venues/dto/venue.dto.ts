@@ -15,8 +15,14 @@ import {
   Min,
   ValidateIf,
 } from 'class-validator';
+import { sanitizeThaiText } from '../../common/sanitize-thai.util';
 import { VENUE_PHOTOS_MAX } from '../venues.constants';
 
+/**
+ * ⚠️ STILL HERE ON PURPOSE. `sanitizeThaiText` replaced it on the two `name` fields only; `q`,
+ * `closedReason` and the photo `url` keep the plain trim. Rewriting a URL's characters would be a
+ * bug, not a fix.
+ */
 const trim = ({ value }: { value: unknown }): unknown =>
   typeof value === 'string' ? value.trim() : value;
 
@@ -93,7 +99,7 @@ export class ListVenuesQueryDto {
  */
 class VenueWritableFields {
   @ApiProperty({ example: 'หอประชุมวารณ', maxLength: 120 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)
@@ -206,7 +212,7 @@ export class CreateVenueDto extends VenueWritableFields {}
  */
 export class UpdateVenueDto {
   @ApiPropertyOptional({ example: 'หอประชุมวารณ', maxLength: 120 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)

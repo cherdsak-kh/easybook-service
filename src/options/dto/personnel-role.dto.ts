@@ -1,9 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import { IsNotEmpty, IsString, MaxLength } from 'class-validator';
-
-const trim = ({ value }: { value: unknown }): unknown =>
-  typeof value === 'string' ? value.trim() : value;
+import { sanitizeThaiText } from '../../common/sanitize-thai.util';
 
 /**
  * Body for `POST /personnel-roles`. A `PersonnelRole` is the LINE end-user's self-declared role
@@ -12,7 +10,7 @@ const trim = ({ value }: { value: unknown }): unknown =>
  */
 export class CreatePersonnelRoleDto {
   @ApiProperty({ example: 'Teacher', maxLength: 120 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)
@@ -22,7 +20,7 @@ export class CreatePersonnelRoleDto {
 /** Body for `PATCH /personnel-roles/:id` (rename). Same shape/validation as create. */
 export class UpdatePersonnelRoleDto {
   @ApiProperty({ example: 'Senior Lecturer', maxLength: 120 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)

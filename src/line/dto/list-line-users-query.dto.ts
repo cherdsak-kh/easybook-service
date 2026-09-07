@@ -11,10 +11,7 @@ import {
   MaxLength,
   Min,
 } from 'class-validator';
-
-/** Trims a string value, leaving non-strings untouched (mirrors the system-users DTOs). */
-const trim = ({ value }: { value: unknown }): unknown =>
-  typeof value === 'string' ? value.trim() : value;
+import { sanitizeThaiText } from '../../common/sanitize-thai.util';
 
 /**
  * Offset pagination + optional `displayName` search and `access` filter for the LINE users list.
@@ -54,10 +51,15 @@ export class ListLineUsersQueryDto {
       'Case-insensitive substring match across the LINE display name, the registered first and ' +
       'last name, the resolved position and department names, and the phone number. A query of ' +
       'three or more digits also matches the phone with its separators removed, so "0812345678" ' +
-      'finds "081-234-5678". Trimmed; empty/absent → no search filter.',
+      'finds "081-234-5678". Trimmed and Thai-normalised (a double SARA E, a NIKHAHIT+SARA AA, a ' +
+      'misordered tone mark or a pasted zero-width character all still match); empty/absent → no ' +
+      'search filter.',
   })
   @IsOptional()
-  @Transform(trim)
+  // ⚠️ THE SAME SANITISER AS THE WRITE PATH, and it has to be: a name is stored sanitised, so a
+  // query left raw would ask the database for a spelling it can no longer contain and answer
+  // "not found" about a row on screen. Search and store must agree on what the letters are.
+  @Transform(sanitizeThaiText)
   @IsString()
   @MaxLength(100)
   search?: string;

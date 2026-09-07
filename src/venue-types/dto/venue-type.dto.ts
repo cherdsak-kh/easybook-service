@@ -1,14 +1,12 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import { IsNotEmpty, IsString, MaxLength } from 'class-validator';
-
-const trim = ({ value }: { value: unknown }): unknown =>
-  typeof value === 'string' ? value.trim() : value;
+import { sanitizeThaiText } from '../../common/sanitize-thai.util';
 
 /** Body for `POST /venue-types`. `name` is required, trimmed, and active-name-unique (409 on clash). */
 export class CreateVenueTypeDto {
   @ApiProperty({ example: 'โรงยิม', maxLength: 120 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)
@@ -18,7 +16,7 @@ export class CreateVenueTypeDto {
 /** Body for `PATCH /venue-types/:id` (rename). Same shape/validation as create. */
 export class UpdateVenueTypeDto {
   @ApiProperty({ example: 'โรงยิมและสนามในร่ม', maxLength: 120 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)

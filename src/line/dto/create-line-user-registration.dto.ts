@@ -7,8 +7,14 @@ import {
   Matches,
   MaxLength,
 } from 'class-validator';
+import { sanitizeThaiText } from '../../common/sanitize-thai.util';
 
-/** Trims a string value, leaving non-strings untouched (mirrors the system-users DTOs). */
+/**
+ * ⚠️ STILL HERE ON PURPOSE — `phone` keeps it. `sanitizeThaiText` replaced it on `firstName` and
+ * `lastName` only: the phone grammar below is digits, separators and the literal marker `ต่อ`, and
+ * running a Thai mark reorderer over a number is a way to make a phone number that no longer
+ * matches the `@Matches` grammar it just passed.
+ */
 const trim = ({ value }: { value: unknown }): unknown =>
   typeof value === 'string' ? value.trim() : value;
 
@@ -31,14 +37,14 @@ const trim = ({ value }: { value: unknown }): unknown =>
  */
 export class CreateLineUserRegistrationDto {
   @ApiProperty({ example: 'Somchai', maxLength: 100 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(100)
   firstName!: string;
 
   @ApiProperty({ example: 'Jaidee', maxLength: 100 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(100)

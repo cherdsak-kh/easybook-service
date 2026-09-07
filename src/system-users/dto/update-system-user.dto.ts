@@ -14,8 +14,14 @@ import {
   MinLength,
   ValidateIf,
 } from 'class-validator';
+import { sanitizeThaiText } from '../../common/sanitize-thai.util';
 import { AtLeastOneDefined } from '../../common/validators/at-least-one-defined.validator';
 
+/**
+ * ⚠️ STILL HERE ON PURPOSE — `phoneNumber` and `profilePictureUrl` keep it. `sanitizeThaiText`
+ * replaced it on `firstName`/`lastName` only; a URL and a phone grammar must not have their
+ * characters rewritten.
+ */
 const trim = ({ value }: { value: unknown }): unknown =>
   typeof value === 'string' ? value.trim() : value;
 
@@ -58,7 +64,7 @@ export class UpdateSystemUserDto {
   @AtLeastOneDefined({ message: 'At least one field must be provided.' })
   @ApiPropertyOptional({ example: 'Ada', maxLength: 120 })
   @ValidateIf((o: object, v: unknown) => v !== undefined || noFieldDefined(o))
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @MinLength(1)
   @MaxLength(120)
@@ -66,7 +72,7 @@ export class UpdateSystemUserDto {
 
   @ApiPropertyOptional({ example: 'Lovelace', maxLength: 120 })
   @ValidateIf((_o, v: unknown) => v !== undefined)
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @MinLength(1)
   @MaxLength(120)

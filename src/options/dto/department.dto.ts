@@ -1,14 +1,12 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import { IsNotEmpty, IsString, MaxLength } from 'class-validator';
-
-const trim = ({ value }: { value: unknown }): unknown =>
-  typeof value === 'string' ? value.trim() : value;
+import { sanitizeThaiText } from '../../common/sanitize-thai.util';
 
 /** Body for `POST /departments`. `name` is required, trimmed, and active-name-unique (409 on clash). */
 export class CreateDepartmentDto {
   @ApiProperty({ example: 'Computer Science', maxLength: 120 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)
@@ -18,7 +16,7 @@ export class CreateDepartmentDto {
 /** Body for `PATCH /departments/:id` (rename). Same shape/validation as create. */
 export class UpdateDepartmentDto {
   @ApiProperty({ example: 'Computer Engineering', maxLength: 120 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)

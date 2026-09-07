@@ -1,14 +1,12 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import { IsNotEmpty, IsString, MaxLength } from 'class-validator';
-
-const trim = ({ value }: { value: unknown }): unknown =>
-  typeof value === 'string' ? value.trim() : value;
+import { sanitizeThaiText } from '../../common/sanitize-thai.util';
 
 /** Body for `POST /amenities`. `name` is required, trimmed, and active-name-unique (409 on clash). */
 export class CreateAmenityDto {
   @ApiProperty({ example: 'ไมโครโฟนไร้สาย', maxLength: 120 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)
@@ -18,7 +16,7 @@ export class CreateAmenityDto {
 /** Body for `PATCH /amenities/:id` (rename). Same shape/validation as create. */
 export class UpdateAmenityDto {
   @ApiProperty({ example: 'ไมโครโฟนไร้สาย (2 ตัว)', maxLength: 120 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(120)

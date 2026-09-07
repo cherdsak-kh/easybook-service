@@ -11,10 +11,7 @@ import {
   MaxLength,
   Min,
 } from 'class-validator';
-
-/** Trims a string value, leaving non-strings untouched (mirrors the line-users DTO). */
-const trim = ({ value }: { value: unknown }): unknown =>
-  typeof value === 'string' ? value.trim() : value;
+import { sanitizeThaiText } from '../../common/sanitize-thai.util';
 
 /**
  * The four states the staff screen's status filter offers.
@@ -76,11 +73,15 @@ export class ListSystemUsersQueryDto {
     maxLength: 100,
     description:
       'Case-insensitive substring match on the first name, last name, email or phone number. ' +
-      'Trimmed; empty/absent → no search filter. The phone match is on the number **as stored**, ' +
-      'so it is format-sensitive: `0812345678` does not match a stored `081-234-5678`.',
+      'Trimmed and Thai-normalised (a double SARA E, a NIKHAHIT+SARA AA, a misordered tone mark ' +
+      'or a pasted zero-width character all still match); empty/absent → no search filter. The ' +
+      'phone match is on the number **as stored**, so it is format-sensitive: `0812345678` does ' +
+      'not match a stored `081-234-5678`.',
   })
   @IsOptional()
-  @Transform(trim)
+  // ⚠️ THE SAME SANITISER AS THE WRITE PATH — see the note in `ListLineUsersQueryDto`. A raw query
+  // against sanitised storage answers "not found" about a row the operator is looking at.
+  @Transform(sanitizeThaiText)
   @IsString()
   @MaxLength(100)
   search?: string;
