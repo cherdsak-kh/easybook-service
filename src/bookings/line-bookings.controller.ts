@@ -36,6 +36,7 @@ import {
 } from './dto/booking-response.dto';
 import { CreateLineBookingDto } from './dto/create-line-booking.dto';
 import { ListLineBookingsQueryDto } from './dto/list-line-bookings-query.dto';
+import { LineScheduleSlotDto, ScheduleQueryDto } from './dto/schedule.dto';
 import { VenueAvailabilityQueryDto } from './dto/venue-availability-query.dto';
 
 /**
@@ -61,15 +62,27 @@ import { VenueAvailabilityQueryDto } from './dto/venue-availability-query.dto';
  * | `GET line-users/venues/:id/availability` (3) | as above | no — different method AND depth |
  * | `PATCH line-users/bookings/:id/cancel` (4) | nothing at depth 4 | no |
  * | `PATCH line-users/bookings/:id/slots/:slotId/cancel` (6) | nothing at depth 6 | no |
+ * | **`GET line-users/schedule` (2)** — P7b | `GET line-users` (1) · `PATCH :id` (2) | **no** — different depth, then different method |
  *
  * `GET line-users/venues/:id` on `LineRegistrationController` does not shadow the 3-segment route
  * either: Express matches a pattern's full depth, so `/venues/:id` never captures `/venues/x/y`.
  * `BookingsModule` is therefore free to register after `LineModule`.
  *
  * 🔴 THE ONE ROW THAT WOULD BREAK IF THE ADMIN CONTROLLER GREW: an admin `GET line-users/:id` would
- * be a 2-segment `GET` and would shadow `GET line-users/bookings` if it registered first. There is
- * no such route today, and this is the table to re-check on the day somebody adds one — the failure
- * is a *silent* one, a My Bookings list answering with a LINE user profile.
+ * be a 2-segment `GET` and would shadow BOTH `GET line-users/bookings` AND `GET line-users/schedule`
+ * if it registered first — `LineModule` is registered ahead of `BookingsModule` in `app.module.ts`,
+ * so it WOULD register first. There is no such route today, and this is the table to re-check on the
+ * day somebody adds one — the failure is a *silent* one, a My Bookings list or a master schedule
+ * answering with a LINE user profile.
+ *
+ * ⚠️ `GET line-users/schedule` IS ALSO A LITERAL AGAINST TWO OTHER LITERALS at the same depth —
+ * `GET line-users/settings` and `GET line-users/version` on `LineSettingsController`, plus
+ * `GET line-users/status` and `GET line-users/venues` on `LineRegistrationController`. Distinct
+ * literals never shadow each other at any registration order, which is why `schedule` was chosen over
+ * the originally proposed `venues/master-schedule`: THAT one is matched by `@Get('venues/:id')` and
+ * would have been decided by module order across two modules (`CHECKLIST.md` §7b). The proof that
+ * this route reaches THIS handler is `test/line-schedule.e2e-spec.ts`, not this comment — reading the
+ * order is exactly how a shadowed route survives review.
  *
  * ── CSRF ──
  * ⚠️ `POST /line-users/bookings` MUST be listed in `CSRF_EXEMPT_PATHS`. It is bearer-authenticated
@@ -322,5 +335,40 @@ export class LineBookingsController {
       id,
       query,
     );
+  }
+
+  @Get('schedule')
+  @UseGuards(LineIdTokenGuard)
+  @ApiOperation({
+    summary: 'Read org-wide approved booking schedule across all venues.',
+    description:
+      'Feeds `#/home` — both the calendar’s day dots and the activity list, from ONE round trip, which is why the window defaults to a whole Bangkok month rather than a day. 🔴 **APPROVED only, and there is no parameter that widens it**: a PENDING request is not a fact about the school, several people may hold overlapping ones (`D-C13` rule 4), and painting one on the organisation’s calendar reads to its own author as *my request was granted*. Cancelled slots and soft-deleted venues are excluded too. Returns every matching slot that OVERLAPS the window, `startAt ASC`; `isMine` marks the caller’s own rows for the `คุณ` badge.',
+  })
+  @ApiOkResponse({
+    description: 'Approved activity spans, `startAt ASC`.',
+    type: [LineScheduleSlotDto],
+  })
+  @ApiBadRequestResponse({
+    description:
+      'An unknown query parameter, a malformed date, `to` before `from`, or a range wider than 366 days.',
+    type: ErrorResponseDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'Missing/invalid/expired/wrong-aud LINE ID token.',
+    type: ErrorResponseDto,
+  })
+  @ApiForbiddenResponse({
+    description: 'The caller’s access is not ALLOWED.',
+    type: ErrorResponseDto,
+  })
+  @ApiBadGatewayResponse({
+    description: 'LINE verification endpoint unreachable (retryable).',
+    type: ErrorResponseDto,
+  })
+  getMasterSchedule(
+    @Req() req: RequestWithLineUserId,
+    @Query() query: ScheduleQueryDto,
+  ): Promise<LineScheduleSlotDto[]> {
+    return this.bookings.getMasterSchedule(req.lineUserId as string, query);
   }
 }

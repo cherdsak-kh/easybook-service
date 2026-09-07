@@ -50,6 +50,7 @@ import type {
   BookingSort,
   ListLineBookingsQueryDto,
 } from './dto/list-line-bookings-query.dto';
+import type { LineScheduleSlotDto, ScheduleQueryDto } from './dto/schedule.dto';
 import type { VenueAvailabilityQueryDto } from './dto/venue-availability-query.dto';
 
 /**
@@ -88,6 +89,51 @@ const AVAILABILITY_INCLUDE = {
 
 type AvailabilityRow = Prisma.BookingSlotGetPayload<{
   include: typeof AVAILABILITY_INCLUDE;
+}>;
+
+/**
+ * What the ORG-WIDE schedule needs from each slot (`#/home`, Phase 7b).
+ *
+ * ⚠️ IT IS NOT {@link AVAILABILITY_INCLUDE} PLUS A VENUE. The availability read is scoped to ONE
+ * venue whose id the caller already has, so it never selects the venue at all; the master schedule
+ * spans every venue and prints the room's name on each row, so the venue join is the whole reason
+ * this second shape exists.
+ *
+ * ⚠️ `status` IS NOT SELECTED, and its absence is load-bearing rather than an economy: the `where`
+ * pins it to `APPROVED`, and a selected status would invite the same `mayReveal` branch the
+ * availability mapper needs — a branch that has nothing to decide here and would be one edit away
+ * from admitting PENDING rows to a screen `D-C13` keeps them off.
+ *
+ * ⚠️ NO `deletedAt` FILTER ON THE NESTED REGISTRATION, the same read/write asymmetry the availability
+ * include documents: a LINE user who has since unfollowed must still resolve as the requester of an
+ * activity that is genuinely happening. The venue's `deletedAt` IS filtered, but in the `where` — a
+ * deleted venue drops the whole row rather than blanking a name on it.
+ */
+const SCHEDULE_INCLUDE = {
+  venue: {
+    select: {
+      id: true,
+      name: true,
+      venueTypeId: true,
+      venueType: { select: { id: true, name: true } },
+    },
+  },
+  bookingRequest: {
+    select: {
+      purpose: true,
+      lineUserId: true,
+      requesterName: true,
+      lineUser: {
+        select: {
+          registration: { select: { firstName: true, lastName: true } },
+        },
+      },
+    },
+  },
+} satisfies Prisma.BookingSlotInclude;
+
+type ScheduleRow = Prisma.BookingSlotGetPayload<{
+  include: typeof SCHEDULE_INCLUDE;
 }>;
 
 /**
@@ -285,6 +331,52 @@ export class BookingsService {
     });
 
     return rows.map((row) => toAvailabilityDto(row, requester.id));
+  }
+
+  /**
+   * `GET /line-users/schedule` — the org-wide master schedule behind `#/home` (Phase 7b).
+   *
+   * The same slot row {@link listVenueAvailability} returns, widened from one venue to all of them
+   * and narrowed from two statuses to one.
+   *
+   * 🔴 `APPROVED` ONLY, AND STRICTLY — this is the endpoint's whole contract, not a default. A
+   * PENDING request is not a fact about the school: nobody has agreed to it, several people may hold
+   * overlapping ones (`D-C13` rule 4), and painting one on the organisation's calendar reads to its
+   * own author as *my request was granted*. "Mine" has its own screen at `#/bookings`. There is
+   * deliberately no query parameter that can widen this.
+   *
+   * ⚠️ CANCELLED SLOTS AND DELETED VENUES ARE EXCLUDED IN THE SAME `where`, at slot level and venue
+   * level respectively. Filtering the parent's status alone would still paint a freed Wednesday
+   * (`isCancelled` lives on the child) and a room that no longer exists.
+   *
+   * ⚠️ ONE ROUND TRIP FEEDS BOTH HALVES OF THE SCREEN. `#/home` derives its calendar day-dots from
+   * the same array it lists activities from, which is why the window defaults to a whole month
+   * rather than a day. A per-day endpoint would be 30 calls to paint one calendar.
+   */
+  async getMasterSchedule(
+    lineSub: string,
+    query: ScheduleQueryDto,
+  ): Promise<LineScheduleSlotDto[]> {
+    const requester = await this.resolveAllowedRequester(lineSub);
+    const { from, to } = resolveWindow(query);
+
+    const rows = await this.prisma.bookingSlot.findMany({
+      where: {
+        isCancelled: false,
+        bookingRequest: { status: BookingStatus.APPROVED },
+        // A soft-deleted venue keeps its rows for the audit trail; the school's calendar must not
+        // advertise a room the operator has retired.
+        venue: { deletedAt: null },
+        // 🔴 OVERLAP, not containment — a two-day camp that began before `from` still occupies the
+        // first day of the window, and dropping it would draw an empty day that is not empty.
+        startAt: { lt: to },
+        endAt: { gt: from },
+      },
+      include: SCHEDULE_INCLUDE,
+      orderBy: [{ startAt: 'asc' }, { id: 'asc' }],
+    });
+
+    return rows.map((row) => toScheduleDto(row, requester.id));
   }
 
   /**
@@ -626,8 +718,13 @@ type CreatedRow = Prisma.BookingRequestGetPayload<{
  * ⚠️ BANGKOK, NOT THE SERVER'S CLOCK. "This month" has to mean the month the user is looking at on
  * a phone in Thailand; a UTC container would default the first seven hours of every 1st of the month
  * to the previous one and open the calendar on the wrong page.
+ *
+ * ⚠️ THE PARAMETER IS STRUCTURAL, NOT `VenueAvailabilityQueryDto`, because two endpoints now share
+ * this window: the venue calendar and `#/home`'s master schedule ({@link ScheduleQueryDto}). They
+ * must agree on the default month and on both bounds — a second copy would be a second chance to
+ * default one of them to "today".
  */
-function resolveWindow(query: VenueAvailabilityQueryDto): {
+function resolveWindow(query: { from?: string; to?: string }): {
   from: Date;
   to: Date;
 } {
@@ -855,15 +952,52 @@ function toAvailabilityDto(
 }
 
 /**
+ * `#/home`'s row: an approved activity, anywhere in the school.
+ *
+ * 🔴 `isMine` COMPARES `bookingRequest.lineUserId` AGAINST `LineUser.id`, THE CUID — not against the
+ * LINE-side `U…` sub the caller authenticated with. `resolveAllowedRequester` is what translates one
+ * into the other, and that is the only place the translation happens. Comparing the sub directly
+ * type-checks perfectly and returns `false` for every row forever; the same footgun is documented on
+ * three models in `schema.prisma`.
+ *
+ * ⚠️ NO `mayReveal` BRANCH, deliberately — see {@link LineScheduleSlotDto}. Every row here is
+ * APPROVED, so there is nothing for `D-C13` to blank.
+ */
+function toScheduleDto(
+  row: ScheduleRow,
+  callerLineUserId: string,
+): LineScheduleSlotDto {
+  return {
+    id: row.id,
+    startAt: row.startAt,
+    endAt: row.endAt,
+    venueId: row.venue.id,
+    venueName: row.venue.name,
+    venueTypeId: row.venue.venueType.id,
+    venueTypeName: row.venue.venueType.name,
+    purpose: row.bookingRequest.purpose,
+    requesterName: requesterNameOf(row.bookingRequest),
+    isMine: row.bookingRequest.lineUserId === callerLineUserId,
+  };
+}
+
+/**
  * The requester's name, from whichever origin wrote the row (`D-C18`).
  *
  * A LIFF request reads it through `lineUserId` → `LineUserRegistration`; a staff-created booking
  * uses the `requesterName` override. `null` is a legitimate answer for a staff booking with no
  * override — an unnamed approved slot is an internal event, not a broken row.
+ *
+ * ⚠️ THE PARAMETER IS STRUCTURAL so the availability read and the master schedule share ONE rule.
+ * Their `select`s differ (`status` on one, the venue join on the other) and a nominal type would
+ * have forced a second copy of the two-origin fallback — which is exactly where the copies drift.
  */
-function requesterNameOf(
-  req: AvailabilityRow['bookingRequest'],
-): string | null {
+function requesterNameOf(req: {
+  requesterName: string | null;
+  lineUser: {
+    registration: { firstName: string; lastName: string } | null;
+  } | null;
+}): string | null {
   const reg = req.lineUser?.registration;
   if (reg) return `${reg.firstName} ${reg.lastName}`.trim() || null;
   return req.requesterName ?? null;

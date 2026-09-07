@@ -111,6 +111,9 @@ type SlotWhere = {
   isCancelled?: boolean;
   bookingRequest?:
     { status: BookingStatus } | { status: { in: readonly BookingStatus[] } };
+  // P7b: the master schedule filters the VENUE's soft delete through the relation, because it is
+  // not scoped to a venue id the way every other read on this delegate is.
+  venue?: { deletedAt: null };
   OR?: { startAt: { lt: Date }; endAt: { gt: Date } }[];
   startAt?: { lt: Date };
   endAt?: { gt: Date };
@@ -830,6 +833,198 @@ describe('BookingsService', () => {
         service.listVenueAvailability(SUB, VENUE_ID, {}),
       ).rejects.toThrow(new ForbiddenException(BOOKING_NOT_ALLOWED));
       expect(venue.findFirst).not.toHaveBeenCalled();
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────────
+  // GET /line-users/schedule — Phase 7b, the org-wide master schedule behind `#/home`
+  // ────────────────────────────────────────────────────────────────────────────────
+
+  describe('getMasterSchedule', () => {
+    const START = new Date('2026-09-10T02:00:00.000Z');
+    const END = new Date('2026-09-10T05:00:00.000Z');
+
+    /** One APPROVED slot, as `SCHEDULE_INCLUDE` shapes it. `over` patches the PARENT request. */
+    const row = (over: Record<string, unknown> = {}) => ({
+      id: 'slot-1',
+      startAt: START,
+      endAt: END,
+      venue: {
+        id: VENUE_ID,
+        name: 'หอประชุมวารณ',
+        venueTypeId: 3,
+        venueType: { id: 3, name: 'หอประชุม' },
+      },
+      bookingRequest: {
+        purpose: 'ประชุมผู้ปกครองระดับชั้น ม.3',
+        lineUserId: 'somebody-else',
+        requesterName: null,
+        lineUser: { registration: { firstName: 'สมชาย', lastName: 'ใจดี' } },
+        ...over,
+      },
+    });
+
+    beforeEach(() => {
+      lineUser.findFirst.mockResolvedValue({
+        id: LINE_USER_ID,
+        access: AppAccess.ALLOWED,
+      });
+    });
+
+    it('flattens the venue onto each row and resolves the requester through the registration', async () => {
+      bookingSlot.findMany.mockResolvedValue([row()]);
+
+      const [slot] = await service.getMasterSchedule(SUB, {});
+
+      // The whole wire contract in one assertion — a key added to the DTO without a decision fails
+      // here rather than reaching `easybook-app`'s generated types unnoticed.
+      expect(slot).toEqual({
+        id: 'slot-1',
+        startAt: START,
+        endAt: END,
+        venueId: VENUE_ID,
+        venueName: 'หอประชุมวารณ',
+        venueTypeId: 3,
+        venueTypeName: 'หอประชุม',
+        purpose: 'ประชุมผู้ปกครองระดับชั้น ม.3',
+        requesterName: 'สมชาย ใจดี',
+        isMine: false,
+      });
+    });
+
+    it('names a staff-created booking from the override, and tolerates neither being set', async () => {
+      bookingSlot.findMany.mockResolvedValue([
+        row({
+          lineUserId: null,
+          lineUser: null,
+          requesterName: 'ฝ่ายกิจการนักเรียน',
+        }),
+        row({ lineUserId: null, lineUser: null, requesterName: null }),
+      ]);
+
+      const slots = await service.getMasterSchedule(SUB, {});
+
+      expect(slots[0].requesterName).toBe('ฝ่ายกิจการนักเรียน');
+      // An unnamed approved activity is an internal event, not a broken row (`D-C18`).
+      expect(slots[1].requesterName).toBeNull();
+    });
+
+    // ── isMine ────────────────────────────────────────────────────────────────────
+    // 🔴 THE COMPARISON IS AGAINST `LineUser.id` (the cuid), NOT against the `U…` sub the caller
+    // authenticated with. Getting it wrong type-checks and returns `false` forever, so both
+    // directions are asserted — a mapper hard-wired to `false` would pass the negative test alone.
+
+    it('marks the caller’s OWN activity isMine, comparing the LineUser.id cuid', async () => {
+      bookingSlot.findMany.mockResolvedValue([
+        row({ lineUserId: LINE_USER_ID }),
+      ]);
+
+      const [slot] = await service.getMasterSchedule(SUB, {});
+
+      expect(slot.isMine).toBe(true);
+    });
+
+    it('leaves isMine false for somebody else’s activity — and never matches on the raw sub', async () => {
+      bookingSlot.findMany.mockResolvedValue([
+        row({ lineUserId: 'another-line-user-cuid' }),
+        // The trap: a service that compared the verified `sub` against `bookingRequest.lineUserId`
+        // would light this row up. `lineUserId` on a BookingRequest is a cuid, never a `U…` string.
+        row({ lineUserId: SUB }),
+      ]);
+
+      const slots = await service.getMasterSchedule(SUB, {});
+
+      expect(slots.map((s) => s.isMine)).toEqual([false, false]);
+    });
+
+    // ── the where clause ──────────────────────────────────────────────────────────
+
+    it('🔴 asks ONLY for approved, non-cancelled slots on live venues, overlapping the window', async () => {
+      bookingSlot.findMany.mockResolvedValue([]);
+
+      await service.getMasterSchedule(SUB, {
+        from: '2026-09-01T00:00:00.000Z',
+        to: '2026-10-01T00:00:00.000Z',
+      });
+
+      const { where, orderBy } = bookingSlot.findMany.mock.calls[0][0];
+
+      // PENDING is excluded STRICTLY — this is the endpoint's contract, not a default. Note the
+      // shape: a bare status, never `{ in: [...] }`, so widening it is a visible edit here.
+      expect(where.bookingRequest).toEqual({ status: BookingStatus.APPROVED });
+      // A cancelled Wednesday is free again; the parent's status alone would still paint it.
+      expect(where.isCancelled).toBe(false);
+      // A retired room must not be advertised on the school's calendar.
+      expect(where.venue).toEqual({ deletedAt: null });
+      // OVERLAP, not containment — an activity that began before `from` still occupies day one.
+      expect(where.startAt).toEqual({
+        lt: new Date('2026-10-01T00:00:00.000Z'),
+      });
+      expect(where.endAt).toEqual({ gt: new Date('2026-09-01T00:00:00.000Z') });
+      // No venue scope at all: this read spans every room, which is what makes it "master".
+      expect(where.venueId).toBeUndefined();
+      expect(orderBy).toEqual([{ startAt: 'asc' }, { id: 'asc' }]);
+    });
+
+    it('defaults to the current Bangkok calendar month when from/to are omitted', async () => {
+      bookingSlot.findMany.mockResolvedValue([]);
+
+      await service.getMasterSchedule(SUB, {});
+
+      const { where } = bookingSlot.findMany.mock.calls[0][0];
+      const from = where.endAt?.gt as Date;
+      const to = where.startAt?.lt as Date;
+
+      const days = (to.getTime() - from.getTime()) / DAY;
+      expect(days).toBeGreaterThanOrEqual(28);
+      expect(days).toBeLessThanOrEqual(31);
+
+      // A calendar month starts on the 1st at 00:00 BANGKOK time, which is 17:00 UTC on the last day
+      // of the previous month. A UTC-midnight default would open `#/home` on the wrong page for the
+      // first seven hours of every 1st.
+      const offset = 420 * 60_000;
+      expect(new Date(from.getTime() + offset).getUTCDate()).toBe(1);
+      expect(new Date(from.getTime() + offset).getUTCHours()).toBe(0);
+      expect(new Date(to.getTime() + offset).getUTCDate()).toBe(1);
+    });
+
+    it('400s a reversed range and one wider than a year, before touching the database', async () => {
+      await expect(
+        service.getMasterSchedule(SUB, {
+          from: '2026-10-01T00:00:00.000Z',
+          to: '2026-09-01T00:00:00.000Z',
+        }),
+      ).rejects.toThrow(BadRequestException);
+
+      await expect(
+        service.getMasterSchedule(SUB, {
+          from: '2020-01-01T00:00:00.000Z',
+          to: '2030-01-01T00:00:00.000Z',
+        }),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(bookingSlot.findMany).not.toHaveBeenCalled();
+    });
+
+    it('403s a caller who is not ALLOWED, before the slot read', async () => {
+      lineUser.findFirst.mockResolvedValue({
+        id: LINE_USER_ID,
+        access: AppAccess.PENDING,
+      });
+
+      await expect(service.getMasterSchedule(SUB, {})).rejects.toThrow(
+        new ForbiddenException(BOOKING_NOT_ALLOWED),
+      );
+      expect(bookingSlot.findMany).not.toHaveBeenCalled();
+    });
+
+    it('403s an unknown or soft-deleted LINE user — same answer, no oracle', async () => {
+      lineUser.findFirst.mockResolvedValue(null);
+
+      await expect(service.getMasterSchedule(SUB, {})).rejects.toThrow(
+        new ForbiddenException(BOOKING_NOT_ALLOWED),
+      );
+      expect(bookingSlot.findMany).not.toHaveBeenCalled();
     });
   });
 
