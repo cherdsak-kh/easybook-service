@@ -45,6 +45,7 @@ npm run auth:hash-password -- 'pw'  # print an argon2id hash for a password (deb
 npm run options:seed              # seed baseline Department / PersonnelRole options (never writes isSystemReserved)
 npm run venue-types:seed          # seed the 5 starting VenueType categories + reserved tombstone row (idempotent)
 npm run venues:sweep-photos       # sweep orphan staged photos from venues/_new/ (--dry-run, --hours=N; default 24, min 1)
+npm run sanitize:thai-backfill    # re-run sanitizeThaiText over the 9 Thai text columns (--dry-run; skips unique-index collisions)
 ```
 
 Redis must be running for anything session-backed. A `Dockerfile` and a `docker-compose.staging.yml`
@@ -73,7 +74,12 @@ sides: `SystemUsersModule` needs the guards, and `AuthSystemController` needs `S
 (which owns every `SystemUser` write — `PATCH /auth/system/me` and the avatar's `profilePictureUrl`
 included). Re-providing `SystemUsersService` in `AuthModule` instead would mint a **second instance**
 and is exactly the drift `PUBLIC_FIELDS` exists to prevent. `StorageModule` is imported by `AuthModule`
-only.
+and `VenuesModule`, and it is also the **only** module that schedules anything: it holds the single
+`ScheduleModule.forRoot()` plus `OrphanPhotoSweeperCron` (daily 03:00 `venues/_new/` sweep), **both
+registered conditionally** — under jest (`NODE_ENV=test` / `JEST_WORKER_ID` set) neither is added to
+the module at all, because `test/e2e-app.ts` boots the real `AppModule` and a registered `CronJob` is
+an open handle in every e2e suite. Guarding inside the handler body is not equivalent and does not
+work; see the comments in `src/storage/storage.module.ts`.
 
 **API surface**: the global prefix is `API_BASE_PATH` (`src/common/api.constants.ts` = `/api/v1`).
 Controllers are mounted under that automatically via `main.ts`; don't hardcode `/api/v1` in

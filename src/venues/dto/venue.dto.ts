@@ -19,9 +19,20 @@ import { sanitizeThaiText } from '../../common/sanitize-thai.util';
 import { VENUE_PHOTOS_MAX } from '../venues.constants';
 
 /**
- * ⚠️ STILL HERE ON PURPOSE. `sanitizeThaiText` replaced it on the two `name` fields only; `q`,
- * `closedReason` and the photo `url` keep the plain trim. Rewriting a URL's characters would be a
- * bug, not a fix.
+ * ⚠️ STILL HERE ON PURPOSE, but for TWO fields now, not three — `closedReason` and the photo `url`.
+ *
+ * - **`url`**: rewriting a URL's characters would be a bug, not a fix. An object key is opaque
+ *   percent-encoded bytes; `sanitizeThaiText` folding a pair of them would produce a URL that
+ *   addresses nothing, and the failure would look like a missing photo.
+ * - **`closedReason`**: nothing ever MATCHES on it. It is displayed prose — never a search key,
+ *   never compared against a stored string — so the false "not found" that `sanitizeThaiText`
+ *   exists to prevent has no way to occur here. Untouched for now rather than untouchable:
+ *   sanitising it would be harmless, just not load-bearing, so it is not worth the churn.
+ *
+ * ⚠️ `q` LEFT THIS LIST. It is compared against `Venue.name`, which is WRITTEN through
+ * `sanitizeThaiText` — so a query normalised differently from the write path can never match a row
+ * that only ever existed in the normalised spelling, and the operator reads that as "the venue is
+ * gone". Query normalisation must equal write normalisation; see `ListVenuesQueryDto.q`.
  */
 const trim = ({ value }: { value: unknown }): unknown =>
   typeof value === 'string' ? value.trim() : value;
@@ -50,12 +61,30 @@ export type VenueStatus = (typeof VENUE_STATUSES)[number];
  * actually knows N.
  */
 export class ListVenuesQueryDto {
+  /**
+   * ⚠️ SANITISED WITH THE SAME FUNCTION THE WRITE PATH USES, and that symmetry IS the feature.
+   * `Venue.name` is stored through `sanitizeThaiText`, so a row typed as `ห้องเเดง` (SARA E twice)
+   * is stored as `ห้องแดง` (SARA AE). The two render identically, so an operator who searches by
+   * typing the name the same way they originally typed it would send the double-SARA-E spelling —
+   * which, under a plain `trim`, is a different string from every byte in the column and returns
+   * zero rows. The screen then says the venue does not exist while the venue is sitting in the list
+   * behind the filter.
+   *
+   * `sanitizeThaiText` can only SHORTEN or PRESERVE (see its header), so it cannot make a `q` that
+   * passed `@MaxLength(100)` newly overflow, and a non-string is returned untouched so `@IsString()`
+   * still produces the 400 rather than the transform coercing it.
+   *
+   * ⚠️ `location` IS NOT STORED SANITISED (it keeps `emptyToNull`'s plain trim), so the OR-branch on
+   * location only matches locations that were themselves typed correctly. That is a strict
+   * improvement over the previous state, not a regression: before this, a malformed `q` matched
+   * NEITHER column. Sanitising `location` on write is the follow-up, not a reason to leave `q` wrong.
+   */
   @ApiPropertyOptional({
     maxLength: 100,
     description:
-      'Case-insensitive substring match on the venue NAME or LOCATION. Trimmed; empty/absent → no search filter.',
+      'Case-insensitive substring match on the venue NAME or LOCATION. Normalised with the same Thai sanitiser the venue name is stored with (double SARA E → SARA AE, tone reordering, zero-widths stripped, trimmed), so a search matches what was written; empty/absent → no search filter.',
   })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @MaxLength(100)
   @IsOptional()
