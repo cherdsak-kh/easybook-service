@@ -19,7 +19,6 @@ import { LineService } from '../src/line/line.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import {
   RICH_MENU_LINK_BATCH_SIZE,
-  RICH_MENU_SHORTCUTS,
   RICH_MENU_SPECS,
 } from '../src/line/rich-menu.constants';
 
@@ -102,10 +101,11 @@ const menuType1: MenuDef = {
 // Re-measure this block whenever the artwork is replaced; the numbers are specific
 // to this image, not to the 2500x1686 format.
 //
-// Only the top card has a destination today. The other three are shortcuts to
-// pages that do not exist yet, so they postback and the webhook answers with
-// RICH_MENU_SHORTCUTS[...].pendingMessage. Swap a button to a `uri` action once
-// its page ships — see rich-menu.constants.ts.
+// All four cards link to real LIFF routes in Client Portal v2:
+// - Top card: เข้าสู่หน้าหลัก (LIFF_URI)
+// - Bottom-left: การจองของฉัน (LIFF_URI/bookings)
+// - Bottom-middle: แจ้งปัญหา (LIFF_URI/issues)
+// - Bottom-right: ตั้งค่า (LIFF_URI/settings)
 const menuType2: MenuDef = {
   key: 'type2',
   richMenuType: 'TYPE_2',
@@ -125,27 +125,27 @@ const menuType2: MenuDef = {
         // Bottom-left "การจองของฉัน" (blue).
         bounds: { x: 41, y: 951, width: 797, height: 680 },
         action: {
-          type: 'postback',
-          label: RICH_MENU_SHORTCUTS.myBookings.label,
-          data: RICH_MENU_SHORTCUTS.myBookings.data,
+          type: 'uri',
+          label: 'การจองของฉัน',
+          uri: `${LIFF_URI}/bookings`,
         },
       },
       {
         // Bottom-middle "แจ้งปัญหา" (orange).
         bounds: { x: 887, y: 953, width: 756, height: 675 },
         action: {
-          type: 'postback',
-          label: RICH_MENU_SHORTCUTS.reportIssue.label,
-          data: RICH_MENU_SHORTCUTS.reportIssue.data,
+          type: 'uri',
+          label: 'แจ้งปัญหา',
+          uri: `${LIFF_URI}/issues`,
         },
       },
       {
         // Bottom-right "ตั้งค่า" (green).
         bounds: { x: 1686, y: 955, width: 774, height: 676 },
         action: {
-          type: 'postback',
-          label: RICH_MENU_SHORTCUTS.settings.label,
-          data: RICH_MENU_SHORTCUTS.settings.data,
+          type: 'uri',
+          label: 'ตั้งค่า',
+          uri: `${LIFF_URI}/settings`,
         },
       },
     ],
