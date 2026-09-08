@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import { AppAccess, BookingStatus, Prisma, SystemRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import type { RealtimeActor } from '../realtime/realtime.constants';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { isCodeCollision, nextBookingCode } from './booking-code';
@@ -156,6 +157,7 @@ export class AdminBookingsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtime: RealtimeGateway,
+    private readonly clientRealtime: ClientRealtimeGateway,
   ) {}
 
   /**
@@ -667,6 +669,11 @@ export class AdminBookingsService {
    * The realtime fan-out, delegated to {@link publishBookingRequests} so the LIFF service and this
    * one can never build a different payload for the same row.
    *
+   * ⚠️ ONE CALL, TWO AUDIENCES since `CLIENT-REALTIME-1`: the helper announces the admin queue row on
+   * `/admin` and the end-user's own settled outcome on `/client`. There is deliberately no way to
+   * reach only one of them from here — an approval that moved a card on the operator's screen but
+   * not on the requester's is the exact half-delivery this single dispatcher prevents.
+   *
    * 🔴 IT PASSES `this.prisma`, NOT A TRANSACTION CLIENT, AND IT CANNOT DO OTHERWISE — the helper's
    * parameter type refuses one. That is the compile-time form of "emit after the commit".
    *
@@ -679,7 +686,14 @@ export class AdminBookingsService {
     ids: readonly string[],
     actor: Actor,
   ): Promise<void> {
-    return publishBookingRequests(this.prisma, this.realtime, kind, ids, actor);
+    return publishBookingRequests(
+      this.prisma,
+      this.realtime,
+      this.clientRealtime,
+      kind,
+      ids,
+      actor,
+    );
   }
 
   /**

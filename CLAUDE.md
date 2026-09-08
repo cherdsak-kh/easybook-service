@@ -59,11 +59,55 @@ Redis yourself. See the DOCKER-1 backlog item.
 `PrismaModule` (global) → `RedisModule` (global) → `CsrfModule` (global) → `ThrottlerModule`
 (registered `global: true` so `LoginThrottleGuard` can resolve it) → `HealthModule` →
 `RealtimeModule` → `LineModule` → `AuthModule` → `SystemUsersModule` → `OptionsModule`.
-`RealtimeModule` (`src/realtime/`) hosts the Socket.IO gateway on the **`/admin` namespace**,
-server→client only (zero `@SubscribeMessage`): `lineUser.created` / `.updated` / `.deleted`, plus
-`session.closed`. Its handshake reuses the express session (`SessionIoAdapter`, installed in
-`configureApp`) and namespace membership *is* the `SUPER_ADMIN|ADMIN` boundary — there are no rooms.
-`LineModule` imports it so `LineUserService` emits through the gateway directly.
+`RealtimeModule` (`src/realtime/`) hosts **two** Socket.IO namespaces that share the transport and
+nothing else. Only the names in `REALTIME_NAMESPACE_ALLOWLIST` are served — including socket.io's
+unconditionally-created default `/`, which is refused there; adding a `@WebSocketGateway` is *not*
+enough to make a namespace reachable, and that trip-wire is deliberate.
+- **`/admin`** (`RealtimeGateway`) — server→client only (**zero `@SubscribeMessage`**):
+  `lineUser.created` / `.updated` / `.deleted`, `bookingRequest.created` / `.updated`, plus
+  `session.closed`. Its handshake reuses the express session (`SessionIoAdapter`, installed in
+  `configureApp`) and namespace membership *is* the `SUPER_ADMIN|ADMIN` boundary — there are no rooms.
+- **`/client`** (`ClientRealtimeGateway`, `CLIENT-REALTIME-1`) — the LIFF end-user side, which inverts
+  every one of those choices on purpose. A LINE end-user has no session and no cookie, so the
+  handshake verifies a **LINE ID token** through the *same* `verifyLineIdToken` the REST guard uses
+  (never a second copy of the `aud`/`iss`/`exp` checks), resolves the `sub` to a non-soft-deleted
+  `LineUser` and requires `access === ALLOWED`. Refusals are the same two status classes as `/admin`,
+  never diagnostics; a LINE **verify outage is `UNAUTHENTICATED` too**, because REST may answer a
+  retryable 502 but a socket that cannot prove whose it is must not be held open.
+  - **Rooms carry the authorization here, because the namespace cannot**: membership means only "an
+    `ALLOWED` LINE user", i.e. nearly everybody. Every emit is targeted at `user:<cuid>`
+    (⚠️ the **cuid** `LineUser.id` — what `BookingRequest.lineUserId` holds, *not* the `U…` sub;
+    keying it wrong is a room nobody is in and an event that silently vanishes), `venue:<venueId>`,
+    or the one shared `schedule:all`. There is deliberately **no method that emits namespace-wide**.
+  - **Three events, and `D-C13` is which room each goes to:** `client.bookingUpdated`
+    (`{ id, code, status, rejectReason }` → the owner's room *only*: a code and a reject reason are
+    one person's business), `client.venueAvailabilityChanged` (`{ venueId }` **and nothing else** →
+    that venue's watchers, so it says availability moved and never whose), and
+    `client.scheduleUpdated` (**payload-free** → `schedule:all`). 🔴 `emitSchedulePulse()` takes no
+    argument and must never grow one — that room holds every connected end-user, so anything it
+    carries is published to all of them.
+  - **It accepts inbound messages, the first in the codebase**: `venue:watch` / `venue:unwatch`, which
+    change room membership and nothing else (hand-validated, capped by `CLIENT_MAX_ROOMS_PER_SOCKET`).
+    No booking is created, cancelled or approved over a socket — every write goes through REST so it
+    can answer with a status code and a reason.
+
+**What reaches `/client` is decided by STATUS, never by `kind`** (`src/bookings/booking-realtime.ts`),
+through **two separate lists** — the split is structural because one of them is a privacy boundary.
+`CLIENT_ANNOUNCED_STATUSES` (owner + venue rooms) includes **`PENDING`**, and must, because
+`OCCUPYING_STATUSES` does: a pending request occupies the venue calendar the moment it lands, so a
+competing user on `#/venue/:id` has to watch the hour go amber or they will submit for the same slot —
+the occupancy rule and the fan-out rule have to agree. `SCHEDULE_PULSE_STATUSES` is `APPROVED` /
+`CANCELLED` **only**: `#/home` shows approved activities, so pulsing `schedule:all` for a pending
+submission would both leak that an unapproved request exists and make every open client refetch a view
+that cannot have changed. Both LIFF cancellations (`cancelPendingBooking`, `cancelApprovedSlot`)
+publish through the same dispatcher, so a user freeing a slot moves the admin queue *and* every
+competing calendar.
+
+Both gateways are **fail-soft and emit only after the commit**: `publishBookingRequests` takes
+`PrismaService` — a `Prisma.TransactionClient` is not assignable to it, which is the compile-time form
+of that rule — each namespace gets its own `try/catch` so one dead transport cannot cost the other its
+event, and a fan-out failure is a `warn` carrying ids only, never a failed HTTP write.
+`LineModule` imports `RealtimeModule` so `LineUserService` emits through the gateway directly.
 `OptionsModule` (`src/options/`) exposes the admin-curated `Department` / `PersonnelRole` option
 tables via `DepartmentsController` / `PersonnelRolesController` — the same tables `SystemUser` and
 LINE registrations reference (see the `isSystemReserved` note below). Booking/Resource domain

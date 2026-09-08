@@ -8,6 +8,8 @@ import {
 import { Test, TestingModule } from '@nestjs/testing';
 import { AppAccess, BookingStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
+import { CLIENT_REALTIME_EVENTS } from '../realtime/realtime.constants';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { BookingsService } from './bookings.service';
 import {
@@ -198,6 +200,13 @@ describe('BookingsService', () => {
     emitBookingRequestUpdated: jest.fn(),
   };
 
+  /** The `/client` half of the fan-out (`CLIENT-REALTIME-1`). Mocked for the same reason. */
+  const clientRealtime = {
+    emitToUser: jest.fn(),
+    emitToVenue: jest.fn(),
+    emitSchedulePulse: jest.fn(),
+  };
+
   /** The happy path's collaborators, so each test overrides only the one it is about. */
   const allowAndOpen = () => {
     lineUser.findFirst.mockResolvedValue({
@@ -250,6 +259,7 @@ describe('BookingsService', () => {
           },
         },
         { provide: RealtimeGateway, useValue: realtime },
+        { provide: ClientRealtimeGateway, useValue: clientRealtime },
       ],
     }).compile();
     service = module.get(BookingsService);
@@ -1081,6 +1091,60 @@ describe('BookingsService', () => {
     );
   };
 
+  /**
+   * The two rows `publishBookingRequests` re-reads AFTER the commit: `readBookingListDtos`' queue
+   * shape for `/admin` first, then `CLIENT_FANOUT_SELECT`'s six scalars for `/client`.
+   *
+   * ⚠️ QUEUED POSITIONALLY, because one `bookingRequest.findMany` mock serves both reads. Two
+   * `mockResolvedValueOnce`s, in the order the dispatcher issues them — the `beforeEach` default of
+   * `[]` is what every other test keeps.
+   */
+  const answerFanoutReads = (status: BookingStatus): void => {
+    bookingRequest.findMany
+      .mockResolvedValueOnce([
+        {
+          id: BOOKING_ID,
+          code: CODE,
+          status,
+          createdById: null,
+          purpose: 'ประชุมเตรียมงานกีฬาสี',
+          attendees: 10,
+          firstStartAt: new Date(Date.now() + DAY),
+          lastEndAt: new Date(Date.now() + DAY + HOUR),
+          rejectReason: null,
+          createdAt: new Date(),
+          requesterName: null,
+          contactPhone: null,
+          department: null,
+          lineUser: null,
+          venue: { id: VENUE_ID, name: 'ห้องประชุมใหญ่', location: null },
+          slots: [],
+        },
+      ])
+      .mockResolvedValueOnce([
+        {
+          id: BOOKING_ID,
+          code: CODE,
+          status,
+          rejectReason: null,
+          // 🔴 The cuid `LineUser.id`, which is what `user:<…>` rooms are keyed on.
+          lineUserId: LINE_USER_ID,
+          venueId: VENUE_ID,
+        },
+      ]);
+  };
+
+  /**
+   * The batch re-read the fan-out issues — the observable proof of which ids were published.
+   *
+   * ⚠️ The cast is to the MOCK's declared argument type, not to Prisma's: `expect.objectContaining`
+   * is `any`, and this file's lint rules refuse to return one. It is a matcher, never a value.
+   */
+  const publishedIds = () =>
+    expect.objectContaining({
+      where: { id: { in: [BOOKING_ID] } },
+    }) as BookingListArgs;
+
   const query = (
     over: Partial<ListLineBookingsQueryDto> = {},
   ): ListLineBookingsQueryDto => ({ sort: BOOKING_SORT_DEFAULT, ...over });
@@ -1355,6 +1419,94 @@ describe('BookingsService', () => {
 
       expect(bookingRequest.update).not.toHaveBeenCalled();
     });
+
+    /**
+     * 🔴 A WITHDRAWAL USED TO MOVE NOBODY'S SCREEN. A pending request OCCUPIES the venue's calendar
+     * (`OCCUPYING_STATUSES`), so withdrawing it frees an hour other people are looking at and drops a
+     * row out of the approval queue an operator has open. Both audiences hear it, from the one
+     * dispatcher, with THIS booking's id.
+     */
+    it('publishes the cancellation to both namespaces, with the affected booking id', async () => {
+      answerFindFirst(
+        { id: BOOKING_ID, status: BookingStatus.PENDING },
+        detailRow({ status: BookingStatus.CANCELLED }),
+      );
+      answerFanoutReads(BookingStatus.CANCELLED);
+
+      await service.cancelPendingBooking(SUB, CODE);
+
+      // The batch re-read names the ids that were published — one per namespace, never one per id.
+      expect(bookingRequest.findMany).toHaveBeenCalledTimes(2);
+      expect(bookingRequest.findMany).toHaveBeenNthCalledWith(
+        1,
+        publishedIds(),
+      );
+      expect(bookingRequest.findMany).toHaveBeenNthCalledWith(
+        2,
+        publishedIds(),
+      );
+
+      // `actor: null` — a LINE user withdrew their own request; nobody on staff operated.
+      expect(realtime.emitBookingRequestUpdated).toHaveBeenCalledWith(
+        expect.objectContaining({ id: BOOKING_ID }),
+        null,
+      );
+      expect(clientRealtime.emitToUser).toHaveBeenCalledWith(
+        LINE_USER_ID,
+        CLIENT_REALTIME_EVENTS.bookingUpdated,
+        expect.objectContaining({
+          id: BOOKING_ID,
+          status: BookingStatus.CANCELLED,
+        }),
+      );
+      expect(clientRealtime.emitToVenue).toHaveBeenCalledWith(
+        VENUE_ID,
+        CLIENT_REALTIME_EVENTS.venueAvailabilityChanged,
+        { venueId: VENUE_ID },
+      );
+      // CANCELLED removes a block from the org-wide day view, so this one DOES pulse.
+      expect(clientRealtime.emitSchedulePulse).toHaveBeenCalledTimes(1);
+    });
+
+    /** Emitted AFTER the commit — the write is durable before any screen is told about it. */
+    it('publishes only once the transaction has committed', async () => {
+      answerFindFirst({ id: BOOKING_ID, status: BookingStatus.PENDING });
+      answerFanoutReads(BookingStatus.CANCELLED);
+
+      await service.cancelPendingBooking(SUB, CODE);
+
+      expect(
+        realtime.emitBookingRequestUpdated.mock.invocationCallOrder[0],
+      ).toBeGreaterThan(bookingSlot.updateMany.mock.invocationCallOrder[0]);
+    });
+
+    /** Fail-soft: the row is already CANCELLED in the database, so a dead socket is not a 500. */
+    it('still returns the booking when the transport throws', async () => {
+      answerFindFirst(
+        { id: BOOKING_ID, status: BookingStatus.PENDING },
+        detailRow({ status: BookingStatus.CANCELLED }),
+      );
+      answerFanoutReads(BookingStatus.CANCELLED);
+      realtime.emitBookingRequestUpdated.mockImplementationOnce(() => {
+        throw new Error('transport down');
+      });
+
+      await expect(
+        service.cancelPendingBooking(SUB, CODE),
+      ).resolves.toBeDefined();
+    });
+
+    /** Nothing was written, so nothing may be announced — a refused cancel is not an event. */
+    it('publishes nothing when the state check refuses the cancellation', async () => {
+      answerFindFirst({ id: BOOKING_ID, status: BookingStatus.APPROVED });
+
+      await expect(service.cancelPendingBooking(SUB, CODE)).rejects.toThrow(
+        new UnprocessableEntityException(BOOKING_NOT_PENDING),
+      );
+      expect(bookingRequest.findMany).not.toHaveBeenCalled();
+      expect(realtime.emitBookingRequestUpdated).not.toHaveBeenCalled();
+      expect(clientRealtime.emitToVenue).not.toHaveBeenCalled();
+    });
   });
 
   describe('cancelApprovedSlot', () => {
@@ -1508,6 +1660,62 @@ describe('BookingsService', () => {
         service.cancelApprovedSlot(SUB, CODE, SLOT_ID),
       ).rejects.toThrow(new NotFoundException(BOOKING_NOT_FOUND));
       expect(bookingSlot.findFirst).not.toHaveBeenCalled();
+    });
+
+    /**
+     * 🔴 THE MOST VISIBLE CALENDAR WRITE A LINE USER CAN MAKE, and until now it moved nobody's
+     * screen. The freed hour is green again on the next read, so everyone watching that venue must
+     * be told to take one — and the queue row an operator has open changed too.
+     */
+    it('publishes the freed slot to both namespaces, with the affected booking id', async () => {
+      approvedWithSlot(3 * DAY);
+      bookingSlot.findMany.mockResolvedValue([
+        { startAt: inDays(5), endAt: inDays(5.1) },
+      ]);
+      answerFanoutReads(BookingStatus.APPROVED);
+
+      await service.cancelApprovedSlot(SUB, BOOKING_ID, SLOT_ID);
+
+      expect(bookingRequest.findMany).toHaveBeenCalledTimes(2);
+      expect(bookingRequest.findMany).toHaveBeenNthCalledWith(
+        1,
+        publishedIds(),
+      );
+      expect(realtime.emitBookingRequestUpdated).toHaveBeenCalledWith(
+        expect.objectContaining({ id: BOOKING_ID }),
+        null,
+      );
+      expect(clientRealtime.emitToVenue).toHaveBeenCalledWith(
+        VENUE_ID,
+        CLIENT_REALTIME_EVENTS.venueAvailabilityChanged,
+        { venueId: VENUE_ID },
+      );
+      // The request is still APPROVED and still occupies the org-wide view, one day lighter.
+      expect(clientRealtime.emitSchedulePulse).toHaveBeenCalledTimes(1);
+    });
+
+    /** Emitted AFTER the commit, never from inside it — the same rule the admin side follows. */
+    it('publishes only once the slot write has committed', async () => {
+      approvedWithSlot(3 * DAY);
+      answerFanoutReads(BookingStatus.CANCELLED);
+
+      await service.cancelApprovedSlot(SUB, BOOKING_ID, SLOT_ID);
+
+      expect(
+        realtime.emitBookingRequestUpdated.mock.invocationCallOrder[0],
+      ).toBeGreaterThan(bookingRequest.update.mock.invocationCallOrder[0]);
+    });
+
+    /** A refused cancellation wrote nothing, so it announces nothing. */
+    it('publishes nothing when the slot is inside the lead time', async () => {
+      approvedWithSlot(29 * 60_000);
+
+      await expect(
+        service.cancelApprovedSlot(SUB, CODE, SLOT_ID),
+      ).rejects.toThrow(new UnprocessableEntityException(SLOT_CANCEL_TOO_LATE));
+      expect(bookingRequest.findMany).not.toHaveBeenCalled();
+      expect(realtime.emitBookingRequestUpdated).not.toHaveBeenCalled();
+      expect(clientRealtime.emitToVenue).not.toHaveBeenCalled();
     });
   });
 });

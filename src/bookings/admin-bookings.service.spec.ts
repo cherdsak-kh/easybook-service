@@ -6,6 +6,7 @@ import {
 import { Test, TestingModule } from '@nestjs/testing';
 import { AppAccess, BookingStatus, SystemRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { AdminBookingsService } from './admin-bookings.service';
 import {
@@ -106,6 +107,13 @@ describe('AdminBookingsService', () => {
     emitBookingRequestUpdated: jest.fn(),
   };
 
+  /** The `/client` half of the fan-out (`CLIENT-REALTIME-1`). Mocked for the same reason. */
+  const clientRealtime = {
+    emitToUser: jest.fn(),
+    emitToVenue: jest.fn(),
+    emitSchedulePulse: jest.fn(),
+  };
+
   const tx = {
     bookingRequest,
     bookingSlot,
@@ -182,6 +190,7 @@ describe('AdminBookingsService', () => {
           },
         },
         { provide: RealtimeGateway, useValue: realtime },
+        { provide: ClientRealtimeGateway, useValue: clientRealtime },
       ],
     }).compile();
     service = module.get(AdminBookingsService);
@@ -1527,9 +1536,15 @@ describe('AdminBookingsService', () => {
       bookingRequest.create.mockResolvedValue({ id: BOOKING_ID });
       bookingRequest.updateMany.mockResolvedValue({ count: 1 });
       bookingRequest.findUnique.mockResolvedValue(detailRow());
+      // ⚠️ THE QUEUE IS POSITIONAL, so every read `publish()` performs has to appear here in order.
+      // Since CLIENT-REALTIME-1 each `publish()` makes TWO reads — the `/admin` queue-row re-read
+      // and the narrow `/client` one — so the third entry is the `created` publish's client read.
+      // It is `[]` because what this test measures is the `/admin` kinds; the `/client` fan-out has
+      // its own coverage in `booking-realtime.spec.ts`.
       bookingRequest.findMany
         .mockResolvedValueOnce([loser(LOSER_ID, 'BR-25690903-009')])
         .mockResolvedValueOnce([detailRow({ id: BOOKING_ID })])
+        .mockResolvedValueOnce([])
         .mockResolvedValueOnce([
           detailRow({ id: LOSER_ID, status: BookingStatus.REJECTED }),
         ]);

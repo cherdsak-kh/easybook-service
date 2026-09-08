@@ -10,6 +10,7 @@ import {
 } from '@nestjs/common';
 import { AppAccess, BookingStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { TOMBSTONE_VENUE_TYPE_NAME } from '../venue-types/venue-types.constants';
 import { isCodeCollision, nextBookingCode } from './booking-code';
@@ -252,6 +253,7 @@ export class BookingsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly realtime: RealtimeGateway,
+    private readonly clientRealtime: ClientRealtimeGateway,
   ) {}
 
   /**
@@ -279,15 +281,19 @@ export class BookingsService {
 
     const row = await this.insertWithCode(venue.id, requester.id, dto, slots);
 
-    // 🔴 THE ONLY REALTIME EMIT ON THE LIFF SIDE (`ADMIN-REALTIME-BOOKINGS-1`), and it goes to the
-    // ADMIN namespace: a new request has just landed in the approval queue somebody is watching.
-    // `actor` is `null` because nobody on staff did this — a LINE user submitted it, which is exactly
-    // the case `RealtimeActor | null` exists for. After the insert transaction has committed, and
-    // fail-soft inside, so a socket problem can never fail a booking the database already accepted.
-    // ⛔ Nothing here reaches a `/client` namespace: that is `CLIENT-REALTIME-1`'s job (P7c).
+    // 🔴 THE FAN-OUT (`ADMIN-REALTIME-BOOKINGS-1`): a new request has just landed in the approval
+    // queue somebody is watching. `actor` is `null` because nobody on staff did this — a LINE user
+    // submitted it, which is exactly the case `RealtimeActor | null` exists for. After the insert
+    // transaction has committed, and fail-soft inside, so a socket problem can never fail a booking
+    // the database already accepted.
+    // ⚠️ THE `/client` HALF FIRES TOO, and it must: the row is born `PENDING`, `PENDING` is in
+    // `OCCUPYING_STATUSES`, so this submission has just taken an hour off `#/venue/:id` for everybody
+    // else looking at it. `venue:<id>` hears about it; `schedule:all` deliberately does NOT (see
+    // `booking-realtime.ts` — `#/home` is approved-only).
     await publishBookingRequests(
       this.prisma,
       this.realtime,
+      this.clientRealtime,
       'created',
       [row.id],
       null,
@@ -474,6 +480,19 @@ export class BookingsService {
       return booking.id;
     });
 
+    // 🔴 THE WITHDRAWAL IS A FAN-OUT TOO. A pending request OCCUPIES the venue's calendar
+    // (`OCCUPYING_STATUSES`), so withdrawing it frees an hour that other people are looking at, and
+    // it moves a row that an operator has open in the approval queue. Same shape as `createFromLine`:
+    // after the commit, `actor: null` (a LINE user did this, nobody on staff), fail-soft inside, and
+    // awaited so the event is on the transport before the HTTP response leaves.
+    await publishBookingRequests(
+      this.prisma,
+      this.realtime,
+      this.clientRealtime,
+      'updated',
+      [id],
+      null,
+    );
     return this.readDetail({ id });
   }
 
@@ -571,6 +590,20 @@ export class BookingsService {
       return booking.id;
     });
 
+    // 🔴 FREEING ONE DAY IS THE MOST VISIBLE CALENDAR WRITE A LINE USER CAN MAKE — the hour goes
+    // green again on `#/venue/:id` with no job and no cache to invalidate, and everybody watching
+    // that venue should see it now rather than on their next refetch. When the LAST live slot went,
+    // the transaction above also flipped the request to `CANCELLED`, and the fan-out reads the
+    // settled row back, so `schedule:all` gets its pulse from the status rather than from a flag
+    // passed in here.
+    await publishBookingRequests(
+      this.prisma,
+      this.realtime,
+      this.clientRealtime,
+      'updated',
+      [id],
+      null,
+    );
     return this.readDetail({ id });
   }
 
