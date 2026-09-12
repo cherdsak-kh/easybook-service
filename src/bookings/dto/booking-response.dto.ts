@@ -9,9 +9,9 @@ import {
 /**
  * One span of a request, as echoed back to its own requester.
  *
- * ⚠️ THIS IS THE OWNER'S VIEW and carries no privacy rule — the caller is looking at their own
- * booking. {@link VenueAvailabilitySlotDto} is the OTHER view of the same table and is where
- * `D-C13`'s privacy clause bites.
+ * ⚠️ THIS IS THE OWNER'S VIEW — the caller is looking at their own booking.
+ * {@link VenueAvailabilitySlotDto} is the OTHER view of the same table, and is where `D-C13`'s
+ * privacy clause used to bite before `#ISSUE-01` retired it.
  */
 export class BookingSlotResponseDto {
   @ApiProperty()
@@ -342,24 +342,32 @@ export class BookingRequestResponseDto {
 }
 
 /**
- * ── 🔴 THE PRIVACY BOUNDARY OF THE WHOLE BOOKING DOMAIN ──
  * One occupied span on a venue's calendar, as seen by SOMEBODY ELSE.
  *
- * `D-C13`'s last clause: *an unapproved request never reveals who requested it or what for*. This
- * DTO is where that is enforced, and it is enforced by the SERVER omitting the strings — not by a
- * client choosing not to render them, which is not a privacy boundary
- * ([`TRANSPORT.md`](TRANSPORT.md) §2.3).
- *
- * Three cases, and the third is why `purpose` is not simply "null when pending":
+ * ── 🔴 THIS DTO USED TO BE THE PRIVACY BOUNDARY OF THE BOOKING DOMAIN. IT NO LONGER IS ──
+ * `D-C13`'s last clause — *an unapproved request never reveals who requested it or what for* — was
+ * enforced here by the server blanking both strings on somebody else's PENDING row. **Removed
+ * 12 ก.ย. 2569 by PO ruling (`#ISSUE-01`).** All four cases now carry both fields:
  *
  * | Slot | `purpose` | `requesterName` |
  * |---|---|---|
  * | `APPROVED`, someone else's | ✅ shown | ✅ shown |
- * | `PENDING`, someone else's | ❌ `null` | ❌ `null` |
+ * | `PENDING`, someone else's | ✅ shown *(was `null`)* | ✅ shown *(was `null`)* |
  * | Either, **the caller's own** | ✅ shown | ✅ shown |
  *
- * ⚠️ `D-C18` extends this to origin: a STAFF-created booking renders as any other taken slot. The
- * privacy rule is about the VIEWER, not about who wrote the row.
+ * The client portal's prototype — the design authority for that surface — prints the requester and
+ * the purpose on every row it draws, pending ones included, and appends `(ขอใช้ซ้อนได้)` to say the
+ * hour is not actually held (3933–3943). The redaction made `SlotList` render an empty heading and
+ * no name, which reads as a broken card rather than as a rule, and it withheld exactly the fact
+ * `D-C13` rule 1 needs the next requester to have: you may ask for this hour, and here is who else
+ * already has.
+ *
+ * ⚠️ BOTH FIELDS STAY NULLABLE, and the reason is now only `D-C18`: a staff-created booking with no
+ * LINE requester and no manual override genuinely has no name. Do not narrow them to `string`.
+ *
+ * ⚠️ IF A PRIVACY RULE COMES BACK, IT COMES BACK **HERE**, in the server's mapper — not in the
+ * client. A client that chooses not to render a field is not a boundary, because the payload is
+ * still on the wire ([`TRANSPORT.md`](TRANSPORT.md) §2.3). That part of the reasoning stands.
  */
 export class VenueAvailabilitySlotDto {
   @ApiProperty()
@@ -388,7 +396,7 @@ export class VenueAvailabilitySlotDto {
 
   @ApiProperty({
     description:
-      'True when this slot belongs to the calling LINE user’s own request. Drives the `คุณ` badge, and unlocks `purpose`/`requesterName` on the caller’s own pending rows.',
+      'True when this slot belongs to the calling LINE user’s own request. Drives the `คุณ` badge.',
   })
   isMine!: boolean;
 
@@ -396,7 +404,7 @@ export class VenueAvailabilitySlotDto {
     type: String,
     nullable: true,
     description:
-      '🔴 `null` on somebody else’s PENDING request (`D-C13`). Non-null on an approved slot and on the caller’s own.',
+      'The requester’s stated purpose, sent for every slot regardless of status or owner (`#ISSUE-01`). Nullable only because the column is.',
   })
   purpose!: string | null;
 
@@ -404,7 +412,7 @@ export class VenueAvailabilitySlotDto {
     type: String,
     nullable: true,
     description:
-      '🔴 `null` on somebody else’s PENDING request (`D-C13`). Also `null` on a staff-created booking with no LINE requester and no manual override — an unnamed approved slot is normal, not an error.',
+      'The requester’s name, sent for every slot regardless of status or owner (`#ISSUE-01`). `null` on a staff-created booking with no LINE requester and no manual override — an unnamed slot is normal, not an error (`D-C18`).',
   })
   requesterName!: string | null;
 }

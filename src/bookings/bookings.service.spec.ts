@@ -726,18 +726,22 @@ describe('BookingsService', () => {
       });
     });
 
-    it('🔴 D-C13 — blanks purpose and requester on somebody else’s PENDING slot', async () => {
+    it('🔴 #ISSUE-01 — reveals purpose and requester on somebody else’s PENDING slot', async () => {
       bookingSlot.findMany.mockResolvedValue([
         row({ status: BookingStatus.PENDING }),
       ]);
 
       const [slot] = await service.listVenueAvailability(SUB, VENUE_ID, {});
 
-      // The slot is still returned — the calendar must show that somebody has asked (amber). What
-      // it must not carry is who, or what for, and the SERVER is what omits them.
+      // The slot is returned amber — somebody has asked, and nothing is holding the hour. It now
+      // carries WHO and WHAT FOR as well, which is the `D-C13` redaction the PO retired on
+      // 12 ก.ย. 2569 so the live screen matches the prototype it was drawn from. This assertion is
+      // the tripwire: if the branch is ever reinstated in `toAvailabilityDto`, it fails here rather
+      // than silently blanking a card in production.
       expect(slot.status).toBe(BookingStatus.PENDING);
-      expect(slot.purpose).toBeNull();
-      expect(slot.requesterName).toBeNull();
+      expect(slot.isMine).toBe(false);
+      expect(slot.purpose).toBe('อบรมครู');
+      expect(slot.requesterName).toBe('สมชาย ใจดี');
     });
 
     it('reveals the caller’s OWN pending request to the caller', async () => {

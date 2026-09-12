@@ -101,9 +101,9 @@ type AvailabilityRow = Prisma.BookingSlotGetPayload<{
  * this second shape exists.
  *
  * ⚠️ `status` IS NOT SELECTED, and its absence is load-bearing rather than an economy: the `where`
- * pins it to `APPROVED`, and a selected status would invite the same `mayReveal` branch the
- * availability mapper needs — a branch that has nothing to decide here and would be one edit away
- * from admitting PENDING rows to a screen `D-C13` keeps them off.
+ * pins it to `APPROVED`, and a selected status here would be one edit away from admitting PENDING
+ * rows to a screen `D-C13` keeps them off. That rule is untouched by `#ISSUE-01`, which widened what
+ * the *venue availability* read reveals about a pending row — not which rows reach `#/home`.
  *
  * ⚠️ NO `deletedAt` FILTER ON THE NESTED REGISTRATION, the same read/write asymmetry the availability
  * include documents: a LINE user who has since unfollowed must still resolve as the requester of an
@@ -959,18 +959,32 @@ function toDetailDto(
 }
 
 /**
- * 🔴 WHERE `D-C13`'s PRIVACY CLAUSE IS ACTUALLY ENFORCED. Both strings are omitted by the SERVER on
- * somebody else's unapproved request — a client that chose not to render them would not be a privacy
- * boundary, because the payload would still be on the wire.
+ * One occupied span on a venue's calendar, as everyone else sees it.
+ *
+ * 🔴 `D-C13`'s REDACTION BRANCH WAS REMOVED ON 12 ก.ย. 2569 (`#ISSUE-01`), BY PO RULING, AND THIS
+ * IS THE ONE PLACE THAT DECISION LIVES. Both strings used to be blanked on somebody else's PENDING
+ * request — `mayReveal = isApproved || isMine`. The prototype, which is the design authority for
+ * the client portal, prints them for **every** row it draws
+ * (`client_portal_prototype.html` 3933–3943: *"อบรมเชิงปฏิบัติการ — ประเสริฐ สุขใจ (ขอใช้ซ้อนได้)"*),
+ * so the server and the drawing disagreed and the server won by default: `SlotList` rendered an
+ * empty `<h3>` and no requester line, which reads as a half-loaded card rather than as a rule.
+ *
+ * ⚠️ WHAT THIS ACTUALLY WIDENS, STATED PLAINLY. Every `ALLOWED` LINE user can now read the purpose
+ * and the requester's full name of every pending request on any venue they open — not just approved
+ * ones. That is a real disclosure, not a rendering detail, and it is why the branch was here. It is
+ * deliberate: the PO's position is that an overlapping request is a fact the next requester needs in
+ * order to decide (`D-C13` rule 1 — *you may ask for an hour somebody else has asked for*), and a
+ * nameless amber band tells them they are competing without telling them with whom or for what.
+ *
+ * ⚠️ THE SHAPE DID NOT CHANGE — both fields stay nullable, because `requesterNameOf` still answers
+ * `null` for a staff-created booking with no override (`D-C18`). A client that was already handling
+ * `null` keeps working; it simply stops seeing `null` for the privacy reason.
  */
 function toAvailabilityDto(
   row: AvailabilityRow,
   callerLineUserId: string,
 ): VenueAvailabilitySlotDto {
   const req = row.bookingRequest;
-  const isMine = req.lineUserId === callerLineUserId;
-  const isApproved = req.status === BookingStatus.APPROVED;
-  const mayReveal = isApproved || isMine;
 
   return {
     id: row.id,
@@ -978,9 +992,9 @@ function toAvailabilityDto(
     endAt: row.endAt,
     // The `where` above admits only these two, so the cast records a filter rather than widening one.
     status: req.status as typeof BookingStatus.APPROVED,
-    isMine,
-    purpose: mayReveal ? req.purpose : null,
-    requesterName: mayReveal ? requesterNameOf(req) : null,
+    isMine: req.lineUserId === callerLineUserId,
+    purpose: req.purpose,
+    requesterName: requesterNameOf(req),
   };
 }
 
@@ -993,8 +1007,9 @@ function toAvailabilityDto(
  * type-checks perfectly and returns `false` for every row forever; the same footgun is documented on
  * three models in `schema.prisma`.
  *
- * ⚠️ NO `mayReveal` BRANCH, deliberately — see {@link LineScheduleSlotDto}. Every row here is
- * APPROVED, so there is nothing for `D-C13` to blank.
+ * ⚠️ NO REDACTION BRANCH, and there never was one — see {@link LineScheduleSlotDto}. Every row here
+ * is APPROVED, so there was nothing for `D-C13` to blank even before `#ISSUE-01` removed the
+ * availability read's branch.
  */
 function toScheduleDto(
   row: ScheduleRow,
