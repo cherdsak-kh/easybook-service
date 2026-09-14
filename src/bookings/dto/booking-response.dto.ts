@@ -147,15 +147,13 @@ export class BookingVenueDetailDto {
 /**
  * One row of `#/bookings` — the caller's own booking request.
  *
- * ── 🔴 THE STATUS ON THIS ROW IS ONE OF FOUR; THE SCREEN PAINTS SIX ──
- * `สิ้นสุดแล้ว` (a past `APPROVED`) and `หมดเวลาพิจารณา` (a past `PENDING`) are **derived at read
- * time from `status` and `lastEndAt`, and never stored** (`CHECKLIST.md`, Phase 6). That is why
- * `lastEndAt` is on this DTO even though no card prints it directly: it is the input to two of the
- * six badges. A server-side `expired` enum value would be a scheduled job's problem for a fact that
- * a subtraction answers exactly.
+ * ── 🔴 THE STATUS ON THIS ROW IS ONE OF FIVE; THE SCREEN PAINTS SIX ──
+ * `สิ้นสุดแล้ว` (a past `APPROVED`) is derived from the slots at read time. `หมดเวลาพิจารณา` is the
+ * stored `EXPIRED` (#ISSUE-06). `lastEndAt` is on this DTO even though no card prints it directly:
+ * it is the input to the `สิ้นสุดแล้ว` badge.
  *
  * ⚠️ `lastEndAt` IS THE **LATEST** SLOT'S END, not the first. A three-day repeat has not finished
- * until the third day has.
+ * until day three.
  */
 export class BookingListItemDto {
   @ApiProperty()
@@ -319,8 +317,8 @@ export class BookingRequestResponseDto {
 
   /**
    * ⚠️ DENORMALISED FROM THE SLOTS, recomputed inside the same transaction as any write that adds,
-   * removes or cancels one. They exist because My Bookings sorts by "soonest" and the approval queue
-   * filters by "not yet past", and cursor pagination in this repo may not order through a relation.
+   * removes or cancels one. They exist because My Bookings and the approval queue sort by when the room
+   * is used, and cursor pagination in this repo may not order through a relation.
    */
   @ApiProperty({
     format: 'date-time',

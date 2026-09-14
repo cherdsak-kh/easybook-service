@@ -151,7 +151,7 @@ export class LineBookingsController {
   @ApiOperation({
     summary: 'List the caller’s own booking requests (`#/bookings`).',
     description:
-      'Scoped to the verified `sub` — there is no parameter that widens it, and ownership is part of the query rather than a filter applied afterwards. Unpaginated: this is one user’s own bookings, and the screen’s four accordion groups are counted over the whole set. 🔴 `status` filters the four STORED statuses; the screen paints SIX, deriving `สิ้นสุดแล้ว` and `หมดเวลาพิจารณา` from `status` + `lastEndAt` at read time. Nothing expires in the database.',
+      'Scoped to the verified `sub` — there is no parameter that widens it, and ownership is part of the query rather than a filter applied afterwards. Unpaginated: this is one user’s own bookings, and the screen’s four accordion groups are counted over the whole set. 🔴 `status` filters the five STORED statuses (`EXPIRED` included); the screen derives only `สิ้นสุดแล้ว` from the slots at read time.',
   })
   @ApiOkResponse({ type: [BookingListItemDto] })
   @ApiBadRequestResponse({

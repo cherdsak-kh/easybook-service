@@ -1,7 +1,9 @@
 import { Module } from '@nestjs/common';
+import { SCHEDULING_ENABLED } from '../common/scheduling.constants';
 import { LineIdTokenGuard } from '../line/guards/line-id-token.guard';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { AdminBookingsService } from './admin-bookings.service';
+import { BookingExpiryCron } from './booking-expiry.cron';
 import { BookingRequestsController } from './booking-requests.controller';
 import { BookingsService } from './bookings.service';
 import { LineBookingsController } from './line-bookings.controller';
@@ -34,6 +36,7 @@ import { LineBookingsController } from './line-bookings.controller';
  * - **No `VenuesModule`** — this service reads `Venue` for two booleans (`deletedAt`, `isOpen`) and
  *   one name, inside the same transaction as the write. `VenuesService.findById` would run outside
  *   it and return the full public DTO, which is the wrong shape and the wrong moment.
+ * - **`BookingExpiryCron`** — guarded provider; `ScheduleModule.forRoot()` lives in `AppModule`.
  *
  * ── THE ADMIN HALF (`BookingRequestsController` + `AdminBookingsService`) ──
  * Added by Phase 4-E, and it still imports no module for its guards: `SessionGuard` and `RolesGuard`
@@ -60,7 +63,13 @@ import { LineBookingsController } from './line-bookings.controller';
 @Module({
   imports: [RealtimeModule],
   controllers: [LineBookingsController, BookingRequestsController],
-  providers: [BookingsService, AdminBookingsService, LineIdTokenGuard],
+  providers: [
+    BookingsService,
+    AdminBookingsService,
+    LineIdTokenGuard,
+    // Guarded exactly like `OrphanPhotoSweeperCron` — see `common/scheduling.constants.ts`.
+    ...(SCHEDULING_ENABLED ? [BookingExpiryCron] : []),
+  ],
   exports: [BookingsService],
 })
 export class BookingsModule {}

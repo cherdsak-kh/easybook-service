@@ -106,12 +106,16 @@ export async function publishBookingRequests(
  * that screen is fed by {@link SCHEDULE_PULSE_STATUSES}, a DIFFERENT list, precisely because these
  * two audiences have different rules. A pending request is a fact about ONE ROOM'S availability and
  * is not a fact about the school's day.
+ *
+ * `EXPIRED` is announced for the same reason `PENDING` is. The row left `OCCUPYING_STATUSES`, so the
+ * venue's watchers must see the hour freed, and the owner must see their card flip (#ISSUE-06).
  */
 const CLIENT_ANNOUNCED_STATUSES: readonly BookingStatus[] = [
   BookingStatus.APPROVED,
   BookingStatus.REJECTED,
   BookingStatus.CANCELLED,
   BookingStatus.PENDING,
+  BookingStatus.EXPIRED,
 ];
 
 /**
@@ -122,8 +126,8 @@ const CLIENT_ANNOUNCED_STATUSES: readonly BookingStatus[] = [
  * `schedule:all` is the room EVERY connected end-user sits in, and `#/home` shows approved activities
  * only. Pulsing it for a `PENDING` submission would do two wrong things at once: tell the whole
  * organisation that an unapproved request exists (`D-C13`), and make every open client refetch a view
- * that cannot have changed. A `REJECTED` request never occupied the schedule either, so it says
- * nothing there.
+ * that cannot have changed. A `REJECTED` or `EXPIRED` request never occupied the schedule either, so
+ * it says nothing there.
  *
  * ⛔ ADDING A STATUS HERE IS A PRIVACY DECISION. Adding one to `CLIENT_ANNOUNCED_STATUSES` is not the
  * same act and must not silently become one — that is why widening the announced list cannot widen

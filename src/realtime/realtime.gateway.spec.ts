@@ -72,7 +72,6 @@ const booking: AdminBookingRequestListItemDto = {
   code: 'BR-25690903-001',
   status: BookingStatus.PENDING,
   origin: 'LINE',
-  isExpired: false,
   requester: {
     name: 'สมชาย ใจดี',
     phone: '081-234-5678',

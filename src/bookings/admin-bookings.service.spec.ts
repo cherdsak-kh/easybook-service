@@ -273,7 +273,7 @@ describe('AdminBookingsService', () => {
     });
 
     /**
-     * 🔴 THE TAB COUNTS IGNORE THE SELECTED TAB. Counting under `status` would zero the other four
+     * 🔴 THE TAB COUNTS IGNORE THE SELECTED TAB. Counting under `status` would zero the other five
      * the moment one is picked — a bug the screen cannot tell from real data.
      */
     it('counts under search+venue but NOT under status, and zero-fills missing statuses', async () => {
@@ -302,29 +302,63 @@ describe('AdminBookingsService', () => {
         approved: 5,
         rejected: 0,
         cancelled: 0,
+        expired: 0,
       });
     });
 
-    it('computes `isExpired` at read time — PENDING and already over', async () => {
+    /**
+     * #ISSUE-06 — `EXPIRED` is a stored status with its own tab. `pending` is stored `PENDING` only,
+     * so an expired request leaves the pending badge by construction, and `all` still counts it.
+     */
+    it('counts include `expired`, and `all` sums all five', async () => {
+      bookingRequest.groupBy.mockResolvedValue([
+        { status: BookingStatus.PENDING, _count: { _all: 1 } },
+        { status: BookingStatus.APPROVED, _count: { _all: 2 } },
+        { status: BookingStatus.REJECTED, _count: { _all: 3 } },
+        { status: BookingStatus.CANCELLED, _count: { _all: 4 } },
+        { status: BookingStatus.EXPIRED, _count: { _all: 5 } },
+      ]);
+      const result = await service.list(query());
+      expect(result.counts).toEqual({
+        all: 15,
+        pending: 1,
+        approved: 2,
+        rejected: 3,
+        cancelled: 4,
+        expired: 5,
+      });
+    });
+
+    it('filters `status: EXPIRED` into the row query, NOT into the counts, with no time predicate', async () => {
+      await service.list(query({ status: BookingStatus.EXPIRED }));
+
+      const listArgs = callArg<{
+        where: Record<string, unknown>;
+      }>(bookingRequest.findMany);
+      expect(listArgs.where.status).toBe(BookingStatus.EXPIRED);
+
+      const groupArgs = callArg<{
+        where: Record<string, unknown>;
+      }>(bookingRequest.groupBy);
+      expect(groupArgs.where.status).toBeUndefined();
+
+      // ⛔ AC-8.8: expiry is read from `status`, never recomputed against a clock.
+      for (const where of [listArgs.where, groupArgs.where]) {
+        expect(where.firstStartAt).toBeUndefined();
+        expect(where.lastEndAt).toBeUndefined();
+      }
+    });
+
+    it('a PENDING row past its start stays PENDING on the wire until the cron sweeps it', async () => {
       bookingRequest.findMany.mockResolvedValue([
         detailRow({
           status: BookingStatus.PENDING,
-          lastEndAt: at(-HOUR),
-        }),
-        detailRow({
-          id: 'future',
-          status: BookingStatus.PENDING,
-          lastEndAt: at(DAY),
-        }),
-        // An APPROVED booking in the past is `สิ้นสุดแล้ว`, not `หมดอายุ` — never `isExpired`.
-        detailRow({
-          id: 'done',
-          status: BookingStatus.APPROVED,
+          firstStartAt: at(-2 * HOUR),
           lastEndAt: at(-HOUR),
         }),
       ]);
       const result = await service.list(query());
-      expect(result.data.map((r) => r.isExpired)).toEqual([true, false, false]);
+      expect(result.data[0].status).toBe(BookingStatus.PENDING);
     });
 
     it('infers `origin` from `createdById` — ADMIN wins even when a LINE user is attached', async () => {
@@ -521,6 +555,8 @@ describe('AdminBookingsService', () => {
       BookingStatus.APPROVED,
       BookingStatus.REJECTED,
       BookingStatus.CANCELLED,
+      // #ISSUE-06: EXPIRED is terminal — the existing pending guard refuses it, no new code path.
+      BookingStatus.EXPIRED,
     ])('409s a request that is %s, writing nothing', async (status) => {
       bookingRequest.findUnique
         .mockResolvedValueOnce({ id: BOOKING_ID, venueId: VENUE_ID, status })
@@ -672,6 +708,20 @@ describe('AdminBookingsService', () => {
         service.reject(BOOKING_ID, { reason: 'x' }, ACTOR),
       ).rejects.toThrow(new NotFoundException(BOOKING_NOT_FOUND));
     });
+
+    /** #ISSUE-06: EXPIRED is terminal — the stored reason must not be overwritten by a late reject. */
+    it('409s an EXPIRED request, writing nothing', async () => {
+      bookingRequest.findUnique.mockResolvedValueOnce({
+        id: BOOKING_ID,
+        status: BookingStatus.EXPIRED,
+      });
+      await expect(
+        service.reject(BOOKING_ID, { reason: 'x' }, ACTOR),
+      ).rejects.toThrow(
+        new ConflictException(BOOKING_NOT_PENDING_FOR_DECISION),
+      );
+      expect(bookingRequest.updateMany).not.toHaveBeenCalled();
+    });
   });
 
   // ────────────────────────────────────────────────────────────────────────────────
@@ -800,6 +850,9 @@ describe('AdminBookingsService', () => {
       BookingStatus.PENDING,
       BookingStatus.REJECTED,
       BookingStatus.CANCELLED,
+      // #ISSUE-06 (design C1): the cancel guard is `!== APPROVED`, so EXPIRED gets THIS code, not
+      // `BOOKING_NOT_PENDING_FOR_DECISION`.
+      BookingStatus.EXPIRED,
     ])('409s a request that is %s', async (status) => {
       bookingRequest.findUnique
         .mockResolvedValueOnce({ id: BOOKING_ID, venueId: VENUE_ID, status })
@@ -1322,7 +1375,6 @@ describe('AdminBookingsService', () => {
       'createdAt',
       'firstStartAt',
       'id',
-      'isExpired',
       'lastEndAt',
       'origin',
       'purpose',

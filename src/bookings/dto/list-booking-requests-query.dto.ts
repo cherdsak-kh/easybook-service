@@ -121,15 +121,11 @@ export class ListBookingRequestsQueryDto {
   @IsNotEmpty()
   venueId?: string;
 
-  /**
-   * ⚠️ THERE IS NO `EXPIRED` VALUE AND NONE MAY BE ADDED. "หมดอายุ" is `status = PENDING AND
-   * lastEndAt < now`, computed at read time and surfaced as `isExpired` on every row — there is no
-   * fifth stored status and no cron that would write one.
-   */
+  /** Narrows to one stored status; absent means the ทั้งหมด tab. `EXPIRED` is a stored value written by `BookingExpiryCron` at `firstStartAt` (#ISSUE-06) — there is no derived expiry state. */
   @ApiPropertyOptional({
     enum: BookingStatus,
     description:
-      'Narrows to one stored status; absent means the `ทั้งหมด` tab. The screen’s "หมดอายุ" state is NOT a value here — it is derived (`status = PENDING && lastEndAt < now`) and returned as `isExpired`.',
+      'Narrows to one stored status; absent means the `ทั้งหมด` tab. `EXPIRED` is stored by the expiry job when a request is still pending at its first slot’s start.',
   })
   @IsOptional()
   @IsEnum(BookingStatus)

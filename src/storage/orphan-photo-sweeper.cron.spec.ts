@@ -1,14 +1,15 @@
 import 'reflect-metadata';
 import { Logger } from '@nestjs/common';
+import { ScheduleModule } from '@nestjs/schedule';
 import {
   ORPHAN_PHOTO_SWEEP_CRON,
   OrphanPhotoSweeperCron,
 } from './orphan-photo-sweeper.cron';
-import type {
+import type { StagedPhotoSweepResult } from './r2-storage.service';
+import {
   R2StorageService,
-  StagedPhotoSweepResult,
+  STAGED_PHOTO_MIN_AGE_MS,
 } from './r2-storage.service';
-import { STAGED_PHOTO_MIN_AGE_MS } from './r2-storage.service';
 import { StorageModule } from './storage.module';
 
 /**
@@ -157,19 +158,27 @@ describe('OrphanPhotoSweeperCron', () => {
    *
    * Asserted on the module's own decorator metadata rather than on the environment variables,
    * because the environment is the INPUT to the guard and this is about its OUTPUT.
+   *
+   * `ScheduleModule.forRoot()` itself moved to `AppModule` (#ISSUE-06); its guard is asserted in
+   * `booking-expiry.cron.spec.ts`. This module now declares no `imports` at all.
    */
   describe('registration guard', () => {
     it('registers neither ScheduleModule nor the cron provider under test', () => {
-      const imports = Reflect.getMetadata(
-        'imports',
-        StorageModule,
-      ) as unknown[];
+      const imports = (Reflect.getMetadata('imports', StorageModule) ??
+        []) as unknown[];
       const providers = Reflect.getMetadata(
         'providers',
         StorageModule,
       ) as unknown[];
 
-      expect(imports).toEqual([]);
+      expect(
+        imports.some(
+          (entry) =>
+            entry === ScheduleModule ||
+            (entry as { module?: unknown } | null)?.module === ScheduleModule,
+        ),
+      ).toBe(false);
+      expect(providers).toContain(R2StorageService);
       expect(providers).not.toContain(OrphanPhotoSweeperCron);
     });
 

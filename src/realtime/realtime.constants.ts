@@ -139,7 +139,8 @@ export const CLIENT_SCHEDULE_ROOM = 'schedule:all';
 /** `/client` server → client events. */
 export const CLIENT_REALTIME_EVENTS = {
   /**
-   * A booking's status moved — approved, rejected, auto-rejected by ADR-001, or cancelled.
+   * A booking's status moved — approved, rejected, auto-rejected by ADR-001, expired by the cron, or
+   * cancelled.
    * Room: `user:<LineUser.id>`. Payload: {@link ClientBookingUpdatedPayload}.
    *
    * 🔴 IT GOES TO EXACTLY ONE PERSON'S ROOM, and that is the whole of `D-C13` on this event: the
@@ -180,7 +181,10 @@ export interface ClientBookingUpdatedPayload {
   id: string;
   code: string;
   status: BookingStatus;
-  /** The approver's reason, or ADR-001's auto-rejection copy. `null` on every other transition. */
+  /**
+   * The approver's reason, ADR-001's auto-rejection copy, or the expiry cron's `AUTO_EXPIRED_REASON`.
+   * `null` on every other transition.
+   */
   rejectReason: string | null;
 }
 

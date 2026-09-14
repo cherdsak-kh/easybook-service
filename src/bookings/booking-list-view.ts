@@ -1,4 +1,4 @@
-import { BookingStatus, Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type {
   AdminBookingRequesterDto,
@@ -157,9 +157,12 @@ function toSlotDto(slot: {
   };
 }
 
+/**
+ * ⛔ NO CLOCK IN HERE. Expiry is the stored `EXPIRED` status written by `BookingExpiryCron`
+ * (#ISSUE-06); this mapper reads `status` and derives nothing from `firstStartAt`/`lastEndAt`.
+ */
 export function toBookingListDto(
   row: BookingListRow,
-  now: Date,
 ): AdminBookingRequestListItemDto {
   return {
     id: row.id,
@@ -167,10 +170,6 @@ export function toBookingListDto(
     status: row.status,
     // `createdById === null` ⇒ nobody on staff typed it ⇒ it came from LINE.
     origin: row.createdById === null ? 'LINE' : 'ADMIN',
-    // Computed at read time against the SERVER's clock. No fifth status, no cron.
-    isExpired:
-      row.status === BookingStatus.PENDING &&
-      row.lastEndAt.getTime() < now.getTime(),
     requester: requesterOf(row),
     venue: row.venue,
     purpose: row.purpose,
@@ -206,8 +205,7 @@ export async function readBookingListDtos(
     where: { id: { in: [...ids] } },
     select: BOOKING_LIST_SELECT,
   });
-  const now = new Date();
-  const byId = new Map(rows.map((row) => [row.id, toBookingListDto(row, now)]));
+  const byId = new Map(rows.map((row) => [row.id, toBookingListDto(row)]));
   return ids
     .map((id) => byId.get(id))
     .filter((dto): dto is AdminBookingRequestListItemDto => dto !== undefined);

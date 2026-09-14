@@ -55,9 +55,9 @@ import type { LineScheduleSlotDto, ScheduleQueryDto } from './dto/schedule.dto';
 import type { VenueAvailabilityQueryDto } from './dto/venue-availability-query.dto';
 
 /**
- * ⚠️ ONLY THESE TWO STATUSES OCCUPY A CALENDAR. `REJECTED` and `CANCELLED` requests hold nothing and
- * must never be painted — a rejected request still owns its `booking_slots` rows, so filtering on
- * the parent's status is not optional.
+ * ⚠️ ONLY THESE TWO STATUSES OCCUPY A CALENDAR. `REJECTED`, `CANCELLED` and `EXPIRED` requests hold
+ * nothing and must never be painted — a rejected or expired request still owns its `booking_slots`
+ * rows, so filtering on the parent's status is not optional.
  */
 const OCCUPYING_STATUSES = [
   BookingStatus.APPROVED,

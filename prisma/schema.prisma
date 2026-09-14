@@ -693,19 +693,25 @@ model SystemUser {
   @@map("system_users")
 }
 
-/// Lifecycle of a BookingRequest (D-C13, PO 2026-08-26).
+/// Lifecycle of a BookingRequest (D-C13, PO 2026-08-26; `EXPIRED` added by #ISSUE-06, PO 2026-09-14).
 ///
-/// ⚠️ THERE IS DELIBERATELY NO `EXPIRED`, and adding one is a schema regression. A pending request
-/// nobody ruled on before its time passed is COMPUTED at read time (`lastEndAt < now()`), never
-/// stored — the same reasoning that keeps the request's status derived from its slots and keeps
-/// `VenuePhoto` free of an `isCover` flag: one fact, one home. A stored EXPIRED needs a cron, and a
-/// cron that misses a day makes every screen lie. Filter the approval queue with `lastEndAt > now()`
-/// instead. See SERVICE_CHANGES.md §2.4.
+/// 🔴 `EXPIRED` IS STORED, AND IT IS THE ONLY DEFINITION OF "EXPIRED". The PO SUPERSEDED D-C13's
+/// "no stored EXPIRED / no cron" clause on 2026-09-14 (#ISSUE-06); every other D-C13 rule stands.
+/// A PENDING request nobody ruled on is flipped to EXPIRED by `BookingExpiryCron`
+/// (`src/bookings/booking-expiry.cron.ts`) on the first minute tick after its `firstStartAt`, with
+/// `rejectReason = AUTO_EXPIRED_REASON`. Nothing computes expiry at read time — no `isExpired`, and
+/// no `lastEndAt`/`firstStartAt` versus `now()` predicate on any read path. A row past `firstStartAt`
+/// that has not been swept yet IS still PENDING (accepted gap: at most one tick, ~60 s).
+///
+/// EXPIRED is terminal and holds nothing: it is not in `OCCUPYING_STATUSES`, and the `holdsSlot`
+/// triggers test `status = 'APPROVED'` only. Appended LAST — Postgres `ADD VALUE` cannot reorder,
+/// and nothing sorts on this enum's ordinal.
 enum BookingStatus {
   PENDING
   APPROVED
   REJECTED
   CANCELLED
+  EXPIRED
 }
 
 /// A request to use a venue — the PARENT of one or more BookingSlot rows (D-C13).
@@ -826,7 +832,7 @@ model BookingRequest {
   /// 🔴 NOT a convenience — a REQUIREMENT of this repo's own pagination rule. Cursor pagination here
   /// must order on a scalar belonging to the model being ordered, never through a relation (the same
   /// constraint that produced `LineUser.registeredAt`). My Bookings sorts by "soonest" and the
-  /// approval queue filters by "not yet past", and both of those are aggregates over booking_slots.
+  /// approval queue sorts by when the room is used, and both of those are aggregates over booking_slots.
   /// Ordering through the child collection is not expressible; these two columns make it a plain
   /// indexed scalar sort.
   ///
@@ -834,8 +840,9 @@ model BookingRequest {
   /// cancels a slot. They are a cache of the children, and a stale cache here silently mis-sorts the
   /// list and mis-filters the queue rather than erroring.
   ///
-  /// `lastEndAt` is also what makes the computed "expired" state possible without an enum value or a
-  /// cron: `status = PENDING AND lastEndAt < now()`.
+  /// `firstStartAt` is also the EXPIRY THRESHOLD: `BookingExpiryCron` writes the stored `EXPIRED`
+  /// onto `status = PENDING AND firstStartAt < now()` (#ISSUE-06, superseding D-C13's computed
+  /// `lastEndAt` rule). Only that WRITE reads it for expiry — no read path may.
   firstStartAt DateTime
   lastEndAt    DateTime
 
@@ -858,7 +865,7 @@ model BookingRequest {
   @@index([createdById])
   @@index([venueId])
   @@index([status])
-  /// The approval queue ("pending, not yet past") and My Bookings' "soonest" sort both read this
+  /// The event-date sorts (admin queue and My Bookings "soonest") and the expiry sweep read this
   /// pair. Free on an empty table, a lock on a populated one — same reasoning as every other index
   /// in this schema.
   @@index([firstStartAt, lastEndAt])

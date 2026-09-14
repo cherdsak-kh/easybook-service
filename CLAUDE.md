@@ -96,7 +96,9 @@ through **two separate lists** — the split is structural because one of them i
 `CLIENT_ANNOUNCED_STATUSES` (owner + venue rooms) includes **`PENDING`**, and must, because
 `OCCUPYING_STATUSES` does: a pending request occupies the venue calendar the moment it lands, so a
 competing user on `#/venue/:id` has to watch the hour go amber or they will submit for the same slot —
-the occupancy rule and the fan-out rule have to agree. `SCHEDULE_PULSE_STATUSES` is `APPROVED` /
+the occupancy rule and the fan-out rule have to agree. It also includes **`EXPIRED`** (#ISSUE-06): the
+expiry cron frees the hour a pending request was painting, so the owner's room and the venue's room
+hear it — never `schedule:all`. `SCHEDULE_PULSE_STATUSES` is `APPROVED` /
 `CANCELLED` **only**: `#/home` shows approved activities, so pulsing `schedule:all` for a pending
 submission would both leak that an unapproved request exists and make every open client refetch a view
 that cannot have changed. Both LIFF cancellations (`cancelPendingBooking`, `cancelApprovedSlot`)
@@ -118,12 +120,14 @@ sides: `SystemUsersModule` needs the guards, and `AuthSystemController` needs `S
 (which owns every `SystemUser` write — `PATCH /auth/system/me` and the avatar's `profilePictureUrl`
 included). Re-providing `SystemUsersService` in `AuthModule` instead would mint a **second instance**
 and is exactly the drift `PUBLIC_FIELDS` exists to prevent. `StorageModule` is imported by `AuthModule`
-and `VenuesModule`, and it is also the **only** module that schedules anything: it holds the single
-`ScheduleModule.forRoot()` plus `OrphanPhotoSweeperCron` (daily 03:00 `venues/_new/` sweep), **both
-registered conditionally** — under jest (`NODE_ENV=test` / `JEST_WORKER_ID` set) neither is added to
-the module at all, because `test/e2e-app.ts` boots the real `AppModule` and a registered `CronJob` is
-an open handle in every e2e suite. Guarding inside the handler body is not equivalent and does not
-work; see the comments in `src/storage/storage.module.ts`.
+and `VenuesModule`. **Scheduling is split in two:** the single `ScheduleModule.forRoot()` lives in
+`AppModule`. Each job is a provider in its own module: `OrphanPhotoSweeperCron` in `StorageModule`
+(daily 03:00 `venues/_new/` sweep) and `BookingExpiryCron` in `BookingsModule` (every minute,
+`PENDING` → `EXPIRED` at `firstStartAt`, #ISSUE-06). **All three registrations read one constant**,
+`SCHEDULING_ENABLED` in `src/common/scheduling.constants.ts`. Under jest (`NODE_ENV=test` /
+`JEST_WORKER_ID` set) none of them is added to the module graph, because `test/e2e-app.ts` boots the
+real `AppModule` and a registered `CronJob` is an open handle in every e2e suite. Guarding inside the
+handler body is not equivalent and does not work.
 
 **API surface**: the global prefix is `API_BASE_PATH` (`src/common/api.constants.ts` = `/api/v1`).
 Controllers are mounted under that automatically via `main.ts`; don't hardcode `/api/v1` in

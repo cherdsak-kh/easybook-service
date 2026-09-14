@@ -234,6 +234,17 @@ export const AUTO_REJECTED_REASON =
   'ช่วงเวลาที่ขอถูกจัดสรรให้การจองอื่นแล้ว จึงไม่สามารถอนุมัติคำขอนี้ได้';
 
 /**
+ * The `rejectReason` written onto every request `BookingExpiryCron` expires (#ISSUE-06).
+ * THAI for the same reason as AUTO_REJECTED_REASON: it is stored CONTENT rendered raw to the requester,
+ * not an error message. It names nobody (D-C13 privacy clause still applies).
+ */
+export const AUTO_EXPIRED_REASON =
+  'คำขอหมดอายุโดยอัตโนมัติ เนื่องจากเลยกำหนดเวลาเริ่มต้นใช้งานโดยยังไม่ได้รับการพิจารณา';
+
+/** Ids per `publishBookingRequests` call when a backlog is swept — bounds each re-read's IN list. */
+export const BOOKING_EXPIRY_PUBLISH_CHUNK = 500;
+
+/**
  * The `pg_advisory_xact_lock` namespace for booking decisions, keyed by `hashtext(venueId)`.
  *
  * 🔴 WITHOUT IT, TWO SIMULTANEOUS APPROVALS OF OVERLAPPING REQUESTS DEADLOCK rather than one losing

@@ -46,7 +46,6 @@ const LIST_ITEM_KEYS = [
   'createdAt',
   'firstStartAt',
   'id',
-  'isExpired',
   'lastEndAt',
   'origin',
   'purpose',

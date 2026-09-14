@@ -41,13 +41,11 @@ export const BOOKING_SORT_DEFAULT: BookingSort = 'created-desc';
  * numbers. If this list ever needs pages, the grouping needs a server-side count first.
  *
  * ── 🔴 `status` FILTERS THE STORED STATUS, WHICH IS NOT WHAT THE SCREEN SHOWS ──
- * `#/bookings` paints **six** states out of these **four** plus the clock: a past `APPROVED` reads
- * as `สิ้นสุดแล้ว`, a past `PENDING` as `หมดเวลาพิจารณา`, and its "ประวัติ" chip means all four of
- * `done` / `expired` / `rejected` / `cancelled` at once. None of those three is a stored value, so
- * none of them can be passed here. The derived state is computed by the client from `status` +
- * `lastEndAt`, which the response carries for that purpose — `หมดเวลา` is computed at read time and
- * never stored (`CHECKLIST.md`, Phase 6). Filtering the derived state stays client-side, which the
- * unpaginated list above makes correct rather than merely convenient.
+ * `#/bookings` paints **six** states from **five** stored statuses plus the clock. Only `สิ้นสุดแล้ว`
+ * (an `APPROVED` request past its last slot's end) is derived. `หมดเวลาพิจารณา` is the stored
+ * `EXPIRED` (#ISSUE-06). The `ประวัติ` chip means `done` / `expired` / `rejected` / `cancelled` at
+ * once. `done` is not a stored value, so the chip filter stays client-side, which the unpaginated
+ * list above makes correct rather than merely convenient.
  */
 export class ListLineBookingsQueryDto {
   /**
@@ -70,7 +68,7 @@ export class ListLineBookingsQueryDto {
   @ApiPropertyOptional({
     enum: BookingStatus,
     description:
-      'Narrows to one STORED status. The screen’s `ประวัติ` chip and its `สิ้นสุดแล้ว` / `หมดเวลาพิจารณา` badges are DERIVED from `status` + `lastEndAt` and cannot be passed here — see the class note.',
+      'Narrows to one STORED status (`EXPIRED` included). The screen’s `ประวัติ` chip and its derived `สิ้นสุดแล้ว` badge cannot be passed here — see the class note.',
   })
   @IsEnum(BookingStatus)
   @IsOptional()

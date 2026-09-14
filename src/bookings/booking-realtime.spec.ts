@@ -5,6 +5,7 @@ import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import { CLIENT_REALTIME_EVENTS } from '../realtime/realtime.constants';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { publishBookingRequests } from './booking-realtime';
+import { AUTO_EXPIRED_REASON } from './bookings.constants';
 
 const ACTOR = { id: 'op-1', name: 'วีระ ทองดี' };
 
@@ -410,6 +411,53 @@ describe('publishBookingRequests', () => {
       expect(toUser).not.toHaveBeenCalled();
       expect(toVenue).toHaveBeenCalledTimes(1);
       expect(schedulePulse).toHaveBeenCalledTimes(1);
+    });
+
+    /**
+     * #ISSUE-06 — the expiry cron's rows. `EXPIRED` is announced like `PENDING` (the hour was painted
+     * and is now free, and the owner's card flips) but, like `REJECTED`, it never reached `#/home`.
+     */
+    it('EXPIRED reaches the owner with the stored reason and the venue, but NEVER the schedule room', async () => {
+      findMany.mockResolvedValue([
+        row('a', {
+          status: BookingStatus.EXPIRED,
+          rejectReason: AUTO_EXPIRED_REASON,
+        }),
+      ]);
+
+      await publish('updated', ['a'], null);
+
+      expect(toUser).toHaveBeenCalledWith(
+        LINE_USER_CUID,
+        CLIENT_REALTIME_EVENTS.bookingUpdated,
+        {
+          id: 'a',
+          code: 'BR-25690903-a',
+          status: BookingStatus.EXPIRED,
+          rejectReason: AUTO_EXPIRED_REASON,
+        },
+      );
+      expect(toVenue).toHaveBeenCalledWith(
+        VENUE_ID,
+        CLIENT_REALTIME_EVENTS.venueAvailabilityChanged,
+        { venueId: VENUE_ID },
+      );
+      expect(schedulePulse).not.toHaveBeenCalled();
+    });
+
+    /** The system actor: the cron publishes `null`, and `/admin` receives exactly that. */
+    it('an `updated` publish with a null actor reaches /admin with actor null', async () => {
+      findMany.mockResolvedValue([row('a', { status: BookingStatus.EXPIRED })]);
+
+      await publish('updated', ['a'], null);
+
+      expect(updated).toHaveBeenCalledTimes(1);
+      const [booking, actor] = (
+        updated.mock.calls as [{ id: string; status: BookingStatus }, unknown][]
+      )[0];
+      expect(booking.id).toBe('a');
+      expect(booking.status).toBe(BookingStatus.EXPIRED);
+      expect(actor).toBeNull();
     });
 
     /** ADR-001 auto-rejects the losers of an approval: one client event per row that changed. */

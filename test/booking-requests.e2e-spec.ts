@@ -1,16 +1,23 @@
 import type { INestApplication } from '@nestjs/common';
+import { SchedulerRegistry } from '@nestjs/schedule';
 import { BookingStatus, SystemRole } from '@prisma/client';
 import type { Redis } from 'ioredis';
 import { Client } from 'pg';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import { PasswordService } from '../src/auth/password.service';
+import { BookingExpiryCron } from '../src/bookings/booking-expiry.cron';
 import {
+  AUTO_EXPIRED_REASON,
   AUTO_REJECTED_REASON,
+  BOOKING_NOT_APPROVED_FOR_CANCEL,
+  BOOKING_NOT_PENDING_FOR_DECISION,
   BOOKING_VENUE_LOCK_NS,
 } from '../src/bookings/bookings.constants';
 import { API_BASE_PATH } from '../src/common/api.constants';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { ClientRealtimeGateway } from '../src/realtime/client-realtime.gateway';
+import { RealtimeGateway } from '../src/realtime/realtime.gateway';
 import {
   clearThrottleCounters,
   createE2eApp,
@@ -58,7 +65,6 @@ interface BookingBody {
   code: string;
   status: BookingStatus;
   origin: 'LINE' | 'ADMIN';
-  isExpired: boolean;
   requester: {
     name: string | null;
     phone: string | null;
@@ -89,6 +95,7 @@ interface ListBody {
     approved: number;
     rejected: number;
     cancelled: number;
+    expired: number;
   };
 }
 
@@ -445,6 +452,23 @@ describe('Booking requests — admin surface (e2e)', () => {
   });
 
   // ────────────────────────────────────────────────────────────────────────────────
+  // #ISSUE-06 AC-8.10 — nothing is scheduled inside the e2e app graph
+  // ────────────────────────────────────────────────────────────────────────────────
+  describe('scheduling', () => {
+    /**
+     * `SchedulerRegistry` is provided only by `ScheduleModule.forRoot()`, so its absence proves the
+     * root registration is off; `BookingExpiryCron`'s absence proves the per-job guard. Either one
+     * present would be a live `CronJob` timer — an open handle in every e2e suite.
+     */
+    it('registers neither the scheduler nor the expiry cron under jest', () => {
+      expect(() => app.get(SchedulerRegistry, { strict: false })).toThrow();
+      expect(() => app.get(BookingExpiryCron, { strict: false })).toThrow();
+      // Positive control: the same lookup resolves a provider that IS registered.
+      expect(app.get(RealtimeGateway, { strict: false })).toBeDefined();
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────────
   // AC-BR2 / AC-BR3 / AC-BR4 / AC-BR5 — the queue
   // ────────────────────────────────────────────────────────────────────────────────
   describe('list and detail', () => {
@@ -472,9 +496,10 @@ describe('Booking requests — admin surface (e2e)', () => {
         approved: 1,
         rejected: 0,
         cancelled: 0,
+        expired: 0,
       });
 
-      // Selecting a tab narrows `data` but leaves the OTHER FOUR counts intact.
+      // Selecting a tab narrows `data` but leaves the OTHER counts intact.
       const pendingOnly = await admin.agent
         .get(url('/booking-requests?status=PENDING'))
         .expect(200);
@@ -683,13 +708,22 @@ describe('Booking requests — admin surface (e2e)', () => {
       ]);
     });
 
-    it('computes `isExpired` and `origin` at read time', async () => {
+    /**
+     * #ISSUE-06 — AC-8.1, AC-8.4 and design §4.3 against real Postgres. The cron is not registered
+     * under jest, so this calls the method the tick calls.
+     *
+     * ⚠️ Counts and tabs are read under `venueId`, so the fixture venue isolates them from any other
+     * row in the shared database. The sweep itself is global, exactly as in production.
+     */
+    it('the expiry sweep stores `EXPIRED` and moves the counts', async () => {
       const admin = await login(ADMIN);
-      // A PENDING request whose event is over. Written by SQL because `parseSlots` refuses the past.
-      const expired = await seedBooking({
-        spans: [[-3 * HOUR, -2 * HOUR]],
-      });
+      // Written straight to the database because `parseSlots` refuses the past.
+      const overdue = await seedBooking({ spans: [[-3 * HOUR, -2 * HOUR]] });
       const live = await seedBooking({ spans: [[DAY, DAY + HOUR]] });
+      const pastApproved = await seedBooking({
+        status: BookingStatus.APPROVED,
+        spans: [[-5 * HOUR, -4 * HOUR]],
+      });
       const staff = await seedBooking({
         spans: [[2 * DAY, 2 * DAY + HOUR]],
         lineUser: null,
@@ -697,21 +731,105 @@ describe('Booking requests — admin surface (e2e)', () => {
         requesterName: 'x',
       });
 
-      const res = await admin.agent.get(url('/booking-requests')).expect(200);
-      const byId = new Map(
-        (res.body as ListBody).data.map((r) => [r.id, r] as const),
-      );
-      expect(byId.get(expired.id)?.isExpired).toBe(true);
-      expect(byId.get(live.id)?.isExpired).toBe(false);
-      expect(byId.get(live.id)?.origin).toBe('LINE');
-      expect(byId.get(staff.id)?.origin).toBe('ADMIN');
+      const readVenue = async (query = '') =>
+        (
+          await admin.agent
+            .get(url(`/booking-requests?venueId=${venueId}${query}`))
+            .expect(200)
+        ).body as ListBody;
 
-      // ⛔ No stored fifth status: the row is still PENDING in the database.
-      const row = await prisma.bookingRequest.findUnique({
-        where: { id: expired.id },
-        select: { status: true },
+      const before = await readVenue();
+      expect(before.counts).toMatchObject({
+        all: 4,
+        pending: 3,
+        approved: 1,
+        expired: 0,
       });
-      expect(row?.status).toBe(BookingStatus.PENDING);
+      // The accepted gap (AC-8.8): past its start but not yet swept, it is still PENDING on the wire.
+      expect(before.data.find((r) => r.id === overdue.id)?.status).toBe(
+        BookingStatus.PENDING,
+      );
+
+      const cron = new BookingExpiryCron(
+        prisma,
+        app.get(RealtimeGateway),
+        app.get(ClientRealtimeGateway),
+      );
+      const swept = await cron.expireOverdue();
+      expect(swept).toContain(overdue.id);
+      for (const untouched of [live, pastApproved, staff]) {
+        expect(swept).not.toContain(untouched.id);
+      }
+
+      const rows = await prisma.bookingRequest.findMany({
+        where: { id: { in: [overdue.id, live.id, pastApproved.id, staff.id] } },
+        select: { id: true, status: true, rejectReason: true },
+      });
+      const stored = new Map(rows.map((r) => [r.id, r] as const));
+      expect(stored.get(overdue.id)).toMatchObject({
+        status: BookingStatus.EXPIRED,
+        rejectReason: AUTO_EXPIRED_REASON,
+      });
+      expect(stored.get(live.id)?.status).toBe(BookingStatus.PENDING);
+      expect(stored.get(staff.id)?.status).toBe(BookingStatus.PENDING);
+      expect(stored.get(pastApproved.id)).toMatchObject({
+        status: BookingStatus.APPROVED,
+        rejectReason: null,
+      });
+
+      // AC-8.4: pending −1, expired +1, all unchanged.
+      const after = await readVenue();
+      expect(after.counts.pending).toBe(before.counts.pending - 1);
+      expect(after.counts.expired).toBe(before.counts.expired + 1);
+      expect(after.counts.all).toBe(before.counts.all);
+
+      const wire = new Map(after.data.map((r) => [r.id, r] as const));
+      expect(wire.get(overdue.id)?.status).toBe(BookingStatus.EXPIRED);
+      expect(wire.get(overdue.id)?.rejectReason).toBe(AUTO_EXPIRED_REASON);
+      expect(wire.get(live.id)?.origin).toBe('LINE');
+      expect(wire.get(staff.id)?.origin).toBe('ADMIN');
+
+      // The รอพิจารณา tab no longer lists it; the EXPIRED tab lists only it.
+      const pendingTab = await readVenue('&status=PENDING');
+      expect(pendingTab.data.map((r) => r.id)).not.toContain(overdue.id);
+      const expiredTab = await readVenue('&status=EXPIRED');
+      expect(expiredTab.data.map((r) => r.id)).toEqual([overdue.id]);
+
+      // §4.3: EXPIRED is terminal, refused by the existing guards with the existing codes.
+      const approve = await admin.agent
+        .post(url(`/booking-requests/${overdue.id}/approve`))
+        .set('x-csrf-token', admin.token)
+        .expect(409);
+      expect(JSON.stringify(approve.body)).toContain(
+        BOOKING_NOT_PENDING_FOR_DECISION,
+      );
+      const reject = await admin.agent
+        .post(url(`/booking-requests/${overdue.id}/reject`))
+        .set('x-csrf-token', admin.token)
+        .send({ reason: 'ช้าไป' })
+        .expect(409);
+      expect(JSON.stringify(reject.body)).toContain(
+        BOOKING_NOT_PENDING_FOR_DECISION,
+      );
+      const cancel = await admin.agent
+        .post(url(`/booking-requests/${overdue.id}/cancel`))
+        .set('x-csrf-token', admin.token)
+        .send({ reason: 'ช้าไป' })
+        .expect(409);
+      expect(JSON.stringify(cancel.body)).toContain(
+        BOOKING_NOT_APPROVED_FOR_CANCEL,
+      );
+
+      // A second sweep (the next tick, or a second instance) does not re-announce it.
+      expect(await cron.expireOverdue()).not.toContain(overdue.id);
+      const unchanged = await prisma.bookingRequest.findUnique({
+        where: { id: overdue.id },
+        select: { status: true, rejectReason: true },
+      });
+      expect(unchanged).toEqual({
+        status: BookingStatus.EXPIRED,
+        rejectReason: AUTO_EXPIRED_REASON,
+      });
     });
 
     /** AC-BR5 — every slot, cancelled ones included, plus the requester from either origin. */

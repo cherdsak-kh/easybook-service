@@ -199,8 +199,8 @@ export class AdminBookingsService {
         take: query.limit,
       }),
       this.prisma.bookingRequest.count({ where }),
-      // ONE grouped query for all five numbers rather than five counts — and the reason it is not
-      // `_count: true` per status in a loop is that a loop would be five round trips for a tab strip.
+      // ONE grouped query for every status rather than one count each — a loop would be five round
+      // trips for a tab strip. `pending` is stored `PENDING` only: no time predicate (#ISSUE-06).
       this.prisma.bookingRequest.groupBy({
         by: ['status'],
         where: baseWhere,
@@ -208,9 +208,8 @@ export class AdminBookingsService {
       }),
     ]);
 
-    const now = new Date();
     return {
-      data: rows.map((row) => toBookingListDto(row, now)),
+      data: rows.map((row) => toBookingListDto(row)),
       meta: {
         page: query.page,
         limit: query.limit,
@@ -739,7 +738,7 @@ export class AdminBookingsService {
     });
     if (!row) throw new NotFoundException(BOOKING_NOT_FOUND);
     return {
-      ...toBookingListDto(row, new Date()),
+      ...toBookingListDto(row),
       venue: row.venue,
       createdBy: row.createdBy,
       approvedBy: row.approvedBy,
@@ -1015,7 +1014,12 @@ function searchWhere(search?: string): Prisma.BookingRequestWhereInput {
   };
 }
 
-/** `groupBy` rows → the five numbers, with a `0` for every status that had none. */
+/**
+ * `groupBy` rows → the six numbers, with a `0` for every status that had none.
+ *
+ * `pending` is stored `PENDING` only, so a request the expiry cron closed leaves the pending badge
+ * and lands in `expired` by construction (#ISSUE-06). `all` counts every stored status.
+ */
 function toCounts(
   grouped: { status: BookingStatus; _count: { _all: number } }[],
 ): BookingStatusCountsDto {
@@ -1025,11 +1029,13 @@ function toCounts(
   const approved = at(BookingStatus.APPROVED);
   const rejected = at(BookingStatus.REJECTED);
   const cancelled = at(BookingStatus.CANCELLED);
+  const expired = at(BookingStatus.EXPIRED);
   return {
-    all: pending + approved + rejected + cancelled,
+    all: pending + approved + rejected + cancelled + expired,
     pending,
     approved,
     rejected,
     cancelled,
+    expired,
   };
 }

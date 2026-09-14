@@ -142,17 +142,6 @@ export class AdminBookingRequestListItemDto {
   })
   origin!: 'LINE' | 'ADMIN';
 
-  /**
-   * 🔴 COMPUTED AT READ TIME, NEVER STORED. There is no fifth `BookingStatus` and no cron that would
-   * write one; "หมดอายุ" is `status = PENDING && lastEndAt < now`. It is in the payload so the client
-   * does not have to compare against the browser's own clock, which can be wrong.
-   */
-  @ApiProperty({
-    description:
-      '`status === PENDING && lastEndAt < now`, evaluated by the SERVER at read time. Not a stored status and not a cron — the client should not recompute it against its own clock.',
-  })
-  isExpired!: boolean;
-
   @ApiProperty({ type: AdminBookingRequesterDto })
   requester!: AdminBookingRequesterDto;
 
@@ -283,6 +272,12 @@ export class BookingStatusCountsDto {
 
   @ApiProperty({ example: 2 })
   cancelled!: number;
+
+  @ApiProperty({
+    example: 4,
+    description: 'Requests the expiry cron closed (stored `EXPIRED`).',
+  })
+  expired!: number;
 }
 
 export class PaginatedBookingRequestsResponseDto {
@@ -299,13 +294,13 @@ export class PaginatedBookingRequestsResponseDto {
 
   /**
    * 🔴 COUNTED UNDER `search` + `venueId` BUT **NOT** UNDER `status`. Counting with the status filter
-   * applied would zero the other four tabs the instant one is selected — a bug the screen has no way
+   * applied would zero the other five tabs the instant one is selected — a bug the screen has no way
    * to distinguish from real data. Statuses with no rows return `0` rather than going missing.
    */
   @ApiProperty({
     type: BookingStatusCountsDto,
     description:
-      'Tab counts. Computed with `search` and `venueId` applied but WITHOUT `status` — otherwise selecting a tab would zero the other four. A status with no rows is `0`, never absent.',
+      'Tab counts. Computed with `search` and `venueId` applied but WITHOUT `status`, otherwise selecting a tab would zero the other five. A status with no rows is `0`, never absent.',
   })
   counts!: BookingStatusCountsDto;
 }

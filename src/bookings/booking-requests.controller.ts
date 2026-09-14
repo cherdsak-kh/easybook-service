@@ -203,7 +203,7 @@ export class BookingRequestsController {
   @ApiOperation({
     summary: 'List booking requests — the approval queue.',
     description:
-      'Filtered, sorted AND paginated entirely by the server. `counts` carries the five tab totals and is computed with `search` and `venueId` applied but WITHOUT `status`, so selecting a tab does not zero the other four. Every row carries ALL its slots, cancelled ones included, and a server-computed `isExpired` (`status = PENDING && lastEndAt < now`) — there is no fifth stored status and no cron.',
+      'Filtered, sorted AND paginated entirely by the server. `counts` carries the six tab totals and is computed with `search` and `venueId` applied but WITHOUT `status`, so selecting a tab does not zero the others. Every row carries ALL its slots, cancelled ones included. `EXPIRED` is a stored status written by the expiry job at the request’s first slot start.',
   })
   @ApiOkResponse({
     description: 'The page.',

@@ -787,6 +787,11 @@ describe('BookingsService', () => {
       expect(where.bookingRequest).toEqual({
         status: { in: [BookingStatus.APPROVED, BookingStatus.PENDING] },
       });
+      // AC-8.11 (#ISSUE-06): an EXPIRED request holds nothing, so its hours read as free.
+      const occupying = (
+        where.bookingRequest as { status: { in: readonly BookingStatus[] } }
+      ).status.in;
+      expect(occupying).not.toContain(BookingStatus.EXPIRED);
       expect(where.isCancelled).toBe(false);
       // 🔴 OVERLAP, not containment — a camp that began before `from` still occupies day one.
       expect(where.startAt).toEqual({
@@ -1389,11 +1394,13 @@ describe('BookingsService', () => {
       expect(bookingSlot.updateMany).not.toHaveBeenCalled();
     });
 
-    it('422s an APPROVED, REJECTED or CANCELLED request and writes nothing', async () => {
+    it('422s an APPROVED, REJECTED, CANCELLED or EXPIRED request and writes nothing', async () => {
       for (const status of [
         BookingStatus.APPROVED,
         BookingStatus.REJECTED,
         BookingStatus.CANCELLED,
+        // #ISSUE-06: an expired request is terminal; the user has nothing left to withdraw.
+        BookingStatus.EXPIRED,
       ]) {
         bookingRequest.updateMany.mockClear();
         bookingSlot.updateMany.mockClear();

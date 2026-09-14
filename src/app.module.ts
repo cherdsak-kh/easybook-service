@@ -1,5 +1,6 @@
 import { DynamicModule, Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerModule } from '@nestjs/throttler';
 import type { Redis } from 'ioredis';
 import { AppController } from './app.controller';
@@ -14,6 +15,7 @@ import {
   LOGIN_IP_EMAIL_THROTTLER,
   LOGIN_IP_THROTTLER,
 } from './auth/login-throttle.key';
+import { SCHEDULING_ENABLED } from './common/scheduling.constants';
 import { validateEnv } from './config/env.validation';
 import { CsrfModule } from './csrf/csrf.module';
 import { HealthModule } from './health/health.module';
@@ -77,6 +79,8 @@ const throttlerModule: DynamicModule = {
     RedisModule,
     CsrfModule,
     throttlerModule,
+    // One `forRoot()` per app, registered only outside jest — see `common/scheduling.constants.ts`.
+    ...(SCHEDULING_ENABLED ? [ScheduleModule.forRoot()] : []),
     HealthModule,
     RealtimeModule,
     LineModule,
