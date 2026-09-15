@@ -8,6 +8,7 @@ import type { PrismaService } from '../prisma/prisma.service';
 import type { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import type { RealtimeGateway } from '../realtime/realtime.gateway';
 import { BOOKING_EXPIRY_CRON, BookingExpiryCron } from './booking-expiry.cron';
+import type { BookingNotifier } from './booking-notifier';
 import { publishBookingRequests } from './booking-realtime';
 import {
   AUTO_EXPIRED_REASON,
@@ -46,8 +47,12 @@ describe('BookingExpiryCron', () => {
   } as unknown as PrismaService;
   const realtime = { name: 'admin-gateway' } as unknown as RealtimeGateway;
   const client = { name: 'client-gateway' } as unknown as ClientRealtimeGateway;
+  /** `CLIENT-NOTIFY-1`: mocked at the notifier seam; delivery is `booking-notifier.spec.ts`'s job. */
+  const notifyDecisions = jest.fn<Promise<void>, [unknown]>();
+  const notifier = { notifyDecisions } as unknown as BookingNotifier;
 
-  const subject = () => new BookingExpiryCron(prisma, realtime, client);
+  const subject = () =>
+    new BookingExpiryCron(prisma, realtime, client, notifier);
 
   let logSpy: jest.SpyInstance;
   let errorSpy: jest.SpyInstance;
@@ -56,6 +61,8 @@ describe('BookingExpiryCron', () => {
     updateManyAndReturn.mockReset();
     publish.mockReset();
     publish.mockResolvedValue(undefined);
+    notifyDecisions.mockReset();
+    notifyDecisions.mockResolvedValue(undefined);
     logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation();
     errorSpy = jest.spyOn(Logger.prototype, 'error').mockImplementation();
   });
@@ -182,6 +189,62 @@ describe('BookingExpiryCron', () => {
       const chunks = publish.mock.calls.map((call) => call[4]);
       expect(chunks.map((chunk) => chunk.length)).toEqual([500, 500, 201]);
       expect(chunks.flat()).toEqual(all);
+    });
+  });
+
+  describe('LINE notification (CLIENT-NOTIFY-1, Use Case 1.5)', () => {
+    it('sends each owner an EXPIRED card, after the write and the publish', async () => {
+      updateManyAndReturn.mockResolvedValue([{ id: 'a' }, { id: 'b' }]);
+
+      await subject().expireOverdue(NOW);
+
+      expect(notifyDecisions).toHaveBeenCalledTimes(1);
+      expect(notifyDecisions).toHaveBeenCalledWith([
+        { bookingId: 'a', status: 'EXPIRED' },
+        { bookingId: 'b', status: 'EXPIRED' },
+      ]);
+      expect(updateManyAndReturn.mock.invocationCallOrder[0]).toBeLessThan(
+        notifyDecisions.mock.invocationCallOrder[0],
+      );
+      expect(publish.mock.invocationCallOrder[0]).toBeLessThan(
+        notifyDecisions.mock.invocationCallOrder[0],
+      );
+    });
+
+    it('notifies nobody when nothing expired, or when the write failed', async () => {
+      updateManyAndReturn.mockResolvedValueOnce([]);
+      await subject().expireOverdue(NOW);
+      updateManyAndReturn.mockRejectedValueOnce(
+        new Error('connection terminated'),
+      );
+      await subject().expireOverdue(NOW);
+
+      expect(notifyDecisions).not.toHaveBeenCalled();
+    });
+
+    it('notifies a backlog in the same 500-id chunks as the publish', async () => {
+      const all = ids(1201);
+      updateManyAndReturn.mockResolvedValue(all.map((id) => ({ id })));
+
+      await subject().expireOverdue(NOW);
+
+      const chunks = notifyDecisions.mock.calls.map(
+        (call) => call[0] as { bookingId: string; status: string }[],
+      );
+      expect(chunks.map((chunk) => chunk.length)).toEqual([500, 500, 201]);
+      expect(chunks.flat().map((n) => n.bookingId)).toEqual(all);
+      expect(chunks.flat().every((n) => n.status === 'EXPIRED')).toBe(true);
+    });
+
+    it('the tick survives a notifier that broke its never-throw contract', async () => {
+      updateManyAndReturn.mockResolvedValue([{ id: 'a' }]);
+      notifyDecisions.mockRejectedValue(new Error('line down'));
+
+      await expect(subject().tick()).resolves.toBeUndefined();
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('line down'),
+      );
     });
   });
 

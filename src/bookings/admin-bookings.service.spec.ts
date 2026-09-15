@@ -9,6 +9,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { AdminBookingsService } from './admin-bookings.service';
+import { BookingNotifier } from './booking-notifier';
 import {
   AUTO_REJECTED_REASON,
   BOOKING_ALREADY_CANCELLED,
@@ -114,6 +115,12 @@ describe('AdminBookingsService', () => {
     emitSchedulePulse: jest.fn(),
   };
 
+  /**
+   * The LINE cards (`CLIENT-NOTIFY-1`), mocked at the notifier seam. What this file measures is WHICH
+   * notices each write sends and when; the card content is `notification-cards.spec.ts`'s job.
+   */
+  const notifier = { notifyDecisions: jest.fn() };
+
   const tx = {
     bookingRequest,
     bookingSlot,
@@ -191,6 +198,7 @@ describe('AdminBookingsService', () => {
         },
         { provide: RealtimeGateway, useValue: realtime },
         { provide: ClientRealtimeGateway, useValue: clientRealtime },
+        { provide: BookingNotifier, useValue: notifier },
       ],
     }).compile();
     service = module.get(AdminBookingsService);
@@ -1619,6 +1627,136 @@ describe('AdminBookingsService', () => {
       );
       expect(realtime.emitBookingRequestUpdated).toHaveBeenCalledTimes(1);
       expect(emitted(realtime.emitBookingRequestUpdated)[0].id).toBe(LOSER_ID);
+    });
+
+    /**
+     * `CLIENT-NOTIFY-1`. Lives beside the fan-out tests because it reuses their fixtures and obeys the
+     * same two rules: after the commit, and one notice per changed row.
+     */
+    describe('LINE notification cards (CLIENT-NOTIFY-1)', () => {
+      const notices = () =>
+        callArg<Record<string, unknown>[]>(notifier.notifyDecisions);
+
+      it('approve: APPROVED to the requester, then a reason-free AUTO_REJECTED per loser (D-C13)', async () => {
+        approveBumpingTwo();
+
+        await service.approve(BOOKING_ID, ACTOR);
+
+        expect(notifier.notifyDecisions).toHaveBeenCalledTimes(1);
+        // `toStrictEqual`, not `toEqual`: a loser's notice must not carry even an undefined `reason`.
+        expect(notices()).toStrictEqual([
+          { bookingId: BOOKING_ID, status: 'APPROVED' },
+          { bookingId: LOSER_ID, status: 'AUTO_REJECTED' },
+          { bookingId: LOSER_2_ID, status: 'AUTO_REJECTED' },
+        ]);
+        expect(JSON.stringify(notices())).not.toContain(AUTO_REJECTED_REASON);
+        const lastWrite = bookingRequest.updateMany.mock.invocationCallOrder[1];
+        expect(
+          notifier.notifyDecisions.mock.invocationCallOrder[0],
+        ).toBeGreaterThan(lastWrite);
+      });
+
+      it('a refused approval sends no card', async () => {
+        bookingRequest.findUnique
+          .mockResolvedValueOnce({
+            id: BOOKING_ID,
+            venueId: VENUE_ID,
+            status: BookingStatus.APPROVED,
+          })
+          .mockResolvedValueOnce({ status: BookingStatus.APPROVED });
+
+        await expect(service.approve(BOOKING_ID, ACTOR)).rejects.toThrow(
+          new ConflictException(BOOKING_NOT_PENDING_FOR_DECISION),
+        );
+        expect(notifier.notifyDecisions).not.toHaveBeenCalled();
+      });
+
+      it('reject: REJECTED carrying the operator’s reason', async () => {
+        bookingRequest.findUnique
+          .mockResolvedValueOnce({
+            id: BOOKING_ID,
+            status: BookingStatus.PENDING,
+          })
+          .mockResolvedValue(detailRow({ status: BookingStatus.REJECTED }));
+        bookingRequest.updateMany.mockResolvedValue({ count: 1 });
+
+        await service.reject(BOOKING_ID, { reason: 'ห้องไม่ว่าง' }, ACTOR);
+
+        expect(notices()).toStrictEqual([
+          { bookingId: BOOKING_ID, status: 'REJECTED', reason: 'ห้องไม่ว่าง' },
+        ]);
+      });
+
+      it('cancel: CANCELLED_BY_STAFF about exactly the slots it cancelled, with the reason', async () => {
+        bookingRequest.findUnique
+          .mockResolvedValueOnce({
+            id: BOOKING_ID,
+            venueId: VENUE_ID,
+            status: BookingStatus.APPROVED,
+          })
+          .mockResolvedValueOnce({ status: BookingStatus.APPROVED });
+        bookingSlot.findMany.mockResolvedValue([
+          {
+            id: 's1',
+            startAt: at(DAY),
+            endAt: at(DAY + HOUR),
+            isCancelled: false,
+          },
+          {
+            id: 's2',
+            startAt: at(2 * DAY),
+            endAt: at(2 * DAY + HOUR),
+            isCancelled: false,
+          },
+        ]);
+        bookingSlot.updateMany.mockResolvedValue({ count: 1 });
+        bookingRequest.update.mockResolvedValue({});
+        bookingRequest.findUnique.mockResolvedValue(detailRow());
+
+        await service.cancel(
+          BOOKING_ID,
+          { reason: 'ท่อน้ำแตก', slotIds: ['s2'] },
+          ACTOR,
+        );
+
+        expect(notices()).toStrictEqual([
+          {
+            bookingId: BOOKING_ID,
+            status: 'CANCELLED_BY_STAFF',
+            reason: 'ท่อน้ำแตก',
+            slotIds: ['s2'],
+          },
+        ]);
+      });
+
+      it('direct: APPROVED for the new booking and a reason-free AUTO_REJECTED per loser', async () => {
+        venue.findFirst.mockResolvedValue({ id: VENUE_ID });
+        bookingSlot.findFirst.mockResolvedValue(null);
+        bookingRequest.count.mockResolvedValue(0);
+        bookingRequest.create.mockResolvedValue({ id: BOOKING_ID });
+        bookingRequest.updateMany.mockResolvedValue({ count: 1 });
+        bookingRequest.findUnique.mockResolvedValue(detailRow());
+        bookingRequest.findMany.mockResolvedValueOnce([
+          loser(LOSER_ID, 'BR-25690903-009'),
+        ]);
+
+        await service.createDirect(
+          {
+            venueId: VENUE_ID,
+            purpose: 'ประชุมคณะกรรมการ',
+            attendees: 20,
+            slots: [{ startAt: iso(DAY), endAt: iso(DAY + HOUR) }],
+            requesterName: 'สพท.',
+            contactPhone: '02-000-0000',
+          },
+          ACTOR,
+        );
+
+        expect(notices()).toStrictEqual([
+          { bookingId: BOOKING_ID, status: 'APPROVED' },
+          { bookingId: LOSER_ID, status: 'AUTO_REJECTED' },
+        ]);
+      });
     });
   });
 });

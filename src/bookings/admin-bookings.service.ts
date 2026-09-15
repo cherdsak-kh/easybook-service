@@ -18,6 +18,7 @@ import {
   requesterOf,
   toBookingListDto,
 } from './booking-list-view';
+import { BookingNotifier } from './booking-notifier';
 import {
   approvedClashWhere,
   assertNoApprovedClash,
@@ -158,6 +159,7 @@ export class AdminBookingsService {
     private readonly prisma: PrismaService,
     private readonly realtime: RealtimeGateway,
     private readonly clientRealtime: ClientRealtimeGateway,
+    private readonly notifier: BookingNotifier,
   ) {}
 
   /**
@@ -329,6 +331,16 @@ export class AdminBookingsService {
       [bookingId, ...autoRejected.map((loser) => loser.id)],
       actor,
     );
+    // 10. `CLIENT-NOTIFY-1` — the requester's APPROVED card (Use Case 1.2) and one AUTO_REJECTED card
+    //     per loser (Use Case 1.4). 🔴 D-C13: the losers' notices carry NO reason; the card says only
+    //     that the slot went to someone. After the commit, fail-soft inside.
+    await this.notifier.notifyDecisions([
+      { bookingId, status: 'APPROVED' },
+      ...autoRejected.map((loser) => ({
+        bookingId: loser.id,
+        status: 'AUTO_REJECTED' as const,
+      })),
+    ]);
     return response;
   }
 
@@ -373,6 +385,10 @@ export class AdminBookingsService {
     const booking = await this.readDetail(this.prisma, id);
     // One row changed, so one event — after the commit, never inside it.
     await this.publish('updated', [id], actor);
+    // `CLIENT-NOTIFY-1` Use Case 1.3 — the operator's reason is shown to its requester.
+    await this.notifier.notifyDecisions([
+      { bookingId: id, status: 'REJECTED', reason: dto.reason },
+    ]);
     return booking;
   }
 
@@ -395,6 +411,9 @@ export class AdminBookingsService {
     dto: CancelBookingRequestDto,
     actor: Actor,
   ): Promise<AdminBookingRequestDetailDto> {
+    // The slots this cancellation actually wrote, for the requester's card. Assigned only once the
+    // guarded update succeeded; a throw rolls back and leaves it unread.
+    let cancelledSlotIds: string[] = [];
     await this.runDecision(async (tx) => {
       const booking = await tx.bookingRequest.findUnique({
         where: { id },
@@ -457,6 +476,7 @@ export class AdminBookingsService {
       if (cancelled.count !== targetIds.length) {
         throw new ConflictException(SLOT_ALREADY_CANCELLED);
       }
+      cancelledSlotIds = targetIds;
 
       // 🔴 `cancel` IS A WRITER of the denormalised span, so it MUST recompute it in this same
       // transaction (AC-BR10). `approve` and `reject` are not, and must not.
@@ -487,6 +507,15 @@ export class AdminBookingsService {
     const booking = await this.readDetail(this.prisma, id);
     // Cancelling frees the room for everyone, so every queue looking at this venue must move.
     await this.publish('updated', [id], actor);
+    // `CLIENT-NOTIFY-1` Use Case 1.6 — about the slots cancelled NOW, with the staff reason.
+    await this.notifier.notifyDecisions([
+      {
+        bookingId: id,
+        status: 'CANCELLED_BY_STAFF',
+        reason: dto.reason,
+        slotIds: cancelledSlotIds,
+      },
+    ]);
     return booking;
   }
 
@@ -524,6 +553,16 @@ export class AdminBookingsService {
           autoRejected.map((loser) => loser.id),
           actor,
         );
+        // `CLIENT-NOTIFY-1` — a direct booking made ON BEHALF OF a LINE user is born APPROVED, so that
+        // user gets the APPROVED card (the notifier skips it when `lineUserId` is null); every request
+        // it bumped gets the reason-free AUTO_REJECTED card (D-C13). After the commit, fail-soft.
+        await this.notifier.notifyDecisions([
+          { bookingId, status: 'APPROVED' },
+          ...autoRejected.map((loser) => ({
+            bookingId: loser.id,
+            status: 'AUTO_REJECTED' as const,
+          })),
+        ]);
         return response;
       } catch (err) {
         if (!isCodeCollision(err) || attempt === BOOKING_CODE_MAX_ATTEMPTS) {

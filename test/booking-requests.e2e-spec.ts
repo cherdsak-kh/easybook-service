@@ -1,3 +1,4 @@
+import type { messagingApi } from '@line/bot-sdk';
 import type { INestApplication } from '@nestjs/common';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import { BookingStatus, SystemRole } from '@prisma/client';
@@ -7,6 +8,8 @@ import request from 'supertest';
 import type { App } from 'supertest/types';
 import { PasswordService } from '../src/auth/password.service';
 import { BookingExpiryCron } from '../src/bookings/booking-expiry.cron';
+import { BookingNotifier } from '../src/bookings/booking-notifier';
+import { BookingReminderCron } from '../src/bookings/booking-reminder.cron';
 import {
   AUTO_EXPIRED_REASON,
   AUTO_REJECTED_REASON,
@@ -15,6 +18,7 @@ import {
   BOOKING_VENUE_LOCK_NS,
 } from '../src/bookings/bookings.constants';
 import { API_BASE_PATH } from '../src/common/api.constants';
+import { LineService } from '../src/line/line.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { ClientRealtimeGateway } from '../src/realtime/client-realtime.gateway';
 import { RealtimeGateway } from '../src/realtime/realtime.gateway';
@@ -338,6 +342,8 @@ describe('Booking requests — admin surface (e2e)', () => {
 
   beforeAll(async () => {
     app = await createE2eApp();
+    // Booking writes push LINE cards since CLIENT-NOTIFY-1; never reach the real Messaging API.
+    jest.spyOn(app.get(LineService), 'push').mockResolvedValue(undefined);
     prisma = prismaOf(app);
     redis = redisOf(app);
     await waitForRedis(redis);
@@ -354,6 +360,142 @@ describe('Booking requests — admin surface (e2e)', () => {
     await purgeE2eUsers(prisma, SU_PREFIX);
     await clearThrottleCounters(redis);
     await app.close();
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────────
+  // CLIENT-NOTIFY-1 — LINE Flex cards on decisions, and the reminder claim
+  // ────────────────────────────────────────────────────────────────────────────────
+  describe('LINE notification cards (CLIENT-NOTIFY-1)', () => {
+    const MINUTE = 60_000;
+
+    /** The stub installed in `beforeAll`; `spyOn` on an already-spied method returns that mock. */
+    const pushSpy = () => jest.spyOn(app.get(LineService), 'push');
+
+    /** Every Flex message pushed to one LINE `U…` id, in order. */
+    const flexTo = (to: string) =>
+      pushSpy()
+        .mock.calls.filter(([recipient]) => recipient === to)
+        .map(([, messages]) => messages[0] as messagingApi.FlexMessage);
+
+    beforeEach(() => {
+      pushSpy().mockClear();
+    });
+
+    it('approve pushes APPROVED to the owner and a reason-free AUTO_REJECTED card to the loser (D-C13)', async () => {
+      const loserOwner = (
+        await prisma.lineUser.create({
+          data: { lineUserId: `${ROW_PREFIX}loser`, access: 'ALLOWED' },
+          select: { id: true },
+        })
+      ).id;
+      const winner = await seedBooking({
+        spans: [[DAY, DAY + 2 * HOUR]],
+        purpose: 'งานเลี้ยงรุ่นของผู้ชนะ',
+      });
+      const loser = await seedBooking({
+        spans: [[DAY + HOUR, DAY + 3 * HOUR]],
+        lineUser: loserOwner,
+        purpose: 'ซ้อมละครเวที',
+      });
+
+      const admin = await login(ADMIN);
+      await admin.agent
+        .post(url(`/booking-requests/${winner.id}/approve`))
+        .set('x-csrf-token', admin.token)
+        .expect(200);
+
+      const [approved] = flexTo(`${ROW_PREFIX}allowed`);
+      expect(approved?.altText).toMatch(/^อนุมัติคำขอจอง: /);
+      expect(approved?.altText).toContain(winner.code);
+
+      const [bumped] = flexTo(`${ROW_PREFIX}loser`);
+      expect(bumped?.altText).toContain('มีผู้ได้รับสิทธิ์แล้ว');
+      const serialised = JSON.stringify(bumped);
+      expect(serialised).toContain(loser.code);
+      expect(serialised).not.toContain('งานเลี้ยงรุ่นของผู้ชนะ');
+      expect(serialised).not.toContain(winner.code);
+      expect(serialised).not.toContain(AUTO_REJECTED_REASON);
+    });
+
+    it('reject pushes REJECTED carrying the operator’s reason to the owner', async () => {
+      const booking = await seedBooking({ spans: [[DAY, DAY + HOUR]] });
+
+      const admin = await login(ADMIN);
+      await admin.agent
+        .post(url(`/booking-requests/${booking.id}/reject`))
+        .set('x-csrf-token', admin.token)
+        .send({ reason: 'ปิดปรับปรุงระบบไฟฟ้า' })
+        .expect(200);
+
+      const [card] = flexTo(`${ROW_PREFIX}allowed`);
+      expect(card?.altText).toMatch(/^คำขอจองไม่ผ่านการอนุมัติ: /);
+      expect(JSON.stringify(card)).toContain('ปิดปรับปรุงระบบไฟฟ้า');
+    });
+
+    it('the reminder cron claims each approved, live, LINE-owned slot ONCE and pushes a button-less card', async () => {
+      const soon = await seedBooking({
+        status: BookingStatus.APPROVED,
+        spans: [
+          [30 * MINUTE, 90 * MINUTE],
+          [DAY, DAY + HOUR],
+        ],
+      });
+      const pending = await seedBooking({
+        spans: [[20 * MINUTE, 50 * MINUTE]],
+      });
+      const staffOnly = await seedBooking({
+        status: BookingStatus.APPROVED,
+        venue: otherVenueId,
+        spans: [[40 * MINUTE, 80 * MINUTE]],
+        lineUser: null,
+        createdBy: staffIds[ADMIN],
+        requesterName: 'x',
+      });
+      const cancelled = await seedBooking({
+        status: BookingStatus.APPROVED,
+        venue: otherVenueId,
+        spans: [[10 * MINUTE, 20 * MINUTE]],
+        cancelledSlots: [0],
+      });
+
+      const cron = new BookingReminderCron(prisma, app.get(BookingNotifier));
+      const isReminder = (m: messagingApi.FlexMessage) =>
+        m.altText.startsWith('เตือนความจำ:');
+
+      const first = await cron.remindUpcoming();
+      expect(first).toContain(soon.slotIds[0]);
+      for (const skipped of [
+        soon.slotIds[1],
+        pending.slotIds[0],
+        staffOnly.slotIds[0],
+        cancelled.slotIds[0],
+      ]) {
+        expect(first).not.toContain(skipped);
+      }
+
+      const reminders = flexTo(`${ROW_PREFIX}allowed`).filter(isReminder);
+      expect(reminders).toHaveLength(1);
+      expect(JSON.stringify(reminders[0])).toContain(soon.code);
+      expect(
+        (reminders[0].contents as messagingApi.FlexBubble).footer,
+      ).toBeUndefined();
+
+      // 🔴 The next tick (or a restart) finds the marker and sends nothing again.
+      const second = await cron.remindUpcoming();
+      expect(second).not.toContain(soon.slotIds[0]);
+      expect(flexTo(`${ROW_PREFIX}allowed`).filter(isReminder)).toHaveLength(1);
+
+      const stored = new Map(
+        (
+          await prisma.bookingSlot.findMany({
+            where: { id: { in: soon.slotIds } },
+            select: { id: true, reminderSentAt: true },
+          })
+        ).map((s) => [s.id, s.reminderSentAt] as const),
+      );
+      expect(stored.get(soon.slotIds[0])).toBeInstanceOf(Date);
+      expect(stored.get(soon.slotIds[1])).toBeNull();
+    });
   });
 
   // ────────────────────────────────────────────────────────────────────────────────
@@ -754,6 +896,7 @@ describe('Booking requests — admin surface (e2e)', () => {
         prisma,
         app.get(RealtimeGateway),
         app.get(ClientRealtimeGateway),
+        app.get(BookingNotifier),
       );
       const swept = await cron.expireOverdue();
       expect(swept).toContain(overdue.id);

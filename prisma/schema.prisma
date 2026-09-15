@@ -945,6 +945,16 @@ model BookingSlot {
   /// Optional free text. PDPA: may name a person or a reason; never logged.
   cancelReason String?
 
+  /// When `BookingReminderCron` CLAIMED this slot's pre-usage LINE reminder (`CLIENT-NOTIFY-1`).
+  /// NULL = not reminded yet.
+  ///
+  /// 🔴 THE IDEMPOTENCY KEY FOR REMINDERS. The cron sets it in ONE guarded `UPDATE … WHERE
+  /// "reminderSentAt" IS NULL … RETURNING` BEFORE it pushes, so a second tick, a restart or a second
+  /// app instance gets an empty RETURNING set and never sends the same reminder twice. The cost of
+  /// that ordering is at-most-once: a push that fails after the claim is logged, not retried.
+  /// Per SLOT, not per request: a three-day booking is reminded before each day.
+  reminderSentAt DateTime?
+
   /// 🔴 NOT DATA — AN INDEX KEY, AND THE DATABASE IS ITS ONLY WRITER.
   ///
   /// It mirrors exactly one derived fact: `(NOT isCancelled) AND bookingRequest.status = APPROVED`
@@ -976,6 +986,9 @@ model BookingSlot {
   @@index([venueId, startAt, endAt])
   @@index([bookingRequestId])
   @@index([isCancelled])
+  /// The reminder sweep reads `startAt` across EVERY venue once a minute; the overlap index above
+  /// leads with `venueId` and cannot serve it.
+  @@index([startAt])
   @@map("booking_slots")
 }
 

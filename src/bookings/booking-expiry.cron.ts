@@ -4,6 +4,7 @@ import { BookingStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { BookingNotifier } from './booking-notifier';
 import { publishBookingRequests } from './booking-realtime';
 import {
   AUTO_EXPIRED_REASON,
@@ -44,6 +45,7 @@ export class BookingExpiryCron {
     private readonly prisma: PrismaService,
     private readonly realtime: RealtimeGateway,
     private readonly client: ClientRealtimeGateway,
+    private readonly notifier: BookingNotifier,
   ) {}
 
   /**
@@ -108,13 +110,19 @@ export class BookingExpiryCron {
     // on staff operated, and inventing a `{ id: 'system' }` actor would be a third producer of a shape
     // that names a colleague. Chunked so one re-read's `IN` list stays bounded on a backlog.
     for (let i = 0; i < ids.length; i += BOOKING_EXPIRY_PUBLISH_CHUNK) {
+      const chunk = ids.slice(i, i + BOOKING_EXPIRY_PUBLISH_CHUNK);
       await publishBookingRequests(
         this.prisma,
         this.realtime,
         this.client,
         'updated',
-        ids.slice(i, i + BOOKING_EXPIRY_PUBLISH_CHUNK),
+        chunk,
         null,
+      );
+      // `CLIENT-NOTIFY-1` Use Case 1.5 — each owner's EXPIRED card. Same chunk, so the notifier's one
+      // read keeps a bounded `IN` list; fail-soft inside, like the publish.
+      await this.notifier.notifyDecisions(
+        chunk.map((id) => ({ bookingId: id, status: 'EXPIRED' as const })),
       );
     }
     return ids;

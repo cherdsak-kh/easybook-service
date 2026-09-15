@@ -14,6 +14,7 @@ import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { TOMBSTONE_VENUE_TYPE_NAME } from '../venue-types/venue-types.constants';
 import { isCodeCollision, nextBookingCode } from './booking-code';
+import { BookingNotifier } from './booking-notifier';
 import {
   assertNoApprovedClash,
   parseSlots,
@@ -256,6 +257,7 @@ export class BookingsService {
     private readonly prisma: PrismaService,
     private readonly realtime: RealtimeGateway,
     private readonly clientRealtime: ClientRealtimeGateway,
+    private readonly notifier: BookingNotifier,
   ) {}
 
   /**
@@ -300,6 +302,11 @@ export class BookingsService {
       [row.id],
       null,
     );
+    // `CLIENT-NOTIFY-1` Use Case 1.1 — the requester's PENDING card. After the commit and fail-soft
+    // inside, like the fan-out: a LINE outage can never fail a booking the database accepted.
+    await this.notifier.notifyDecisions([
+      { bookingId: row.id, status: 'PENDING' },
+    ]);
     return toRequestDto(row, venue.name);
   }
 
@@ -535,6 +542,10 @@ export class BookingsService {
       [id],
       null,
     );
+    // `CLIENT-NOTIFY-1` Use Case 1.7 — after the commit, fail-soft inside.
+    await this.notifier.notifyDecisions([
+      { bookingId: id, status: 'CANCELLED_BY_USER' },
+    ]);
     return this.readDetail({ id });
   }
 
@@ -646,6 +657,11 @@ export class BookingsService {
       [id],
       null,
     );
+    // `CLIENT-NOTIFY-1` Use Case 1.7 — the card describes the ONE slot that was dropped, not the
+    // days that survive. After the commit, fail-soft inside.
+    await this.notifier.notifyDecisions([
+      { bookingId: id, status: 'CANCELLED_BY_USER', slotIds: [slotId] },
+    ]);
     return this.readDetail({ id });
   }
 

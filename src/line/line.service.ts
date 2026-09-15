@@ -1,6 +1,12 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { messagingApi } from '@line/bot-sdk';
+import {
+  buildDecisionCard,
+  buildReminderCard,
+  type DecisionCardOptions,
+  type ReminderCardOptions,
+} from './notification-cards';
 
 /**
  * Thin wrapper over the LINE Messaging API SDK: reply/push messaging plus
@@ -39,6 +45,28 @@ export class LineService {
 
   push(to: string, messages: messagingApi.Message[]): Promise<unknown> {
     return this.client.pushMessage({ to, messages });
+  }
+
+  /**
+   * Push a booking Decisions & Lifecycle card (`CLIENT-NOTIFY-1`). Goes through {@link push}, so a
+   * spy on `push` observes it. Rejects on a LINE failure; the caller decides whether that is fatal
+   * (the booking notifier is fail-soft).
+   *
+   * @param to the LINE-side `U…` id (`LineUser.lineUserId`), NOT the cuid `LineUser.id`.
+   */
+  pushDecisionNotification(
+    to: string,
+    options: DecisionCardOptions,
+  ): Promise<unknown> {
+    return this.push(to, [buildDecisionCard(options)]);
+  }
+
+  /** Push a pre-usage reminder card (`CLIENT-NOTIFY-1`). Same contract as the decision push. */
+  pushReminderNotification(
+    to: string,
+    options: ReminderCardOptions,
+  ): Promise<unknown> {
+    return this.push(to, [buildReminderCard(options)]);
   }
 
   getProfile(userId: string): Promise<messagingApi.UserProfileResponse> {

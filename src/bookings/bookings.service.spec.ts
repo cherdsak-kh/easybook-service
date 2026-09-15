@@ -11,6 +11,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import { CLIENT_REALTIME_EVENTS } from '../realtime/realtime.constants';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { BookingNotifier } from './booking-notifier';
 import { BookingsService } from './bookings.service';
 import {
   BOOKING_NOT_ALLOWED,
@@ -229,6 +230,12 @@ describe('BookingsService', () => {
     emitSchedulePulse: jest.fn(),
   };
 
+  /**
+   * The LINE cards (`CLIENT-NOTIFY-1`), mocked at the notifier seam: this file measures WHICH notice
+   * each write sends and when, never the card or the delivery.
+   */
+  const notifier = { notifyDecisions: jest.fn() };
+
   /** The happy path's collaborators, so each test overrides only the one it is about. */
   const allowAndOpen = () => {
     lineUser.findFirst.mockResolvedValue({
@@ -283,6 +290,7 @@ describe('BookingsService', () => {
         },
         { provide: RealtimeGateway, useValue: realtime },
         { provide: ClientRealtimeGateway, useValue: clientRealtime },
+        { provide: BookingNotifier, useValue: notifier },
       ],
     }).compile();
     service = module.get(BookingsService);
@@ -433,6 +441,41 @@ describe('BookingsService', () => {
             dto([{ startAt: iso(DAY), endAt: iso(DAY + HOUR) }]),
           ),
         ).resolves.toBeDefined();
+      });
+
+      it('sends the requester a PENDING LINE card after the insert commits (CLIENT-NOTIFY-1)', async () => {
+        allowAndOpen();
+        echoCreate();
+
+        await service.createFromLine(
+          SUB,
+          dto([{ startAt: iso(DAY), endAt: iso(DAY + HOUR) }]),
+        );
+
+        expect(notifier.notifyDecisions).toHaveBeenCalledTimes(1);
+        expect(notifier.notifyDecisions).toHaveBeenCalledWith([
+          { bookingId: BOOKING_ID, status: 'PENDING' },
+        ]);
+        expect(
+          notifier.notifyDecisions.mock.invocationCallOrder[0],
+        ).toBeGreaterThan(bookingRequest.create.mock.invocationCallOrder[0]);
+      });
+
+      it('notifies nobody when the request is refused', async () => {
+        allowAndOpen();
+        venue.findFirst.mockResolvedValue({
+          id: VENUE_ID,
+          name: 'ห้องประชุมใหญ่',
+          isOpen: false,
+        });
+
+        await expect(
+          service.createFromLine(
+            SUB,
+            dto([{ startAt: iso(DAY), endAt: iso(DAY + HOUR) }]),
+          ),
+        ).rejects.toThrow(new ConflictException(VENUE_CLOSED));
+        expect(notifier.notifyDecisions).not.toHaveBeenCalled();
       });
     });
 
@@ -1659,6 +1702,32 @@ describe('BookingsService', () => {
       expect(realtime.emitBookingRequestUpdated).not.toHaveBeenCalled();
       expect(clientRealtime.emitToVenue).not.toHaveBeenCalled();
     });
+
+    it('sends the requester a CANCELLED_BY_USER card after the commit (CLIENT-NOTIFY-1)', async () => {
+      answerFindFirst(
+        { id: BOOKING_ID, status: BookingStatus.PENDING },
+        detailRow({ status: BookingStatus.CANCELLED }),
+      );
+
+      await service.cancelPendingBooking(SUB, CODE);
+
+      expect(notifier.notifyDecisions).toHaveBeenCalledTimes(1);
+      expect(notifier.notifyDecisions).toHaveBeenCalledWith([
+        { bookingId: BOOKING_ID, status: 'CANCELLED_BY_USER' },
+      ]);
+      expect(
+        notifier.notifyDecisions.mock.invocationCallOrder[0],
+      ).toBeGreaterThan(bookingSlot.updateMany.mock.invocationCallOrder[0]);
+    });
+
+    it('sends no card when the cancellation is refused', async () => {
+      answerFindFirst({ id: BOOKING_ID, status: BookingStatus.APPROVED });
+
+      await expect(service.cancelPendingBooking(SUB, CODE)).rejects.toThrow(
+        new UnprocessableEntityException(BOOKING_NOT_PENDING),
+      );
+      expect(notifier.notifyDecisions).not.toHaveBeenCalled();
+    });
   });
 
   describe('cancelApprovedSlot', () => {
@@ -1756,6 +1825,33 @@ describe('BookingsService', () => {
       // the window of whichever slot went last. There is no aggregate over zero live slots.
       expect(data.firstStartAt).toBeUndefined();
       expect(data.lastEndAt).toBeUndefined();
+    });
+
+    it('sends a CANCELLED_BY_USER card about THAT slot only, after the commit (CLIENT-NOTIFY-1)', async () => {
+      approvedWithSlot(3 * DAY);
+
+      await service.cancelApprovedSlot(SUB, BOOKING_ID, SLOT_ID);
+
+      expect(notifier.notifyDecisions).toHaveBeenCalledTimes(1);
+      expect(notifier.notifyDecisions).toHaveBeenCalledWith([
+        {
+          bookingId: BOOKING_ID,
+          status: 'CANCELLED_BY_USER',
+          slotIds: [SLOT_ID],
+        },
+      ]);
+      expect(
+        notifier.notifyDecisions.mock.invocationCallOrder[0],
+      ).toBeGreaterThan(bookingRequest.update.mock.invocationCallOrder[0]);
+    });
+
+    it('sends no card when the slot is too late to cancel', async () => {
+      approvedWithSlot(29 * 60_000);
+
+      await expect(
+        service.cancelApprovedSlot(SUB, CODE, SLOT_ID),
+      ).rejects.toThrow(new UnprocessableEntityException(SLOT_CANCEL_TOO_LATE));
+      expect(notifier.notifyDecisions).not.toHaveBeenCalled();
     });
 
     it('422s when the booking is not APPROVED — a pending one is cancelled whole', async () => {

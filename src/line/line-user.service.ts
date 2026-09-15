@@ -296,7 +296,7 @@ export const defaultNotificationPreferences =
  * documented default, so a malformed row degrades to "notifications on" rather than to a response
  * whose declared type is a lie.
  */
-const toNotificationPreferences = (
+export const toNotificationPreferences = (
   stored: Prisma.JsonValue | null | undefined,
 ): NotificationPreferencesDto => {
   const defaults = defaultNotificationPreferences();

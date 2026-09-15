@@ -16,6 +16,7 @@ import request from 'supertest';
 import type { App } from 'supertest/types';
 import { PasswordService } from '../src/auth/password.service';
 import { API_BASE_PATH } from '../src/common/api.constants';
+import { LineService } from '../src/line/line.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import {
   CLIENT_REALTIME_EVENTS,
@@ -327,6 +328,8 @@ describe('Client realtime gateway (e2e)', () => {
   beforeAll(async () => {
     stubLineVerify();
     app = await createE2eApp();
+    // Booking writes push LINE cards since CLIENT-NOTIFY-1; never reach the real Messaging API.
+    jest.spyOn(app.get(LineService), 'push').mockResolvedValue(undefined);
     prisma = prismaOf(app);
     redis = redisOf(app);
     cookieName = sessionCookieName(app.get(ConfigService));
