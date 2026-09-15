@@ -1,5 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { BookingStatus } from '@prisma/client';
+import { ListFacetsDto } from '../../common/dto/list-facets.dto';
+import { PaginationMetaDto } from '../../system-users/dto/paginated-system-users-response.dto';
 import {
   VenueAmenityDto,
   VenuePhotoDto,
@@ -197,6 +199,22 @@ export class BookingListItemDto {
 
   @ApiProperty({ format: 'date-time' })
   createdAt!: Date;
+}
+
+/**
+ * The `{ data, meta, facets }` envelope for `GET /line-users/bookings` (`CLIENT-PAGINATION-1`).
+ *
+ * `meta` is the ONE shared `PaginationMetaDto` schema, and `facets` its sibling — see `ListFacetsDto`.
+ */
+export class PaginatedLineBookingsResponseDto {
+  @ApiProperty({ type: [BookingListItemDto] })
+  data!: BookingListItemDto[];
+
+  @ApiProperty({ type: PaginationMetaDto })
+  meta!: PaginationMetaDto;
+
+  @ApiProperty({ type: ListFacetsDto })
+  facets!: ListFacetsDto;
 }
 
 /**

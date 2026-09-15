@@ -30,8 +30,8 @@ import type { RequestWithLineUserId } from '../line/line.types';
 import { BookingsService } from './bookings.service';
 import {
   BookingDetailResponseDto,
-  BookingListItemDto,
   BookingRequestResponseDto,
+  PaginatedLineBookingsResponseDto,
   VenueAvailabilitySlotDto,
 } from './dto/booking-response.dto';
 import { CreateLineBookingDto } from './dto/create-line-booking.dto';
@@ -149,14 +149,15 @@ export class LineBookingsController {
   @Get('bookings')
   @UseGuards(LineIdTokenGuard)
   @ApiOperation({
-    summary: 'List the caller’s own booking requests (`#/bookings`).',
+    summary:
+      'List the caller’s own booking requests, one page at a time (`#/bookings`).',
     description:
-      'Scoped to the verified `sub` — there is no parameter that widens it, and ownership is part of the query rather than a filter applied afterwards. Unpaginated: this is one user’s own bookings, and the screen’s four accordion groups are counted over the whole set. 🔴 `status` filters the five STORED statuses (`EXPIRED` included); the screen derives only `สิ้นสุดแล้ว` from the slots at read time.',
+      'Scoped to the verified `sub` — there is no parameter that widens it, and ownership is part of the rows, the count AND the facets. Offset-paginated (`CLIENT-PAGINATION-1`), so every filter runs in Postgres: 🔴 `state` is the screen’s DERIVED bucket (`pending` / `approved` / `history`), bucketed against the server clock, and the three partition the set. `facets.venueTypes` lists the categories in the caller’s searched set, independent of `state`, `venueTypeId` and the page. The former `status` parameter (stored enum) is gone and is now a 400.',
   })
-  @ApiOkResponse({ type: [BookingListItemDto] })
+  @ApiOkResponse({ type: PaginatedLineBookingsResponseDto })
   @ApiBadRequestResponse({
     description:
-      'An unknown query parameter, an invalid `status` or `sort`, or a `q` longer than 100 characters.',
+      'An unknown query parameter (including the retired `status`), an invalid `state`, `sort` or `venueTypeId`, `page`/`limit` out of bounds, or a `q` longer than 100 characters.',
     type: ErrorResponseDto,
   })
   @ApiUnauthorizedResponse({
@@ -174,7 +175,7 @@ export class LineBookingsController {
   list(
     @Req() req: RequestWithLineUserId,
     @Query() query: ListLineBookingsQueryDto,
-  ): Promise<BookingListItemDto[]> {
+  ): Promise<PaginatedLineBookingsResponseDto> {
     return this.bookings.listUserBookings(req.lineUserId as string, query);
   }
 

@@ -126,14 +126,26 @@ type SlotFindArgs = {
   orderBy?: Record<string, 'asc' | 'desc'>[];
 };
 
-/** `findMany` on the My Bookings list — the ownership clause is what these tests read. */
+/**
+ * `findMany` on the My Bookings list. Since `CLIENT-PAGINATION-1` its `where` is ONE `AND` of four
+ * clauses in a fixed order — ownership, search, venue type, state bucket — which is what these tests
+ * read. `skip`/`take` are the page.
+ */
 type BookingListArgs = {
-  where: {
-    lineUserId: string;
-    status?: BookingStatus;
-    OR?: Record<string, unknown>[];
-  };
+  where: { AND?: Prisma.BookingRequestWhereInput[] };
   orderBy: Record<string, 'asc' | 'desc'>[];
+  skip?: number;
+  take?: number;
+};
+
+/** The facet read: categories reached through the caller's own bookings. */
+type VenueTypeFacetArgs = {
+  where: {
+    venues: {
+      some: { bookingRequests: { some: Prisma.BookingRequestWhereInput } };
+    };
+  };
+  select: { id: true; name: true };
 };
 
 /** `findFirst` on a booking, by id-or-code and owner. `include` marks the DETAIL read. */
@@ -185,10 +197,20 @@ describe('BookingsService', () => {
     update: jest.fn<any, [BookingUpdateArgs]>(),
   };
   const appSetting = { findUnique: jest.fn() };
-  // The interactive form: run the callback against the same mocks, so the assertions below see the
-  // statements the transaction would actually issue.
-  const $transaction = jest.fn((cb: (tx: unknown) => unknown) =>
-    cb({ bookingSlot, bookingRequest }),
+  const venueType = { findMany: jest.fn<any, [VenueTypeFacetArgs]>() };
+  // BOTH forms Prisma offers. The interactive form runs the callback against the same mocks, so the
+  // assertions below see the statements the transaction would actually issue; the batch form (the
+  // paginated list's rows + count + facets) resolves the already-issued queries in order.
+  const $transaction = jest.fn<
+    unknown,
+    [
+      ((tx: unknown) => unknown) | Promise<unknown>[],
+      { isolationLevel?: Prisma.TransactionIsolationLevel }?,
+    ]
+  >((arg) =>
+    Array.isArray(arg)
+      ? Promise.all(arg)
+      : arg({ bookingSlot, bookingRequest }),
   );
 
   /**
@@ -255,6 +277,7 @@ describe('BookingsService', () => {
             bookingSlot,
             bookingRequest,
             appSetting,
+            venueType,
             $transaction,
           },
         },
@@ -1156,55 +1179,171 @@ describe('BookingsService', () => {
 
   const query = (
     over: Partial<ListLineBookingsQueryDto> = {},
-  ): ListLineBookingsQueryDto => ({ sort: BOOKING_SORT_DEFAULT, ...over });
+  ): ListLineBookingsQueryDto => ({
+    sort: BOOKING_SORT_DEFAULT,
+    page: 1,
+    limit: 10,
+    ...over,
+  });
 
   describe('listUserBookings', () => {
     beforeEach(() => {
       allow();
       bookingRequest.findMany.mockResolvedValue([]);
+      bookingRequest.count.mockResolvedValue(0);
+      venueType.findMany.mockResolvedValue([]);
     });
 
-    it('scopes the query to the caller and defaults to newest-submitted first', async () => {
+    /** The four `AND` clauses, in their fixed order. */
+    const clauses = () => {
+      const [owner, search, type, state] =
+        bookingRequest.findMany.mock.calls[0][0].where.AND ?? [];
+      return { owner, search, type, state };
+    };
+
+    const LIVE = { slots: { some: { isCancelled: false } } };
+    const PENDING_BUCKET = {
+      AND: [{ status: BookingStatus.PENDING }, LIVE],
+    };
+    const approvedBucket = (now: Date) => ({
+      AND: [
+        { status: BookingStatus.APPROVED },
+        LIVE,
+        { slots: { some: { endAt: { gte: now } } } },
+      ],
+    });
+    /** The `now` the service captured, read back out of the approved clause it built. */
+    const capturedNow = (clause: Prisma.BookingRequestWhereInput) =>
+      (
+        (clause.AND as Prisma.BookingRequestWhereInput[])[2].slots as {
+          some: { endAt: { gte: Date } };
+        }
+      ).some.endAt.gte;
+
+    it('scopes the query to the caller, adds no filter by default, and defaults to newest-submitted first', async () => {
       await service.listUserBookings(SUB, query());
 
-      const { where, orderBy } = bookingRequest.findMany.mock.calls[0][0];
+      const { orderBy, skip, take } = bookingRequest.findMany.mock.calls[0][0];
       // 🔴 Ownership is a `where` clause, never a filter applied after the read.
-      expect(where.lineUserId).toBe(LINE_USER_ID);
-      expect(where.status).toBeUndefined();
-      expect(where.OR).toBeUndefined();
+      expect(clauses()).toEqual({
+        owner: { lineUserId: LINE_USER_ID },
+        search: {},
+        type: {},
+        state: {},
+      });
       expect(orderBy).toEqual([{ createdAt: 'desc' }, { code: 'asc' }]);
+      expect({ skip, take }).toEqual({ skip: 0, take: 10 });
+    });
+
+    it('returns { data, meta, facets } with the page arithmetic done server-side', async () => {
+      bookingRequest.count.mockResolvedValue(23);
+      venueType.findMany.mockResolvedValue([{ id: 4, name: 'โรงยิม' }]);
+
+      const result = await service.listUserBookings(
+        SUB,
+        query({ page: 3, limit: 10 }),
+      );
+
+      const { skip, take } = bookingRequest.findMany.mock.calls[0][0];
+      expect({ skip, take }).toEqual({ skip: 20, take: 10 });
+      expect(result).toEqual({
+        data: [],
+        meta: { page: 3, limit: 10, total: 23, totalPages: 3 },
+        facets: { venueTypes: [{ id: 4, name: 'โรงยิม' }] },
+      });
+    });
+
+    it('🔴 counts with the SAME where, and reads rows, count and facets in one RepeatableRead snapshot', async () => {
+      await service.listUserBookings(
+        SUB,
+        query({ state: 'history', venueTypeId: 4, q: CODE }),
+      );
+
+      expect(bookingRequest.count.mock.calls[0][0]).toEqual({
+        where: bookingRequest.findMany.mock.calls[0][0].where,
+      });
+      expect($transaction).toHaveBeenCalledTimes(1);
+      expect($transaction.mock.calls[0][0]).toHaveLength(3);
+      expect($transaction.mock.calls[0][1]).toEqual({
+        isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
+      });
     });
 
     it('strips a leading # and searches the code, purpose, venue name and location', async () => {
       await service.listUserBookings(SUB, query({ q: `  #${CODE}  ` }));
 
-      const { where } = bookingRequest.findMany.mock.calls[0][0];
+      const { owner, search } = clauses();
       // The user pasted `#BR-…` out of a LINE chat; the row stores it without the hash.
-      expect(where.OR).toEqual([
-        { code: { contains: CODE, mode: 'insensitive' } },
-        { purpose: { contains: CODE, mode: 'insensitive' } },
-        { venue: { name: { contains: CODE, mode: 'insensitive' } } },
-        { venue: { location: { contains: CODE, mode: 'insensitive' } } },
-      ]);
-      // 🔴 The search never widens past its author.
-      expect(where.lineUserId).toBe(LINE_USER_ID);
+      expect(search).toEqual({
+        OR: [
+          { code: { contains: CODE, mode: 'insensitive' } },
+          { purpose: { contains: CODE, mode: 'insensitive' } },
+          { venue: { name: { contains: CODE, mode: 'insensitive' } } },
+          { venue: { location: { contains: CODE, mode: 'insensitive' } } },
+        ],
+      });
+      // 🔴 The search never widens past its author — it is a sibling in the AND, never a replacement.
+      expect(owner).toEqual({ lineUserId: LINE_USER_ID });
     });
 
     it('emits no search clause at all for a blank q', async () => {
       await service.listUserBookings(SUB, query({ q: '   ' }));
 
-      expect(bookingRequest.findMany.mock.calls[0][0].where.OR).toBeUndefined();
+      expect(clauses().search).toEqual({});
     });
 
-    it('passes a status filter through as the STORED status', async () => {
+    it('filters by the venue’s category through the relation', async () => {
+      await service.listUserBookings(SUB, query({ venueTypeId: 4 }));
+
+      expect(clauses().type).toEqual({ venue: { venueTypeId: 4 } });
+    });
+
+    it('state=pending is PENDING with a live slot', async () => {
+      await service.listUserBookings(SUB, query({ state: 'pending' }));
+
+      expect(clauses().state).toEqual(PENDING_BUCKET);
+    });
+
+    it('🔴 state=approved is APPROVED with a live slot and ANY slot — cancelled included — ending at or after now', async () => {
+      const before = Date.now();
+      await service.listUserBookings(SUB, query({ state: 'approved' }));
+
+      const { state } = clauses();
+      const now = capturedNow(state);
+      expect(now.getTime()).toBeGreaterThanOrEqual(before);
+      expect(now.getTime()).toBeLessThanOrEqual(Date.now());
+      // No `isCancelled` on the end-time clause, and no `lastEndAt` anywhere: that column is
+      // recomputed over SURVIVING slots and would misfile a booking whose last day was dropped.
+      expect(state).toEqual(approvedBucket(now));
+      expect(JSON.stringify(state)).not.toContain('lastEndAt');
+    });
+
+    it('🔴 state=history is the complement of pending and approved, so the three partition the set', async () => {
+      await service.listUserBookings(SUB, query({ state: 'history' }));
+
+      const { state } = clauses();
+      const approved = (
+        (state.NOT as Prisma.BookingRequestWhereInput[])[0]
+          .OR as Prisma.BookingRequestWhereInput[]
+      )[1];
+      expect(state).toEqual({
+        NOT: [{ OR: [PENDING_BUCKET, approvedBucket(capturedNow(approved))] }],
+      });
+    });
+
+    it('🔴 facets are owner-scoped, follow q, and ignore state, venueTypeId and the page', async () => {
       await service.listUserBookings(
         SUB,
-        query({ status: BookingStatus.REJECTED }),
+        query({ q: CODE, state: 'approved', venueTypeId: 4, page: 7 }),
       );
 
-      expect(bookingRequest.findMany.mock.calls[0][0].where.status).toBe(
-        BookingStatus.REJECTED,
-      );
+      const { where, select } = venueType.findMany.mock.calls[0][0];
+      // A facet query without the ownership clause would publish which venue categories OTHER
+      // people have booked.
+      expect(where.venues.some.bookingRequests.some).toEqual({
+        AND: [{ lineUserId: LINE_USER_ID }, clauses().search],
+      });
+      expect(select).toEqual({ id: true, name: true });
     });
 
     it('maps each sort to its own column, always tie-breaking on code', async () => {
@@ -1240,6 +1379,8 @@ describe('BookingsService', () => {
         new ForbiddenException(BOOKING_NOT_ALLOWED),
       );
       expect(bookingRequest.findMany).not.toHaveBeenCalled();
+      expect(bookingRequest.count).not.toHaveBeenCalled();
+      expect(venueType.findMany).not.toHaveBeenCalled();
     });
   });
 

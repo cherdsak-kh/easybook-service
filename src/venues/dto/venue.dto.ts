@@ -15,7 +15,9 @@ import {
   Min,
   ValidateIf,
 } from 'class-validator';
+import { ListFacetsDto } from '../../common/dto/list-facets.dto';
 import { sanitizeThaiText } from '../../common/sanitize-thai.util';
+import { PaginationMetaDto } from '../../system-users/dto/paginated-system-users-response.dto';
 import { VENUE_PHOTOS_MAX } from '../venues.constants';
 
 /**
@@ -54,11 +56,12 @@ export type VenueStatus = (typeof VENUE_STATUSES)[number];
 /**
  * The search box and the two filters the venues screen offers — and only those.
  *
- * ⚠️ NO PAGINATION, and that is a decision rather than an omission. The endpoint returns everything;
- * the footer states a count. Nine venues today, and while nine is not a ceiling, a pager over a list
- * this size is furniture. There is also no `capacity` filter: a range control is the third-biggest
- * thing in the toolbar, and "at least N people" belongs on the LIFF booking form where somebody
- * actually knows N.
+ * ⚠️ NO PAGINATION ON THE **ADMIN** LIST, and that is a decision rather than an omission. `GET /venues`
+ * returns everything; the footer states a count. The LIFF catalogue is paginated since
+ * `CLIENT-PAGINATION-1`, through {@link ListLineVenuesQueryDto}, which EXTENDS this class — so the two
+ * surfaces share one definition of the search and the two filters, and only the consumer grows pages.
+ * There is also no `capacity` filter: a range control is the third-biggest thing in the toolbar, and
+ * "at least N people" belongs on the LIFF booking form where somebody actually knows N.
  */
 export class ListVenuesQueryDto {
   /**
@@ -437,6 +440,57 @@ export class VenueResponseDto {
 
   @ApiProperty({ example: '2026-08-25T10:00:00.000Z' })
   updatedAt!: string;
+}
+
+/** How many venue cards one LIFF page carries — whole rows in both the 1- and 2-column grid. */
+export const LINE_VENUES_PAGE_SIZE_DEFAULT = 12;
+
+/**
+ * `GET /line-users/venues?q=&venueTypeId=&status=&page=&limit=` — the LIFF catalogue (`CLIENT-PAGINATION-1`).
+ *
+ * The admin DTO plus offset pagination, copied validator for validator from `ListLineUsersQueryDto`:
+ * `?page=0`, `?limit=101`, `?page=1.5` and `?page=abc` are all 400s. The field initialisers are
+ * load-bearing — do NOT add `@Expose()` (same footgun `ListSystemUsersQueryDto` documents).
+ */
+export class ListLineVenuesQueryDto extends ListVenuesQueryDto {
+  @ApiPropertyOptional({
+    minimum: 1,
+    default: 1,
+    description: '1-based page number.',
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  page: number = 1;
+
+  @ApiPropertyOptional({
+    minimum: 1,
+    maximum: 100,
+    default: LINE_VENUES_PAGE_SIZE_DEFAULT,
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  @IsOptional()
+  limit: number = LINE_VENUES_PAGE_SIZE_DEFAULT;
+}
+
+/** The `{ data, meta, facets }` envelope for `GET /line-users/venues`. */
+export class PaginatedLineVenuesResponseDto {
+  @ApiProperty({
+    type: [VenueResponseDto],
+    description:
+      'Ordered `isOpen DESC, name ASC, id ASC` — bookable venues first. The client must not re-sort: appended pages would shuffle.',
+  })
+  data!: VenueResponseDto[];
+
+  @ApiProperty({ type: PaginationMetaDto })
+  meta!: PaginationMetaDto;
+
+  @ApiProperty({ type: ListFacetsDto })
+  facets!: ListFacetsDto;
 }
 
 /** `POST /venues/photos` — the object exists in the bucket; nothing references it yet. */

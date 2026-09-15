@@ -1,7 +1,14 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { BookingStatus } from '@prisma/client';
-import { Transform } from 'class-transformer';
-import { IsEnum, IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+import {
+  IsIn,
+  IsInt,
+  IsOptional,
+  IsString,
+  Max,
+  MaxLength,
+  Min,
+} from 'class-validator';
 import { BOOKING_SEARCH_MAX } from '../bookings.constants';
 
 /** Trims a string value, leaving non-strings untouched (mirrors `ListVenuesQueryDto`). */
@@ -31,21 +38,33 @@ export type BookingSort = (typeof BOOKING_SORTS)[number];
 export const BOOKING_SORT_DEFAULT: BookingSort = 'created-desc';
 
 /**
- * `GET /line-users/bookings?q=&status=&sort=`.
+ * The three buckets the `#/bookings` status dropdown offers, spelled exactly as the app's
+ * `StatusFilter` spells them (its `''` "all" is an absent parameter).
+ */
+export const BOOKING_LIST_STATES = ['pending', 'approved', 'history'] as const;
+
+export type BookingListState = (typeof BOOKING_LIST_STATES)[number];
+
+/** Ten booking cards is about three phone screens. */
+export const LINE_BOOKINGS_PAGE_SIZE_DEFAULT = 10;
+
+/**
+ * `GET /line-users/bookings?q=&state=&venueTypeId=&sort=&page=&limit=` (`CLIENT-PAGINATION-1`).
  *
- * ── 🔴 THERE IS NO PAGINATION, AND THAT IS A SCOPE DECISION RATHER THAN AN OMISSION ──
- * This list is one user's own bookings, which is a bounded set in a way the admin lists are not,
- * and it is the same shape `GET /venues` already ships for the client catalogue. Adding `page`
- * later is additive; the thing that would NOT be additive is the client having built its accordion
- * grouping against a paginated list, because four groups computed over page 1 of 5 are four wrong
- * numbers. If this list ever needs pages, the grouping needs a server-side count first.
+ * ── 🔴 PAGINATED, SO EVERY FILTER RUNS IN POSTGRES ──
+ * Until `CLIENT-PAGINATION-1` this list was unpaginated and the screen filtered its status buckets and
+ * venue type in the browser. That is only correct over the WHOLE set: over page 1 of 5 it yields a
+ * wrong count and a "load more" that never ends. So `state` and `venueTypeId` are query parameters,
+ * and the buckets are computed server-side by `stateWhere()` in `bookings.service.ts`.
  *
- * ── 🔴 `status` FILTERS THE STORED STATUS, WHICH IS NOT WHAT THE SCREEN SHOWS ──
- * `#/bookings` paints **six** states from **five** stored statuses plus the clock. Only `สิ้นสุดแล้ว`
- * (an `APPROVED` request past its last slot's end) is derived. `หมดเวลาพิจารณา` is the stored
- * `EXPIRED` (#ISSUE-06). The `ประวัติ` chip means `done` / `expired` / `rejected` / `cancelled` at
- * once. `done` is not a stored value, so the chip filter stays client-side, which the unpaginated
- * list above makes correct rather than merely convenient.
+ * ── 🔴 `state` IS THE SCREEN'S DERIVED BUCKET, NOT THE STORED STATUS ──
+ * `#/bookings` paints six states from five stored statuses plus the clock (`booking-state.ts`
+ * `bookingState()`); `history` means `done` / `expired` / `rejected` / `cancelled` at once, and `done`
+ * is not a stored value. The previous `status` parameter filtered the STORED enum, which is a
+ * different question — `?status=APPROVED` returns last month's approved bookings, which the screen
+ * paints as history. It is REMOVED rather than kept alongside: one list with two meanings of "status"
+ * is worse than either, and `forbidNonWhitelisted` now turns a stale client into a loud 400 instead of
+ * a silently wrong list.
  */
 export class ListLineBookingsQueryDto {
   /**
@@ -66,13 +85,23 @@ export class ListLineBookingsQueryDto {
   q?: string;
 
   @ApiPropertyOptional({
-    enum: BookingStatus,
+    enum: BOOKING_LIST_STATES,
     description:
-      'Narrows to one STORED status (`EXPIRED` included). The screen’s `ประวัติ` chip and its derived `สิ้นสุดแล้ว` badge cannot be passed here — see the class note.',
+      'The screen’s status bucket, decided by the SERVER clock. `pending` = PENDING with a live slot. `approved` = APPROVED with a live slot and some slot (cancelled ones included) ending at or after now. `history` = everything else (done, expired, rejected, cancelled). Absent → all. The three buckets partition the set.',
   })
-  @IsEnum(BookingStatus)
+  @IsIn(BOOKING_LIST_STATES)
   @IsOptional()
-  status?: BookingStatus;
+  state?: BookingListState;
+
+  @ApiPropertyOptional({
+    description:
+      'Filter by the booking’s venue’s CURRENT category id — the one the card prints. Take the options from `facets.venueTypes`.',
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  venueTypeId?: number;
 
   @ApiPropertyOptional({
     enum: BOOKING_SORTS,
@@ -83,4 +112,31 @@ export class ListLineBookingsQueryDto {
   @IsIn(BOOKING_SORTS)
   @IsOptional()
   sort: BookingSort = BOOKING_SORT_DEFAULT;
+
+  /**
+   * Validators copied from `ListLineUsersQueryDto`. The initialisers are load-bearing — do NOT add
+   * `@Expose()` (the footgun `ListSystemUsersQueryDto` documents).
+   */
+  @ApiPropertyOptional({
+    minimum: 1,
+    default: 1,
+    description: '1-based page number.',
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  page: number = 1;
+
+  @ApiPropertyOptional({
+    minimum: 1,
+    maximum: 100,
+    default: LINE_BOOKINGS_PAGE_SIZE_DEFAULT,
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  @IsOptional()
+  limit: number = LINE_BOOKINGS_PAGE_SIZE_DEFAULT;
 }

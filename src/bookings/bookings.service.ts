@@ -44,10 +44,12 @@ import type {
   BookingListItemDto,
   BookingRequestResponseDto,
   BookingSlotResponseDto,
+  PaginatedLineBookingsResponseDto,
   VenueAvailabilitySlotDto,
 } from './dto/booking-response.dto';
 import type { CreateLineBookingDto } from './dto/create-line-booking.dto';
 import type {
+  BookingListState,
   BookingSort,
   ListLineBookingsQueryDto,
 } from './dto/list-line-bookings-query.dto';
@@ -386,30 +388,70 @@ export class BookingsService {
   }
 
   /**
-   * `GET /line-users/bookings` — My Bookings.
+   * `GET /line-users/bookings` — My Bookings, one page at a time (`CLIENT-PAGINATION-1`).
    *
-   * 🔴 OWNERSHIP IS A `where` CLAUSE, NEVER A FILTER AFTER THE READ. `lineUserId` is fixed from the
-   * verified `sub` and combined with the caller's `q`/`status`, so there is no code path on which a
-   * search term can widen the result set past its author. A post-read `.filter()` would put one
-   * forgotten `return` between a typo and every booking in the product.
+   * 🔴 OWNERSHIP IS A `where` CLAUSE, NEVER A FILTER AFTER THE READ — and it is in ALL THREE queries.
+   * `lineUserId` is fixed from the verified `sub`, so no search term, bucket or type can widen the
+   * rows, the count or the facets past their author. The facet query matters as much as the rows: a
+   * facet without ownership would publish which venue categories OTHER people have booked.
+   *
+   * ⚠️ `AND: [...]`, NEVER OBJECT SPREAD. `searchWhere()` returns a top-level `OR` and the bucket
+   * predicates each reach into `slots`; spread together, a later key would silently overwrite an
+   * earlier one and the query would get WIDER rather than fail.
+   *
+   * ⚠️ ONE `RepeatableRead` SNAPSHOT for rows, count and facets, so `meta.total` cannot disagree with
+   * `data` (the `LineUserService.findManyPaginated` precedent). `now` is read ONCE, so the row read and
+   * the count bucket every booking against the same instant.
    */
   async listUserBookings(
     lineSub: string,
     query: ListLineBookingsQueryDto,
-  ): Promise<BookingListItemDto[]> {
+  ): Promise<PaginatedLineBookingsResponseDto> {
     const requester = await this.resolveAllowedRequester(lineSub);
+    const { page, limit } = query;
+    const now = new Date();
 
-    const rows = await this.prisma.bookingRequest.findMany({
-      where: {
-        lineUserId: requester.id,
-        ...(query.status ? { status: query.status } : {}),
-        ...searchWhere(query.q),
-      },
-      include: LIST_INCLUDE,
-      orderBy: SORT_ORDER[query.sort],
-    });
+    const owned: Prisma.BookingRequestWhereInput = { lineUserId: requester.id };
+    const where: Prisma.BookingRequestWhereInput = {
+      AND: [
+        owned,
+        searchWhere(query.q),
+        query.venueTypeId ? { venue: { venueTypeId: query.venueTypeId } } : {},
+        stateWhere(query.state, now),
+      ],
+    };
+    const facetWhere: Prisma.BookingRequestWhereInput = {
+      AND: [owned, searchWhere(query.q)],
+    };
 
-    return rows.map(toListDto);
+    const [rows, total, venueTypes] = await this.prisma.$transaction(
+      [
+        this.prisma.bookingRequest.findMany({
+          where,
+          include: LIST_INCLUDE,
+          orderBy: SORT_ORDER[query.sort],
+          skip: (page - 1) * limit,
+          take: limit,
+        }),
+        this.prisma.bookingRequest.count({ where }),
+        // No `venue.deletedAt` filter: a booking at a retired venue is still on the list with its
+        // category, so that category must stay selectable.
+        this.prisma.venueType.findMany({
+          where: {
+            venues: { some: { bookingRequests: { some: facetWhere } } },
+          },
+          select: { id: true, name: true },
+          orderBy: [{ name: 'asc' }, { id: 'asc' }],
+        }),
+      ],
+      { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead },
+    );
+
+    return {
+      data: rows.map(toListDto),
+      meta: { page, limit, total, totalPages: Math.ceil(total / limit) },
+      facets: { venueTypes },
+    };
   }
 
   /**
@@ -841,6 +883,59 @@ function searchWhere(q?: string): Prisma.BookingRequestWhereInput {
       { venue: { location: like } },
     ],
   };
+}
+
+/** At least one slot still occupies a calendar. Its absence is `cancelled`, whatever the status says. */
+const HAS_LIVE_SLOT = {
+  slots: { some: { isCancelled: false } },
+} satisfies Prisma.BookingRequestWhereInput;
+
+/**
+ * The `#/bookings` status buckets as Prisma, rule for rule with the app's `bookingState()`
+ * (`easybook-app/src/client-portal/pages/bookings/booking-state.ts`):
+ *
+ * | `bookingState()` rule, in order | State | Bucket |
+ * |---|---|---|
+ * | `CANCELLED`, or no live slot | cancelled | history |
+ * | `REJECTED` | rejected | history |
+ * | `EXPIRED` (stored by the cron — never the clock) | expired | history |
+ * | `APPROVED` and `now > max(endAt over ALL slots)` | done | history |
+ * | `APPROVED` otherwise | approved | approved |
+ * | `PENDING` otherwise | pending | pending |
+ *
+ * 🔴 THE LATEST END SPANS EVERY SLOT, CANCELLED ONES INCLUDED, AND NEVER READS `lastEndAt`. That
+ * column is recomputed over the SURVIVING slots on each cancellation, so a booking whose last day was
+ * dropped would fall into history while its remaining days are still ahead. `now > lastEnd` ⇔ no slot
+ * has `endAt >= now`, hence `gte` — the complement of the client's strict `>`.
+ *
+ * 🔴 `history` IS THE COMPLEMENT OF THE OTHER TWO, not a list of its own. The three buckets are then a
+ * partition BY CONSTRUCTION: no booking lands in two or in none, whatever edge case arrives later — a
+ * request with zero slots, or a sixth enum value.
+ */
+function stateWhere(
+  state: BookingListState | undefined,
+  now: Date,
+): Prisma.BookingRequestWhereInput {
+  if (!state) return {};
+  const pending: Prisma.BookingRequestWhereInput = {
+    AND: [{ status: BookingStatus.PENDING }, HAS_LIVE_SLOT],
+  };
+  const approved: Prisma.BookingRequestWhereInput = {
+    AND: [
+      { status: BookingStatus.APPROVED },
+      HAS_LIVE_SLOT,
+      // ALL slots — deliberately no `isCancelled` filter here.
+      { slots: { some: { endAt: { gte: now } } } },
+    ],
+  };
+  switch (state) {
+    case 'pending':
+      return pending;
+    case 'approved':
+      return approved;
+    case 'history':
+      return { NOT: [{ OR: [pending, approved] }] };
+  }
 }
 
 /**

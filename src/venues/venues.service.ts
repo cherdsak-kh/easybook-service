@@ -22,7 +22,9 @@ import {
 } from './venues.constants';
 import type {
   CreateVenueDto,
+  ListLineVenuesQueryDto,
   ListVenuesQueryDto,
+  PaginatedLineVenuesResponseDto,
   UpdateVenueDto,
   VenueResponseDto,
 } from './dto/venue.dto';
@@ -83,6 +85,32 @@ const toDto = (row: VenueRow): VenueResponseDto => ({
 });
 
 /**
+ * The search and the two filters, shared by the admin list and the LIFF catalogue.
+ *
+ * `q` matches the NAME or the LOCATION, which is what the search box promises
+ * ("ค้นหาจากชื่อสถานที่หรือที่ตั้ง"); matching the description too would return rows whose reason for
+ * matching is invisible on the card. An absent or blank term produces no clause at all.
+ */
+const venueListWhere = (
+  query: Pick<ListVenuesQueryDto, 'q' | 'venueTypeId' | 'status'>,
+): Prisma.VenueWhereInput => {
+  const q = query.q?.trim();
+  return {
+    deletedAt: null,
+    ...(query.venueTypeId ? { venueTypeId: query.venueTypeId } : {}),
+    ...(query.status ? { isOpen: query.status === 'open' } : {}),
+    ...(q
+      ? {
+          OR: [
+            { name: { contains: q, mode: 'insensitive' } },
+            { location: { contains: q, mode: 'insensitive' } },
+          ],
+        }
+      : {}),
+  };
+};
+
+/**
  * `สถานที่จัดกิจกรรม` — the product's subject table.
  *
  * ⚠️ NOT CACHED, and every write here drops OTHER tables' keys. See `VENUE_WRITE_CACHE_KEYS`: both
@@ -111,25 +139,62 @@ export class VenuesService {
    * rows whose reason for matching is invisible on the card.
    */
   async list(query: ListVenuesQueryDto): Promise<VenueResponseDto[]> {
-    const q = query.q?.trim();
     const rows = await this.prisma.venue.findMany({
-      where: {
-        deletedAt: null,
-        ...(query.venueTypeId ? { venueTypeId: query.venueTypeId } : {}),
-        ...(query.status ? { isOpen: query.status === 'open' } : {}),
-        ...(q
-          ? {
-              OR: [
-                { name: { contains: q, mode: 'insensitive' } },
-                { location: { contains: q, mode: 'insensitive' } },
-              ],
-            }
-          : {}),
-      },
+      where: venueListWhere(query),
       include: PUBLIC_INCLUDE,
       orderBy: { name: 'asc' },
     });
     return rows.map(toDto);
+  }
+
+  /**
+   * `GET /line-users/venues` — the LIFF catalogue, one page at a time (`CLIENT-PAGINATION-1`).
+   *
+   * 🔴 THE SAME `where` AS {@link list}, from the same function. The admin list and the catalogue
+   * are one definition of "matches the search and the filters"; two copies are how a fix lands on
+   * one screen and not the other.
+   *
+   * 🔴 THE ORDER IS THE SERVER'S NOW. `isOpen DESC` keeps bookable venues first — the rule the page
+   * used to apply in the browser — and `id` makes the order TOTAL, which offset pagination needs:
+   * without it two rows sharing a sort key may swap between two page reads and one of them is
+   * served twice while the other is never served. The client must not re-sort appended pages.
+   *
+   * ⚠️ ONE `RepeatableRead` SNAPSHOT for rows, count and facets (the `LineUserService.
+   * findManyPaginated` precedent): under READ COMMITTED each statement sees its own snapshot, so
+   * `meta.total` could disagree with `data`. A read-only RepeatableRead transaction cannot abort.
+   *
+   * Facets follow `q` only — see `ListFacetsDto`.
+   */
+  async listForLine(
+    query: ListLineVenuesQueryDto,
+  ): Promise<PaginatedLineVenuesResponseDto> {
+    const { page, limit } = query;
+    const where = venueListWhere(query);
+
+    const [rows, total, venueTypes] = await this.prisma.$transaction(
+      [
+        this.prisma.venue.findMany({
+          where,
+          include: PUBLIC_INCLUDE,
+          orderBy: [{ isOpen: 'desc' }, { name: 'asc' }, { id: 'asc' }],
+          skip: (page - 1) * limit,
+          take: limit,
+        }),
+        this.prisma.venue.count({ where }),
+        this.prisma.venueType.findMany({
+          where: { venues: { some: venueListWhere({ q: query.q }) } },
+          select: { id: true, name: true },
+          orderBy: [{ name: 'asc' }, { id: 'asc' }],
+        }),
+      ],
+      { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead },
+    );
+
+    return {
+      data: rows.map(toDto),
+      meta: { page, limit, total, totalPages: Math.ceil(total / limit) },
+      facets: { venueTypes },
+    };
   }
 
   /**

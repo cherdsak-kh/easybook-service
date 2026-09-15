@@ -5,7 +5,7 @@ import { VENUE_NOT_FOUND } from '../venues/venues.constants';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
 import { VenuesService } from '../venues/venues.service';
-import type { ListVenuesQueryDto } from '../venues/dto/venue.dto';
+import type { ListLineVenuesQueryDto } from '../venues/dto/venue.dto';
 import { LineIdTokenGuard } from './guards/line-id-token.guard';
 import { LineRegistrationController } from './line-registration.controller';
 import { LineUserService } from './line-user.service';
@@ -39,6 +39,7 @@ describe('LineRegistrationController', () => {
   // the service's own behaviour has its own spec.
   const venues = {
     list: jest.fn(),
+    listForLine: jest.fn(),
     findById: jest.fn(),
   };
 
@@ -133,43 +134,63 @@ describe('LineRegistrationController', () => {
   });
 
   describe('GET /line-users/venues', () => {
-    it('passes the query through to VenuesService.list and returns the list', async () => {
-      const query: ListVenuesQueryDto = {
+    const page = (
+      over: Partial<ListLineVenuesQueryDto> = {},
+    ): ListLineVenuesQueryDto => ({ page: 1, limit: 12, ...over });
+    const envelope = (data: unknown[]) => ({
+      data,
+      meta: { page: 1, limit: 12, total: data.length, totalPages: 1 },
+      facets: { venueTypes: [] },
+    });
+
+    it('passes the query through to VenuesService.listForLine and returns the envelope', async () => {
+      const query = page({
         q: 'หอประชุม',
         venueTypeId: 4,
         status: 'open',
-      };
-      const rows = [{ id: 'v1' }, { id: 'v2' }];
-      venues.list.mockResolvedValue(rows);
+        page: 2,
+      });
+      const result$ = envelope([{ id: 'v1' }, { id: 'v2' }]);
+      venues.listForLine.mockResolvedValue(result$);
 
       const result = await controller.listVenues(query);
 
-      expect(venues.list).toHaveBeenCalledWith(query);
-      expect(result).toBe(rows);
+      expect(venues.listForLine).toHaveBeenCalledWith(query);
+      expect(result).toBe(result$);
+    });
+
+    it('🔴 never calls the admin list — the LIFF catalogue is the paginated read', async () => {
+      // `VenuesService.list` is the unpaginated admin read behind `GET /venues`. Reaching it from
+      // here would hand the LIFF client a bare array and every row at once.
+      venues.listForLine.mockResolvedValue(envelope([]));
+
+      await controller.listVenues(page());
+
+      expect(venues.list).not.toHaveBeenCalled();
     });
 
     it('is identity-free: the catalogue is the same for every caller', async () => {
       // The token proves the caller may SEE the catalogue; it does not scope WHAT they see. This
       // handler is handed no request object at all — it cannot reach `req.lineUserId` even by
       // accident — so the only thing that reaches the service is the query.
-      venues.list.mockResolvedValue([]);
+      venues.listForLine.mockResolvedValue(envelope([]));
 
-      await controller.listVenues({});
+      await controller.listVenues(page());
 
-      expect(venues.list).toHaveBeenCalledTimes(1);
-      expect(venues.list).toHaveBeenCalledWith({});
+      expect(venues.listForLine).toHaveBeenCalledTimes(1);
+      expect(venues.listForLine).toHaveBeenCalledWith(page());
     });
 
     it('returns closed venues untouched — the screen renders closedReason as an alert', async () => {
       // A closed venue stays VISIBLE to end users and accepts no new booking requests. Filtering it
       // out here would make it indistinguishable from a deleted one, and the detail screen would
       // have nothing to explain the absence with.
-      const closed = [
+      const closed = envelope([
         { id: 'v1', isOpen: false, closedReason: 'ปิดปรับปรุงพื้นสนาม' },
-      ];
-      venues.list.mockResolvedValue(closed);
+      ]);
+      venues.listForLine.mockResolvedValue(closed);
 
-      const result = await controller.listVenues({});
+      const result = await controller.listVenues(page());
 
       expect(result).toBe(closed);
     });

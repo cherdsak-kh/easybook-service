@@ -24,7 +24,11 @@ import {
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
 import { ErrorResponseDto } from '../common/dto/error-response.dto';
-import { ListVenuesQueryDto, VenueResponseDto } from '../venues/dto/venue.dto';
+import {
+  ListLineVenuesQueryDto,
+  PaginatedLineVenuesResponseDto,
+  VenueResponseDto,
+} from '../venues/dto/venue.dto';
 import { VenuesService } from '../venues/venues.service';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { LineUserStatusResponseDto } from './dto/line-user-status-response.dto';
@@ -126,13 +130,18 @@ export class LineRegistrationController {
   @Get('venues')
   @UseGuards(LineIdTokenGuard)
   @ApiOperation({
-    summary: 'List venues for the LIFF catalogue screen.',
+    summary: 'List venues for the LIFF catalogue screen, one page at a time.',
     description:
-      'The consumer half of `GET /venues`, which is admin-only at class level and unreachable with a LINE ID token. Same service, same shape, same search/filter behaviour — a different guard in front of it. Unpaginated and `name ASC`, exactly like the admin list. CLOSED venues ARE returned (`isOpen: false`, with `closedReason`): a closed venue stays visible to end users and simply accepts no new booking requests. Soft-deleted venues are never returned.',
+      'The consumer half of `GET /venues`, which is admin-only at class level and unreachable with a LINE ID token. Same service and the SAME search/filter `where` — a different guard in front of it. Unlike the admin list it is offset-paginated (`CLIENT-PAGINATION-1`) and ordered `isOpen DESC, name ASC, id ASC`, so bookable venues come first and appended pages never reshuffle. CLOSED venues ARE returned (`isOpen: false`, with `closedReason`): a closed venue stays visible to end users and simply accepts no new booking requests. Soft-deleted venues are never returned. `facets.venueTypes` lists the categories matching `q`, independent of `venueTypeId`, `status` and the page.',
   })
   @ApiOkResponse({
-    description: 'Every non-deleted venue matching the filters, `name ASC`.',
-    type: [VenueResponseDto],
+    description: 'One page of non-deleted venues matching the filters.',
+    type: PaginatedLineVenuesResponseDto,
+  })
+  @ApiBadRequestResponse({
+    description:
+      'An unknown query parameter, `page`/`limit` out of bounds, an invalid `venueTypeId` or `status`, or a `q` longer than 100 characters.',
+    type: ErrorResponseDto,
   })
   @ApiUnauthorizedResponse({
     description: 'Missing/invalid/expired/wrong-aud LINE ID token.',
@@ -142,8 +151,10 @@ export class LineRegistrationController {
     description: 'LINE verification endpoint unreachable (retryable).',
     type: ErrorResponseDto,
   })
-  listVenues(@Query() query: ListVenuesQueryDto): Promise<VenueResponseDto[]> {
-    return this.venues.list(query);
+  listVenues(
+    @Query() query: ListLineVenuesQueryDto,
+  ): Promise<PaginatedLineVenuesResponseDto> {
+    return this.venues.listForLine(query);
   }
 
   @Get('venues/:id')
