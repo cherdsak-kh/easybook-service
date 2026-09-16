@@ -1,6 +1,8 @@
 import type { messagingApi } from '@line/bot-sdk';
+import { describeSlots } from '../bookings/booking-notifier';
 import { AUTO_REJECTED_REASON } from '../bookings/bookings.constants';
 import {
+  ALT_TEXT_MAX_CHARS,
   AUTO_REJECTED_NOTICE,
   buildDecisionCard,
   buildReminderCard,
@@ -49,6 +51,13 @@ const base = (
   liffUrl: LIFF,
   ...over,
 });
+
+/** `n` consecutive daily slots, 09:00–12:00 Bangkok, from 18 Sep 2026 — the real `describeSlots` input. */
+const dailySlots = (n: number) =>
+  Array.from({ length: n }, (_, i) => ({
+    startAt: new Date(Date.UTC(2026, 8, 18, 2) + i * 86_400_000),
+    endAt: new Date(Date.UTC(2026, 8, 18, 5) + i * 86_400_000),
+  }));
 
 const ALL: DecisionCardStatus[] = [
   'PENDING',
@@ -273,14 +282,14 @@ describe('buildDecisionCard', () => {
   });
 
   it.each([
-    ['PENDING', 'ดูรายละเอียดคำขอจอง', '#0f172a', '#/booking/bk1'],
-    ['APPROVED', 'ดูรายละเอียดคำขอจอง', '#047857', '#/booking/bk1'],
-    ['REJECTED', 'เลือกจองช่วงเวลาอื่น', '#0f172a', '#/venue/vn1'],
-    ['AUTO_REJECTED', 'ค้นหาช่วงเวลาอื่นที่ว่าง', '#0369a1', '#/venue/vn1'],
-    ['EXPIRED', 'เลือกจองช่วงเวลาอื่น', '#334155', '#/venue/vn1'],
-    ['CANCELLED_BY_STAFF', 'ดูรายละเอียดคำขอจอง', '#0f172a', '#/booking/bk1'],
-    ['CANCELLED_BY_USER', 'ค้นหาสถานที่เพื่อจองใหม่', '#334155', '#/venues'],
-    ['SLOT_AVAILABLE', 'ส่งคำขอจองทันที', '#047857', '#/venue/vn1'],
+    ['PENDING', 'ดูรายละเอียดคำขอจอง', '#0f172a', '/booking/bk1'],
+    ['APPROVED', 'ดูรายละเอียดคำขอจอง', '#047857', '/booking/bk1'],
+    ['REJECTED', 'เลือกจองช่วงเวลาอื่น', '#0f172a', '/venue/vn1'],
+    ['AUTO_REJECTED', 'ค้นหาช่วงเวลาอื่นที่ว่าง', '#0369a1', '/venue/vn1'],
+    ['EXPIRED', 'เลือกจองช่วงเวลาอื่น', '#334155', '/venue/vn1'],
+    ['CANCELLED_BY_STAFF', 'ดูรายละเอียดคำขอจอง', '#0f172a', '/booking/bk1'],
+    ['CANCELLED_BY_USER', 'ค้นหาสถานที่เพื่อจองใหม่', '#334155', '/venues'],
+    ['SLOT_AVAILABLE', 'ส่งคำขอจองทันที', '#047857', '/venue/vn1'],
   ] as [DecisionCardStatus, string, string, string][])(
     '%s CTA "%s" (%s) deep-links to LIFF %s',
     (status, label, color, route) => {
@@ -297,6 +306,145 @@ describe('buildDecisionCard', () => {
       });
     },
   );
+
+  it('🔴 links by PATH, never a hash route (the app is a BrowserRouter), and ids are encoded', () => {
+    for (const status of ALL) {
+      const card = buildDecisionCard(base(status, { bookingId: 'a/b c' }));
+      expect(JSON.stringify(card)).not.toContain('#/');
+    }
+    const footer = bubbleOf(
+      buildDecisionCard(base('APPROVED', { bookingId: 'a/b c' })),
+    ).footer as messagingApi.FlexBox;
+    expect(
+      (
+        (footer.contents[0] as messagingApi.FlexButton).action as {
+          uri: string;
+        }
+      ).uri,
+    ).toBe(`${LIFF}/booking/a%2Fb%20c`);
+  });
+
+  it('drops a trailing slash on LINE_LIFF_URL instead of producing "//"', () => {
+    const footer = bubbleOf(
+      buildDecisionCard(base('APPROVED', { liffUrl: `${LIFF}/` })),
+    ).footer as messagingApi.FlexBox;
+
+    expect(
+      (
+        (footer.contents[0] as messagingApi.FlexButton).action as {
+          uri: string;
+        }
+      ).uri,
+    ).toBe(`${LIFF}/booking/bk1`);
+  });
+
+  it('renders a multi-date dateText in a wrapping text node, so LINE shows its newlines', () => {
+    const dateText = '• 18 ก.ย. 2569\n• 20 ก.ย. 2569';
+    const body = bubbleOf(buildDecisionCard(base('APPROVED', { dateText })))
+      .body as messagingApi.FlexBox;
+    const venueBox = body.contents.find((c) =>
+      textsOf(c).includes('ข้อมูลสถานที่'),
+    ) as messagingApi.FlexBox;
+    const dateRow = venueBox.contents.find((c) =>
+      textsOf(c).includes('วันที่ใช้งาน'),
+    ) as messagingApi.FlexBox;
+    const value = dateRow.contents[1] as messagingApi.FlexText;
+
+    expect(value.text).toBe(dateText);
+    expect(value.wrap).toBe(true);
+  });
+
+  /**
+   * 🔴 The chat-list preview. LINE rejects the WHOLE push with HTTP 400 over 400 characters, so a
+   * long booking would silently deliver no card at all. The bubble keeps its bulleted list.
+   */
+  describe('altText is one line and never breaches the 400-character cap', () => {
+    it.each([30, 60])(
+      '%i distinct dates: every card type stays single-line and under the cap',
+      (days) => {
+        const { dateText, dateSummary, periodText } = describeSlots(
+          dailySlots(days),
+        );
+        // The bubble's list is still one line per booked day.
+        expect(dateText.split('\n')).toHaveLength(days);
+
+        for (const status of ALL) {
+          const { altText } = buildDecisionCard(
+            base(status, { dateText, dateSummary, periodText }),
+          );
+
+          expect(altText.length).toBeLessThanOrEqual(ALT_TEXT_MAX_CHARS);
+          expect(altText).not.toContain('\n');
+          expect(altText).not.toContain('•');
+          // Summarised, not truncated: the preview still says which days and how many.
+          expect(altText).toContain(dateSummary);
+          expect(altText).not.toContain('…');
+        }
+      },
+    );
+
+    it('the bubble still carries the full bulleted list at the 60-slot cap', () => {
+      const { dateText, dateSummary, periodText } = describeSlots(
+        dailySlots(60),
+      );
+      const card = buildDecisionCard(
+        base('APPROVED', { dateText, dateSummary, periodText }),
+      );
+
+      expect(textsOf(bubbleOf(card))).toContain(dateText);
+      expect(dateText).toContain('• 16 พ.ย. 2569');
+      expect(card.altText).toContain(
+        '18 ก.ย. 2569 - 16 พ.ย. 2569 (รวม 60 วัน)',
+      );
+    });
+
+    it('a single date reads exactly as it did before, summary or not', () => {
+      const one = describeSlots(dailySlots(1));
+      expect(one.dateSummary).toBe(one.dateText);
+
+      for (const status of ALL) {
+        expect(buildDecisionCard(base(status, one)).altText).toBe(
+          buildDecisionCard(
+            base(status, {
+              dateText: one.dateText,
+              periodText: one.periodText,
+            }),
+          ).altText,
+        );
+      }
+    });
+
+    it('flattens a bulleted dateText even when no dateSummary is supplied', () => {
+      const { altText } = buildDecisionCard(
+        base('APPROVED', { dateText: '• 18 ก.ย. 2569\n• 20 ก.ย. 2569' }),
+      );
+
+      expect(altText).toContain('18 ก.ย. 2569 20 ก.ย. 2569');
+      expect(altText).not.toContain('\n');
+      expect(altText).not.toContain('•');
+    });
+
+    it('truncates with an ellipsis rather than letting LINE refuse the card', () => {
+      const { altText } = buildDecisionCard(
+        base('APPROVED', { venueName: 'ห'.repeat(500) }),
+      );
+
+      expect(altText).toHaveLength(ALT_TEXT_MAX_CHARS);
+      expect(altText.endsWith('…')).toBe(true);
+    });
+
+    it('never cuts a surrogate pair in half', () => {
+      const { altText } = buildDecisionCard(
+        base('APPROVED', { venueName: '🎉'.repeat(300) }),
+      );
+
+      expect(altText.length).toBeLessThanOrEqual(ALT_TEXT_MAX_CHARS);
+      expect(altText.endsWith('…')).toBe(true);
+      expect(
+        altText.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, ''),
+      ).not.toMatch(/[\uD800-\uDFFF]/);
+    });
+  });
 
   it.each(ALL)(
     '%s hides the footer when LINE_LIFF_URL is unset (fail-soft CTA)',
@@ -399,5 +547,16 @@ describe('buildReminderCard', () => {
     expect(buildReminderCard(reminder()).altText).toBe(
       'เตือนความจำ: ใกล้ถึงเวลาเข้าใช้สถานที่ ห้องประชุมใหญ่ อาคาร 50 พรรษา เวลา 09:00 - 12:00 น.',
     );
+  });
+
+  it('altText goes through the same choke point: one line, at most 400 characters', () => {
+    const { altText } = buildReminderCard(
+      reminder({ venueName: `ห้องประชุม\n• ชั้น 3 ${'ก'.repeat(500)}` }),
+    );
+
+    expect(altText.length).toBeLessThanOrEqual(ALT_TEXT_MAX_CHARS);
+    expect(altText).not.toContain('\n');
+    expect(altText).not.toContain('•');
+    expect(altText).toContain('ห้องประชุม ชั้น 3');
   });
 });

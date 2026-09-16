@@ -1,9 +1,10 @@
 import { Logger } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
 import type { LineService } from '../line/line.service';
-import type {
-  DecisionCardOptions,
-  ReminderCardOptions,
+import {
+  buildDecisionCard,
+  type DecisionCardOptions,
+  type ReminderCardOptions,
 } from '../line/notification-cards';
 import type { PrismaService } from '../prisma/prisma.service';
 import {
@@ -58,6 +59,7 @@ describe('formatting helpers', () => {
   it('one slot → its date and "HH:mm - HH:mm น."', () => {
     expect(describeSlots([{ startAt: START, endAt: END }])).toEqual({
       dateText: '18 ก.ย. 2569',
+      dateSummary: '18 ก.ย. 2569',
       periodText: '09:00 - 12:00 น.',
     });
   });
@@ -70,23 +72,36 @@ describe('formatting helpers', () => {
           endAt: new Date('2026-09-18T17:00:00.000Z'),
         },
       ]),
-    ).toEqual({ dateText: '18 ก.ย. 2569', periodText: '22:00 - 00:00 น.' });
+    ).toEqual({
+      dateText: '18 ก.ย. 2569',
+      dateSummary: '18 ก.ย. 2569',
+      periodText: '22:00 - 00:00 น.',
+    });
   });
 
-  it('several days at the same time → a counted range and the shared period', () => {
-    const day = 86_400_000;
-    const slots = [0, 1, 2].map((d) => ({
-      startAt: new Date(START.getTime() + d * day),
-      endAt: new Date(END.getTime() + d * day),
-    }));
+  const DAY = 86_400_000;
+  const onDay = (d: number, start = START, end = END) => ({
+    startAt: new Date(start.getTime() + d * DAY),
+    endAt: new Date(end.getTime() + d * DAY),
+  });
 
-    expect(describeSlots(slots)).toEqual({
-      dateText: '18 ก.ย. 2569 - 20 ก.ย. 2569 (3 ช่วงเวลา)',
+  it('several days at the same time → one bullet per date (never a range) and the shared period', () => {
+    expect(describeSlots([onDay(0), onDay(1), onDay(2)])).toEqual({
+      dateText: '• 18 ก.ย. 2569\n• 19 ก.ย. 2569\n• 20 ก.ย. 2569',
+      dateSummary: '18 ก.ย. 2569 - 20 ก.ย. 2569 (รวม 3 วัน)',
       periodText: '09:00 - 12:00 น.',
     });
   });
 
-  it('different periods → "หลายช่วงเวลา"; no slots → "-" (LINE refuses empty text)', () => {
+  it('non-consecutive days list only the days booked — 18 and 25 never reads as 18–25', () => {
+    const { dateText } = describeSlots([onDay(0), onDay(2), onDay(7)]);
+
+    expect(dateText).toBe('• 18 ก.ย. 2569\n• 20 ก.ย. 2569\n• 25 ก.ย. 2569');
+    expect(dateText).not.toContain(' - ');
+    expect(dateText).not.toContain('ช่วงเวลา');
+  });
+
+  it('one date with several slots → that date alone; different periods → "หลายช่วงเวลา"', () => {
     expect(
       describeSlots([
         { startAt: START, endAt: END },
@@ -94,12 +109,94 @@ describe('formatting helpers', () => {
           startAt: new Date('2026-09-18T07:00:00.000Z'),
           endAt: new Date('2026-09-18T08:00:00.000Z'),
         },
+        {
+          startAt: new Date('2026-09-18T09:00:00.000Z'),
+          endAt: new Date('2026-09-18T10:00:00.000Z'),
+        },
       ]),
     ).toEqual({
-      dateText: '18 ก.ย. 2569 (2 ช่วงเวลา)',
+      dateText: '18 ก.ย. 2569',
+      dateSummary: '18 ก.ย. 2569',
       periodText: 'หลายช่วงเวลา',
     });
-    expect(describeSlots([])).toEqual({ dateText: '-', periodText: '-' });
+  });
+
+  it('dates given out of order come out chronological', () => {
+    expect(describeSlots([onDay(7), onDay(0), onDay(2)]).dateText).toBe(
+      '• 18 ก.ย. 2569\n• 20 ก.ย. 2569\n• 25 ก.ย. 2569',
+    );
+  });
+
+  it('duplicate dates collapse to one bullet each', () => {
+    const afternoon = {
+      startAt: new Date('2026-09-18T07:00:00.000Z'),
+      endAt: new Date('2026-09-18T08:00:00.000Z'),
+    };
+
+    expect(
+      describeSlots([
+        onDay(2),
+        onDay(0),
+        onDay(0, afternoon.startAt, afternoon.endAt),
+        onDay(2, afternoon.startAt, afternoon.endAt),
+        onDay(0),
+      ]),
+    ).toEqual({
+      dateText: '• 18 ก.ย. 2569\n• 20 ก.ย. 2569',
+      dateSummary: '18 ก.ย. 2569 - 20 ก.ย. 2569 (รวม 2 วัน)',
+      periodText: 'หลายช่วงเวลา',
+    });
+  });
+
+  it('buckets by the BANGKOK date: 00:30 local on the 19th is not the UTC 18th', () => {
+    expect(
+      describeSlots([
+        { startAt: START, endAt: END }, // 18th 09:00–12:00 Bangkok
+        {
+          startAt: new Date('2026-09-18T17:30:00.000Z'), // 19th 00:30 Bangkok
+          endAt: new Date('2026-09-18T18:30:00.000Z'),
+        },
+      ]).dateText,
+    ).toBe('• 18 ก.ย. 2569\n• 19 ก.ย. 2569');
+  });
+
+  it('no slots → "-" (LINE refuses empty text)', () => {
+    expect(describeSlots([])).toEqual({
+      dateText: '-',
+      dateSummary: '-',
+      periodText: '-',
+    });
+  });
+
+  /**
+   * 🔴 `dateSummary` is what the chat-list preview (`altText`) carries. LINE caps `altText` at 400
+   * characters and rejects the whole push above it, so it must NOT grow with the slot count the way
+   * the bulleted `dateText` does.
+   */
+  describe('dateSummary — the one-line preview of the same dates', () => {
+    it.each([
+      [30, '18 ก.ย. 2569 - 17 ต.ค. 2569 (รวม 30 วัน)'],
+      [60, '18 ก.ย. 2569 - 16 พ.ย. 2569 (รวม 60 วัน)'],
+    ] as [number, string][])(
+      '%i days summarise to "%s", while dateText keeps every line',
+      (days, expected) => {
+        const { dateText, dateSummary } = describeSlots(
+          Array.from({ length: days }, (_, i) => onDay(i)),
+        );
+
+        expect(dateSummary).toBe(expected);
+        expect(dateSummary).not.toContain('\n');
+        expect(dateSummary).not.toContain('•');
+        expect(dateText.split('\n')).toHaveLength(days);
+      },
+    );
+
+    it('summarises the OUTER bounds of a sparse booking, with the real day count', () => {
+      // 18, 20 and 25 Sep: the range is the bounds, and "(รวม 3 วัน)" is what stops it reading as 8.
+      expect(describeSlots([onDay(7), onDay(0), onDay(2)]).dateSummary).toBe(
+        '18 ก.ย. 2569 - 25 ก.ย. 2569 (รวม 3 วัน)',
+      );
+    });
   });
 
   it.each([
@@ -228,6 +325,7 @@ describe('BookingNotifier', () => {
         venueName: 'ห้องประชุมใหญ่',
         venueLocation: 'ชั้น 3',
         dateText: '18 ก.ย. 2569',
+        dateSummary: '18 ก.ย. 2569',
         periodText: '09:00 - 12:00 น.',
         reason: 'ปิดปรับปรุง',
         bookingId: 'bk1',
@@ -364,7 +462,35 @@ describe('BookingNotifier', () => {
         { bookingId: 'bk1', status: 'CANCELLED_BY_STAFF' },
       ]);
       expect(pushDecision.mock.calls[0][1].dateText).toBe(
-        '18 ก.ย. 2569 - 19 ก.ย. 2569 (2 ช่วงเวลา)',
+        '• 18 ก.ย. 2569\n• 19 ก.ย. 2569',
+      );
+      // The bulleted list is for the bubble; the preview gets the one-line summary of the same days.
+      expect(pushDecision.mock.calls[0][1].dateSummary).toBe(
+        '18 ก.ย. 2569 - 19 ก.ย. 2569 (รวม 2 วัน)',
+      );
+    });
+
+    it('forwards a one-line dateSummary for a 60-slot booking, so the card stays under LINE’s altText cap', async () => {
+      const slots = Array.from({ length: 60 }, (_, i) => ({
+        id: `s${i}`,
+        startAt: new Date(START.getTime() + i * 86_400_000),
+        endAt: new Date(END.getTime() + i * 86_400_000),
+        isCancelled: false,
+      }));
+      bookingFindMany.mockResolvedValue([decisionRow({ slots })]);
+
+      await subject().notifyDecisions([
+        { bookingId: 'bk1', status: 'APPROVED' },
+      ]);
+
+      const options = pushDecision.mock.calls[0][1];
+      expect(options.dateSummary).toBe(
+        '18 ก.ย. 2569 - 16 พ.ย. 2569 (รวม 60 วัน)',
+      );
+      expect(options.dateText.split('\n')).toHaveLength(60);
+      // The card builder's own cap is asserted in `notification-cards.spec.ts`.
+      expect(buildDecisionCard(options).altText.length).toBeLessThanOrEqual(
+        400,
       );
     });
 

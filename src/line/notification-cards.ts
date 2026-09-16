@@ -31,6 +31,15 @@ export interface DecisionCardOptions {
   venueName: string;
   venueLocation?: string;
   dateText: string;
+  /**
+   * A ONE-LINE summary of `dateText` for the chat-list preview (`altText`) — e.g.
+   * `"18 ก.ย. 2569 - 25 ก.ย. 2569 (รวม 5 วัน)"` where `dateText` is a 5-line bulleted list.
+   * Built by `describeSlots` (`src/bookings/booking-notifier.ts`), which owns the Thai date format.
+   *
+   * Optional: when it is absent the altText falls back to a flattened `dateText`, which is correct
+   * for a single date and merely terse for many. See {@link toAltText}.
+   */
+  dateSummary?: string;
   periodText: string;
   /**
    * The operator's reason. Rendered for `REJECTED` and `CANCELLED_BY_STAFF` only.
@@ -82,7 +91,12 @@ const LINE_SOFT = '#e2e8f0'; // slate-200
 export const AUTO_REJECTED_NOTICE = 'ช่วงเวลาดังกล่าวมีผู้ได้รับสิทธิ์แล้ว';
 
 /**
- * LIFF hash routes the CTAs open.
+ * LIFF deep-link PATHS the CTAs open, appended to `LINE_LIFF_URL`.
+ *
+ * 🔴 PATHS, NEVER HASH ROUTES. `easybook-app` runs an HTML5 `BrowserRouter`: a `#/booking/:id` link
+ * reaches the SPA as its root path and the router lands on `/home`. LIFF forwards the path after
+ * `https://liff.line.me/{liffId}` onto the LIFF app's endpoint URL, so that endpoint must be the SPA
+ * root (see `.env.example`).
  *
  * ⚠️ DEVIATION FROM THE SPEC, ON PURPOSE: the spec writes `#/venues/:venueId` and
  * `#/booking/new?venueId=:id`, but `easybook-app`'s `ClientRoutes.tsx` serves neither. Its venue
@@ -90,10 +104,40 @@ export const AUTO_REJECTED_NOTICE = 'ช่วงเวลาดังกล่�
  * not-found screen, so the real routes are used here. Recorded in `03_implement_log.md`.
  */
 const bookingRoute = (o: DecisionCardOptions): string | null =>
-  o.bookingId ? `#/booking/${encodeURIComponent(o.bookingId)}` : null;
+  o.bookingId ? `/booking/${encodeURIComponent(o.bookingId)}` : null;
 const venueRoute = (o: DecisionCardOptions): string | null =>
-  o.venueId ? `#/venue/${encodeURIComponent(o.venueId)}` : null;
-const venuesRoute = (): string => '#/venues';
+  o.venueId ? `/venue/${encodeURIComponent(o.venueId)}` : null;
+const venuesRoute = (): string => '/venues';
+
+/**
+ * LINE's hard limit on a Flex message's `altText`. A longer value is not truncated by LINE — the
+ * whole push is rejected with HTTP 400 and the user silently receives NO card.
+ */
+export const ALT_TEXT_MAX_CHARS = 400;
+
+const ELLIPSIS = '…';
+
+/**
+ * 🔴 THE ONE CHOKE POINT EVERY `altText` IN THIS FILE GOES THROUGH. Both builders return
+ * `altText: toAltText(…)`, so no field added to a template later can breach either rule:
+ *
+ * 1. **One line.** `altText` is the chat-list preview and the notification banner. `dateText` is a
+ *    bulleted, newline-separated list for a multi-day booking (`describeSlots`) — right in the
+ *    bubble, wrong in a preview. Bullets and every run of whitespace collapse to a single space.
+ * 2. **At most {@link ALT_TEXT_MAX_CHARS} characters**, ellipsis included. This is a defensive
+ *    backstop, not the design: callers pass `dateSummary`, so a real card lands far under the cap
+ *    (a 60-date booking is ~150 characters). It exists so an unbounded venue name or a future field
+ *    degrades the preview instead of dropping the whole notification.
+ */
+export function toAltText(raw: string): string {
+  const flat = raw.replace(/[•\s]+/g, ' ').trim();
+  if (flat.length <= ALT_TEXT_MAX_CHARS) return flat;
+
+  const cut = flat.slice(0, ALT_TEXT_MAX_CHARS - ELLIPSIS.length);
+  // Never leave half a surrogate pair behind (an emoji in a venue name).
+  const whole = /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut;
+  return `${whole.trimEnd()}${ELLIPSIS}`;
+}
 
 interface DecisionCopy {
   tone: Tone;
@@ -331,7 +375,9 @@ export function buildDecisionCard(
   options: DecisionCardOptions,
 ): messagingApi.FlexMessage {
   const copy = DECISION_COPY[options.status];
-  const when = `${options.dateText} ${options.periodText}`;
+  // 🔴 THE PREVIEW TAKES `dateSummary`, THE BUBBLE TAKES `dateText`. `when` feeds the altText
+  // templates only; the `วันที่ใช้งาน` row below still renders the full bulleted list.
+  const when = `${options.dateSummary ?? options.dateText} ${options.periodText}`;
 
   const body: messagingApi.FlexComponent[] = [
     text(copy.intro, { size: 'sm', color: INK, lineSpacing: '6px' }),
@@ -396,7 +442,8 @@ export function buildDecisionCard(
           action: {
             type: 'uri',
             label: copy.cta.label,
-            uri: options.liffUrl + route,
+            // One trailing `/` on the base is dropped, so `…/abc/` + `/booking/x` never yields `//`.
+            uri: options.liffUrl.replace(/\/$/, '') + route,
           },
         },
       ],
@@ -405,7 +452,7 @@ export function buildDecisionCard(
 
   return {
     type: 'flex',
-    altText: copy.altText(options, when),
+    altText: toAltText(copy.altText(options, when)),
     contents: bubble,
   };
 }
@@ -447,7 +494,9 @@ export function buildReminderCard(
 
   return {
     type: 'flex',
-    altText: `เตือนความจำ: ใกล้ถึงเวลาเข้าใช้สถานที่ ${options.venueName} เวลา ${options.periodText}`,
+    altText: toAltText(
+      `เตือนความจำ: ใกล้ถึงเวลาเข้าใช้สถานที่ ${options.venueName} เวลา ${options.periodText}`,
+    ),
     contents: bubble,
   };
 }
