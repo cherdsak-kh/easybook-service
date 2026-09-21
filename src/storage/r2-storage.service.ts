@@ -38,6 +38,21 @@ const R2_REGION = 'auto';
 export const VENUE_PHOTO_STAGING_PREFIX = 'venues/_new/';
 
 /**
+ * Where a feedback photo lands and STAYS (`CLIENT-ISSUE-1`). Trailing slash included, for the same
+ * reason as the constant above, and it is also the prefix `FeedbackService` checks a submitted URL
+ * against before storing it.
+ *
+ * 🔴 DELIBERATELY OUTSIDE {@link R2StorageService.sweepStagedPhotos}, AND IT MUST STAY OUTSIDE. That
+ * sweep's rule is "delete anything older than 24 h", which is sound only for a STAGING prefix where
+ * age genuinely implies abandonment. Objects here are LIVE at their upload key forever — a sweep
+ * over this prefix would delete the photos of every submission older than a day and leave live rows
+ * pointing at dead URLs. The sweeper a feedback orphan actually needs is a different one (one
+ * `SELECT unnest(photos) FROM feedbacks` diffed against one listing), and it is not this cycle's
+ * work.
+ */
+export const FEEDBACK_PHOTO_PREFIX = 'feedback/';
+
+/**
  * How old a staged object must be before the sweeper will touch it, by default.
  *
  * ⚠️ LOAD-BEARING, NOT A TUNING KNOB. A staged object is not proof of abandonment — it is also what a
@@ -181,6 +196,28 @@ export class R2StorageService {
   /** Is this key still sitting in the staging folder, i.e. does it need re-homing? */
   isStagedVenuePhotoKey(key: string): boolean {
     return key.startsWith(VENUE_PHOTO_STAGING_PREFIX);
+  }
+
+  /**
+   * `feedback/<32 lowercase hex>.<ext>` — where a feedback photo lands and STAYS.
+   *
+   * ⚠️ FLAT, AND NEVER RE-HOMED, unlike {@link buildVenuePhotoKey}. Venue photos stage under
+   * `venues/_new/` and move to `venues/<venueId>/` because the PO asked for a per-venue folder;
+   * nobody has asked for a per-submission folder here, and `rehomePhotos`' best-effort
+   * copy/delete/re-read is real machinery for no stated benefit. It also makes the eventual orphan
+   * sweep SIMPLER rather than harder — see {@link FEEDBACK_PHOTO_PREFIX}, which also records that
+   * this prefix is deliberately outside the nightly staged-photo sweep and why.
+   *
+   * 128 bits of `randomBytes(16)` — UNGUESSABLE, which is the whole control for a public-read
+   * bucket with no listing (plan §8: keys must not be guessable-sequential).
+   *
+   * 🔴 NO USER ID IN THE PATH, unlike `avatars/<userId>/…`. Avatars carry one BECAUSE
+   * `AUTH-ERASURE` needs a one-prefix purge of a person's own face. A feedback photo is content
+   * about a PLACE, and putting the reporter's cuid into a public-read URL would attach their
+   * identity to bytes that may be shared or pasted.
+   */
+  buildFeedbackPhotoKey(type: AvatarImageType): string {
+    return `${FEEDBACK_PHOTO_PREFIX}${randomBytes(16).toString('hex')}.${EXTENSION[type]}`;
   }
 
   /**

@@ -35,6 +35,28 @@ describe('isCsrfExempt', () => {
     expect(isCsrfExempt(p('/line-users/settingsX'))).toBe(false);
   });
 
+  it('exempts BOTH feedback writes — the parent does not cover the child', () => {
+    // `CLIENT-ISSUE-1`. Named explicitly for the same reason as the settings entry above: the loop
+    // passes whatever the list happens to contain. Both are bearer-authenticated and cookieless,
+    // and the middleware runs BEFORE the router — without these two entries every submission and
+    // every photo upload is a 403 that never reaches `LineIdTokenGuard`.
+    expect(isCsrfExempt(p('/line-users/feedback'))).toBe(true);
+    // 🔴 THE MIRROR OF THE SETTINGS CASE, and the reason the second entry exists at all: exact
+    // `req.path` matching means the 2-segment literal exempts nothing below it.
+    expect(isCsrfExempt(p('/line-users/feedback/photos'))).toBe(true);
+  });
+
+  it('does not extend the feedback exemption to any other sub-path', () => {
+    for (const path of [
+      p('/line-users/feedback/photos/clx_abc'),
+      p('/line-users/feedback/clx_abc'),
+      p('/line-users/feedbackX'),
+      p('/line-users/feedback/'),
+    ]) {
+      expect(isCsrfExempt(path)).toBe(false);
+    }
+  });
+
   it('exempts the two parameterised booking cancellations', () => {
     // The reason the pattern list had to exist: neither of these is a fixed string.
     expect(isCsrfExempt(p('/line-users/bookings/clx_abc123/cancel'))).toBe(

@@ -18,6 +18,7 @@ import {
 import { SCHEDULING_ENABLED } from './common/scheduling.constants';
 import { validateEnv } from './config/env.validation';
 import { CsrfModule } from './csrf/csrf.module';
+import { FeedbackModule } from './feedback/feedback.module';
 import { HealthModule } from './health/health.module';
 import { LineModule } from './line/line.module';
 import { OptionsModule } from './options/options.module';
@@ -104,6 +105,12 @@ const throttlerModule: DynamicModule = {
     // register after both `LineModule` controllers. That is proven safe in a table on that file; it
     // is not luck, and it is the thing to re-read before adding a route to either.
     BookingsModule,
+    // `CLIENT-ISSUE-1` — แจ้งปัญหา / ข้อเสนอแนะ. AFTER `BookingsModule`, and the position is worth a
+    // line: its two routes are literals on the shared `line-users/*` family, so they register after
+    // both `LineModule` controllers and after `LineBookingsController`. That is safe today because
+    // no parameterised POST exists on that family — the table proving it is on
+    // `FeedbackController`, and it is the thing to re-read before adding one.
+    FeedbackModule,
     SystemModule,
     // Still future tasks: the admin approval + direct-booking surface (`SessionGuard`), the
     // `/client` realtime namespace, and LINE chat notifications.

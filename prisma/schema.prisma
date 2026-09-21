@@ -111,6 +111,12 @@ model LineUser {
   /// booking table: those rows carry `createdById` instead. This is the LIFF origin's list.
   bookingRequests BookingRequest[] @relation("BookingRequesterLineUser")
 
+  /// Back-relation for Feedback.lineUserId (CLIENT-ISSUE-1). VIRTUAL — adds no column to line_users.
+  /// EMPTY for a follower who never reported anything. Unlike bookingRequests above there is no
+  /// staff-created half of that table: every feedback row was typed by a LINE end-user, which is why
+  /// Feedback.lineUserId is REQUIRED where BookingRequest.lineUserId is nullable.
+  feedbacks Feedback[] @relation("FeedbackReporter")
+
   @@index([deletedAt])
   /// The list's default ordering key.
   @@index([registeredAt])
@@ -492,6 +498,11 @@ model Venue {
   /// index. Going through the parent would make it a join.
   bookingRequests BookingRequest[] @relation("BookingVenue")
   bookingSlots    BookingSlot[]    @relation("BookingSlotVenue")
+
+  /// Back-relation for Feedback.venueId (CLIENT-ISSUE-1). VIRTUAL — adds no column to venues.
+  /// NOT symmetrical with the pair above: a submission's venue is OPTIONAL, and a venue with no
+  /// entries here is indistinguishable from one nobody has reported a problem about.
+  feedbacks Feedback[] @relation("FeedbackVenue")
 
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
@@ -1025,4 +1036,127 @@ model AppSetting {
   updatedAt DateTime @updatedAt
 
   @@map("app_settings")
+}
+
+/// What a submission IS, and the ONLY thing that differs between the two (D-4): there is no
+/// category column — categorising is the admin's job, not the reporter's (proto 1725-1727).
+/// The member names read oddly as a pair (`FeedbackType.FEEDBACK`); they are the prototype's two
+/// `IS_TYPES` keys verbatim, and renaming one to SUGGESTION would put a third vocabulary between
+/// the drawn screen and the column.
+enum FeedbackType {
+  ISSUE
+  FEEDBACK
+}
+
+/// The admin triage lifecycle.
+///
+/// 🔴 NOTHING IN THIS CYCLE TRANSITIONS IT, and nothing reads it. It is absent from every DTO (so
+/// `forbidNonWhitelisted` 400s an attempt to set it, the same construction that protects
+/// `isSystemReserved`), absent from the create response, and no route filters on it. It ships now
+/// because it is the one thing that cannot be added later for free — a new enum type plus an
+/// `ADD COLUMN` on a populated table is a locking migration — and because the admin console is a
+/// named near-term consumer. The plan's objection ("a status with no screen to drive it is a column
+/// that lies") is preserved in full: a column nothing reads and nothing but the default writes
+/// cannot lie. The day the console lands, it owns the transitions and the vocabulary.
+enum FeedbackStatus {
+  PENDING
+  IN_PROGRESS
+  RESOLVED
+  DISMISSED
+}
+
+/// One "แจ้งปัญหา / ข้อเสนอแนะ" submission from the LIFF client (CLIENT-ISSUE-1).
+///
+/// WRITE-ONCE FROM THE CLIENT SIDE: there is no edit and no delete route, and the row is the whole
+/// record — the reporter's name, role and department are NOT snapshotted here, they resolve live
+/// through `lineUserId` -> LineUserRegistration. Copying them would be one fact in two places, the
+/// same bug `VenuePhoto`'s absent `isCover` flag exists to avoid.
+///
+/// PDPA: attributable BY DESIGN — the reporter card's stated purpose is "เรื่องนี้ไม่ใช่บัตรสนเท่ห์".
+/// `subject`/`description` are user-authored free text that may name people; NEVER logged, the same
+/// discipline `BookingRequest.purpose` carries.
+model Feedback {
+  id String @id @default(cuid())
+
+  /// Human-readable reference ("ISS-25690920-001" / "FDB-25690920-001") — the string the success
+  /// dialog prints in `font-mono` and the user quotes to staff on the phone. SEPARATE from `id` for
+  /// the same reason as `BookingRequest.code`: a cuid is unspeakable, and a readable PK invites
+  /// people to parse meaning out of it. @unique, and that constraint is what the minting retry in
+  /// `feedback-code.ts` relies on.
+  code String @unique
+
+  type FeedbackType
+
+  /// FK -> LineUser.id (a cuid), NOT LineUser.lineUserId (the "U…" string). Same-name footgun as
+  /// SystemUser.lineUserId, LineUserRegistration.lineUserId and BookingRequest.lineUserId.
+  /// `LineIdTokenGuard` yields the "U…" sub; the service resolves it to this row first (AC-34).
+  ///
+  /// REQUIRED, unlike BookingRequest.lineUserId: there is no admin origin for a submission — every
+  /// row in this table was typed by a LINE end-user, so a null here would describe nobody.
+  ///
+  /// `onDelete: Cascade` — the submission is erased with its author. Unfollow is a SOFT delete, so
+  /// this fires only on a future right-to-erasure HARD delete, which is exactly when the rows should
+  /// go. (Contrast BookingRequest's `SetNull`: a booking is also the VENUE's schedule history and
+  /// must survive its requester; a report about a broken chair is not.)
+  lineUserId String
+  lineUser   LineUser @relation("FeedbackReporter", fields: [lineUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  /// FK -> Venue.id. NULLABLE, and `null` IS THE PERSISTED MEANING OF "ปัญหาทั่วไป / ไม่ระบุสถานที่"
+  /// (AC-9, AC-10) — not "unknown" and not "missing".
+  ///
+  /// `onDelete: Restrict`, NOT SetNull, and the nullability is the reason. Venue deletes are soft
+  /// (`deletedAt`), so this only ever refuses a stray HARD delete of a venue with history — but if
+  /// one ever happened, `SetNull` would silently rewrite "ปัญหาที่ห้องประชุม 1" into "ปัญหาทั่วไป",
+  /// i.e. turn a specific report into a different, valid-looking one that nobody can tell apart from
+  /// a genuine general report. A refused delete is a loud, fixable event; a laundered report is not.
+  /// Reads resolve as HISTORY (no `deletedAt` filter), the same asymmetry as every other option FK.
+  venueId String?
+  venue   Venue?  @relation("FeedbackVenue", fields: [venueId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  /// หัวข้อ. Free text at the DB layer — the 100-char cap is a DTO input control, not a column
+  /// constraint, exactly as `LineUser.rejectionReason` and `BookingRequest.purpose` state.
+  subject String
+
+  /// รายละเอียด. Same rule as `subject`: the 500-char cap (AC-36, E-9 — trim first, then count)
+  /// lives in `CreateFeedbackDto` and nowhere else. The column is unbounded `text` on purpose, so
+  /// raising the product cap is a constant change rather than an ALTER TABLE on a live table.
+  description String
+
+  /// Public https URLs of the uploaded photos, in the order the reporter attached them. Max 3,
+  /// enforced by the DTO. Empty array = no photos.
+  ///
+  /// ⚠️ AN ARRAY COLUMN, WHERE `VenuePhoto` IS A ROW — and that model's own comment says why the two
+  /// differ: it is a row "because the ORDER is data the operator edits". Here nothing edits: the set
+  /// is written once at submit, never reordered, never renumbered, carries no cover flag, no
+  /// position and no metadata, and is never queried independently of its parent. A child table would
+  /// buy a join and a second write path for three strings.
+  ///
+  /// The backend NEVER fetches these URLs — same contract as `VenuePhoto.url` and
+  /// `SystemUser.profilePictureUrl`. Every entry is verified to start with this deployment's
+  /// `feedback/` public prefix before it is stored, so a foreign URL can never enter the column.
+  photos String[]
+
+  /// Admin triage state. `PENDING` on every insert and NEVER written again in this cycle — see the
+  /// enum's comment for why the column ships anyway.
+  status FeedbackStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The queue view: `WHERE status = 'PENDING' ORDER BY createdAt DESC`. Composite because a bare
+  /// [status] leaves the sort to a heap sort over the filtered set.
+  @@index([status, createdAt])
+  /// The two tabs (แจ้งปัญหา / ข้อเสนอแนะ) with the same recency sort. ALSO load-bearing for the code
+  /// minter: it is the exact shape of the per-day, per-type `count` in `feedback-code.ts`.
+  @@index([type, createdAt])
+  /// The unfiltered "everything, newest first" list. Not redundant with the two composites: Postgres
+  /// cannot use either for a sort that does not constrain the leading column.
+  @@index([createdAt])
+  /// "Everything this person reported", and the index the Cascade delete scans.
+  @@index([lineUserId])
+  /// "Reports about this venue", and the lookup the Restrict FK check performs.
+  @@index([venueId])
+  /// Mechanical pluralisation of the model name, like every other table here — "feedback" being
+  /// uncountable in English does not get to make the model and the table disagree.
+  @@map("feedbacks")
 }

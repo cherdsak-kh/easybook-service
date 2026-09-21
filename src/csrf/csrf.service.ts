@@ -30,6 +30,13 @@ import { isCookieSecure, resolveSameSite } from '../config/env.validation';
  * neighbours — `GET /line-users/settings` and `GET /line-users/version` — need no entry: they are
  * GETs and `ignoredMethods` already exempts them by method.
  *
+ * `POST /line-users/feedback` and `POST /line-users/feedback/photos` (`CLIENT-ISSUE-1`) join on
+ * those same grounds a third time — same `LineIdTokenGuard`, same bearer token, same absence of a
+ * cookie. ⚠️ BOTH ENTRIES ARE NEEDED AND THE FIRST DOES NOT COVER THE SECOND: matching is exact
+ * `req.path`, exactly as the settings pair already demonstrates. The multipart route is no
+ * different from the JSON one here — the upload carries no cookie either, and a multipart body
+ * could not carry a `_csrf` field anyway (the token is a header, never a body key).
+ *
  * 🔴 THE TEST FOR THIS LIST IS "IS THERE AMBIENT AUTHORITY?", NEVER "IS IT INCONVENIENT?". A path
  * belongs here only when the request carries no cookie a foreign origin could ride — a bearer token
  * has to be read and attached by script, which the same-origin policy already prevents. Adding a
@@ -46,6 +53,8 @@ export const CSRF_EXEMPT_PATHS: readonly string[] = [
   `${API_BASE_PATH}/line-users/registration`,
   `${API_BASE_PATH}/line-users/bookings`,
   `${API_BASE_PATH}/line-users/settings`,
+  `${API_BASE_PATH}/line-users/feedback`,
+  `${API_BASE_PATH}/line-users/feedback/photos`,
 ];
 
 /** Escapes a literal so it can be embedded in a `RegExp` — `API_BASE_PATH` is configuration. */
