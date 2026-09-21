@@ -44,6 +44,8 @@ import {
   CreateDirectBookingDto,
   RejectBookingRequestDto,
 } from './dto/admin-booking-write.dto';
+import { CalendarBookingQueryDto } from './dto/calendar-booking-query.dto';
+import { CalendarBookingSlotDto } from './dto/calendar-booking-response.dto';
 import { ListBookingRequestsQueryDto } from './dto/list-booking-requests-query.dto';
 
 /**
@@ -83,13 +85,14 @@ const actorOf = (user: AuthenticatedSystemUser): Actor => ({
  * only inconvenience someone working quickly.
  *
  * ── 🔴 Route ORDER matters ──
- * `direct` and `preflight` are literal segments that a `:id` route would otherwise capture, so both
- * are declared FIRST. State the truth plainly: with exactly these seven routes the collision is NOT
- * reachable — Nest matches on method and segment count, and there is no single-segment `POST /:id`.
- * The ordering is here for the day somebody adds `POST /booking-requests/:id` (edit a request): on
- * that day both would be swallowed silently, and the symptom would be a 404 complaining about an id
- * named "direct". Same reasoning `VenuesController` records for `photos` and `CLAUDE.md` records for
- * the two LINE controllers.
+ * `direct`, `preflight` and `calendar` are literal segments that a `:id` route would otherwise
+ * capture, so all three are declared FIRST. State the truth plainly: for the two POSTs the collision
+ * is NOT reachable today — Nest matches on method and segment count, and there is no single-segment
+ * `POST /:id`. The ordering is there for the day somebody adds `POST /booking-requests/:id` (edit a
+ * request): on that day both would be swallowed silently, and the symptom would be a 404 complaining
+ * about an id named "direct". For `GET calendar` it IS reachable — `GET /:id` exists — so moving it
+ * below `detail` breaks it now. Same reasoning `VenuesController` records for `photos` and
+ * `CLAUDE.md` records for the two LINE controllers.
  */
 @ApiTags('Booking requests')
 @ApiCookieAuth('session')
@@ -196,6 +199,43 @@ export class BookingRequestsController {
     @Body() dto: BookingPreflightDto,
   ): Promise<BookingPreflightResponseDto> {
     return this.bookings.checkPreflight(dto);
+  }
+
+  /**
+   * ── 🔴 THE ONE LITERAL SEGMENT WHOSE ORDER IS LOAD-BEARING TODAY ──
+   * Unlike `direct` and `preflight`, a single-segment `GET /:id` DOES exist, so declared below it
+   * this route would be swallowed: `getDetail('calendar')` → a 404 for an id named "calendar"
+   * (plan AC B2). Keep it above `@Get(':id')`.
+   */
+  @Get('calendar')
+  @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN, SystemRole.VIEWER)
+  @ApiOperation({
+    summary:
+      'ปฏิทินการจอง — every occupying slot in a window, one row per slot.',
+    description:
+      'Returns every NON-cancelled slot of an APPROVED or PENDING request on a non-deleted venue that OVERLAPS the half-open window `[from, to)` (`startAt < to AND endAt > from`). `from`/`to` default to the current Bangkok (UTC+7) month, through the same window logic as the LIFF venue calendar and master schedule. `to == from` → `[]`. One flat row per slot: a three-slot request is three rows sharing `bookingRequestId`/`code`, numbered by `slotIndex`/`slotCount` over the request’s live slots (not the window). `date`/`start`/`end` are Bangkok wall-clock strings; `end` is `24:00` for a slot ending at the next Bangkok midnight. Ordered by `startAt`, then APPROVED before PENDING, then `code`. Not paginated — the window is capped at 366 days.',
+  })
+  @ApiOkResponse({
+    description: 'The slots in the window. Possibly empty.',
+    type: [CalendarBookingSlotDto],
+  })
+  @ApiBadRequestResponse({
+    description:
+      'Invalid query — a malformed `from`/`to`, `to` earlier than `from`, a window wider than 366 days, a `status` other than APPROVED/PENDING, or an unrecognised parameter.',
+    type: ErrorResponseDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'No session.',
+    type: ErrorResponseDto,
+  })
+  @ApiServiceUnavailableResponse({
+    description: 'Session store unavailable.',
+    type: ErrorResponseDto,
+  })
+  calendar(
+    @Query() query: CalendarBookingQueryDto,
+  ): Promise<CalendarBookingSlotDto[]> {
+    return this.bookings.getCalendar(query);
   }
 
   @Get()

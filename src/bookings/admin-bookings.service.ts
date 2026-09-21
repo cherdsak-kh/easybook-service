@@ -11,14 +11,18 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import type { RealtimeActor } from '../realtime/realtime.constants';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
-import { isCodeCollision, nextBookingCode } from './booking-code';
+import {
+  bangkokDayRange,
+  isCodeCollision,
+  nextBookingCode,
+} from './booking-code';
 import {
   BOOKING_LIST_SELECT,
   BOOKING_REQUESTER_SELECT,
   requesterOf,
   toBookingListDto,
 } from './booking-list-view';
-import { BookingNotifier } from './booking-notifier';
+import { bangkokClock, BookingNotifier } from './booking-notifier';
 import {
   approvedClashWhere,
   assertNoApprovedClash,
@@ -29,8 +33,10 @@ import {
   type SlotSpan,
 } from './booking-overlap';
 import { publishBookingRequests } from './booking-realtime';
+import { resolveWindow } from './booking-window';
 import {
   AUTO_REJECTED_REASON,
+  BANGKOK_UTC_OFFSET_MINUTES,
   BOOKING_ALREADY_CANCELLED,
   BOOKING_CODE_MAX_ATTEMPTS,
   BOOKING_DECISION_RACE,
@@ -60,6 +66,12 @@ import type {
   CreateDirectBookingDto,
   RejectBookingRequestDto,
 } from './dto/admin-booking-write.dto';
+import {
+  CALENDAR_STATUSES,
+  type CalendarBookingQueryDto,
+  type CalendarStatus,
+} from './dto/calendar-booking-query.dto';
+import type { CalendarBookingSlotDto } from './dto/calendar-booking-response.dto';
 import {
   type BookingRequestSort,
   type ListBookingRequestsQueryDto,
@@ -100,6 +112,43 @@ const DETAIL_SELECT = {
 
 type DetailRow = Prisma.BookingRequestGetPayload<{
   select: typeof DETAIL_SELECT;
+}>;
+
+/**
+ * What one calendar row needs from its slot, its parent request and its venue — nothing more.
+ *
+ * ⚠️ THE NESTED `slots` IS THE PARENT'S LIVE SIBLINGS, for `slotIndex`/`slotCount` (plan §6-D4). It
+ * is read over the WHOLE request, not the window: "ช่วงที่ 2 จาก 3" must not become "1 จาก 1" because
+ * the other two days fall in next month. `isCancelled: false` is the same predicate the outer read
+ * uses, so a slot this read returns is always in its own sibling list. Prisma batches the nested read
+ * into ONE `IN (...)` query for every parent in the result — never one per slot.
+ *
+ * ⚠️ NO `deletedAt` ON THE REQUESTER READS — `BOOKING_REQUESTER_SELECT`'s read/write asymmetry.
+ */
+const CALENDAR_SLOT_SELECT = {
+  id: true,
+  startAt: true,
+  endAt: true,
+  venueId: true,
+  venue: { select: { name: true } },
+  bookingRequest: {
+    select: {
+      id: true,
+      code: true,
+      status: true,
+      purpose: true,
+      ...BOOKING_REQUESTER_SELECT,
+      slots: {
+        where: { isCancelled: false },
+        select: { id: true },
+        orderBy: [{ startAt: 'asc' }, { id: 'asc' }],
+      },
+    },
+  },
+} satisfies Prisma.BookingSlotSelect;
+
+type CalendarSlotRow = Prisma.BookingSlotGetPayload<{
+  select: typeof CALENDAR_SLOT_SELECT;
 }>;
 
 /**
@@ -232,6 +281,52 @@ export class AdminBookingsService {
    */
   async getDetail(id: string): Promise<AdminBookingRequestDetailDto> {
     return this.readDetail(this.prisma, id);
+  }
+
+  /**
+   * `GET /booking-requests/calendar` — the admin ปฏิทินการจอง: every slot that occupies a live venue
+   * inside `[from, to)`, one flat row per slot.
+   *
+   * ⚠️ THE WINDOW IS `resolveWindow`'s, SHARED WITH THE TWO LIFF CALENDARS, so the default Bangkok
+   * month and both 400s cannot drift apart. `to == from` is answered `[]` HERE, before the read:
+   * the half-open window is empty, yet a slot straddling that instant would still satisfy the
+   * overlap predicate below.
+   *
+   * ⚠️ THE SAME EXCLUSIONS AS THE MASTER SCHEDULE, widened from one status to the two that occupy a
+   * room: cancelled slots (`isCancelled` lives on the child, so the parent's status alone would paint
+   * a freed Wednesday), REJECTED / CANCELLED / EXPIRED parents (they still own their slot rows), and
+   * soft-deleted venues. OVERLAP, not containment — a camp that began before `from` still occupies
+   * the first day of the grid.
+   *
+   * ⚠️ ORDERED IN MEMORY, NOT BY `orderBy` (plan §6-D3). The screen reads the booking that HOLDS the
+   * room first at an equal start, and Postgres orders an enum by DECLARATION — `PENDING` precedes
+   * `APPROVED` in `schema.prisma`, so `status: 'asc'` is backwards and `'desc'` would be right only
+   * by the accident of declaration order. The set is bounded by the 366-day window and never
+   * paginated, so sorting it here costs nothing and says what it means.
+   *
+   * No lock, no transaction: one read.
+   */
+  async getCalendar(
+    query: CalendarBookingQueryDto,
+  ): Promise<CalendarBookingSlotDto[]> {
+    const { from, to } = resolveWindow(query);
+    if (from.getTime() === to.getTime()) return [];
+
+    const rows = await this.prisma.bookingSlot.findMany({
+      where: {
+        isCancelled: false,
+        venue: { deletedAt: null },
+        ...(query.venueId ? { venueId: query.venueId } : {}),
+        bookingRequest: {
+          status: query.status ?? { in: [...CALENDAR_STATUSES] },
+        },
+        startAt: { lt: to },
+        endAt: { gt: from },
+      },
+      select: CALENDAR_SLOT_SELECT,
+    });
+
+    return rows.map(toCalendarSlotDto).sort(compareCalendarSlots);
   }
 
   /**
@@ -1076,5 +1171,77 @@ function toCounts(
     rejected,
     cancelled,
     expired,
+  };
+}
+
+/** Rank for the calendar's second sort key: the booking that HOLDS the room reads first. */
+const CALENDAR_STATUS_RANK: Record<CalendarStatus, number> = {
+  [BookingStatus.APPROVED]: 0,
+  [BookingStatus.PENDING]: 1,
+};
+
+/**
+ * `startAt` ASC → APPROVED before PENDING → `code` ASC → slot `id` ASC (B10).
+ *
+ * The last key only makes the order TOTAL; two live slots of one request cannot share a start.
+ * Plain code-unit comparison, not `localeCompare`: `code` is ASCII (`BR-25690903-001`), and a
+ * locale-sensitive compare would make the order depend on the container's ICU data.
+ */
+function compareCalendarSlots(
+  a: CalendarBookingSlotDto,
+  b: CalendarBookingSlotDto,
+): number {
+  const byStart = a.startAt.getTime() - b.startAt.getTime();
+  if (byStart !== 0) return byStart;
+  const byStatus =
+    CALENDAR_STATUS_RANK[a.status] - CALENDAR_STATUS_RANK[b.status];
+  if (byStatus !== 0) return byStatus;
+  if (a.code !== b.code) return a.code < b.code ? -1 : 1;
+  if (a.id !== b.id) return a.id < b.id ? -1 : 1;
+  return 0;
+}
+
+/** `2026-09-17T17:00:00Z` → `"2026-09-18"` — the Bangkok calendar date, Gregorian. */
+function bangkokIsoDate(at: Date): string {
+  return new Date(at.getTime() + BANGKOK_UTC_OFFSET_MINUTES * 60_000)
+    .toISOString()
+    .slice(0, 10);
+}
+
+/**
+ * One calendar row.
+ *
+ * ⚠️ `end` IS `24:00` WHEN `endAt` IS THE BANGKOK MIDNIGHT RIGHT AFTER `date` — an evening slot that
+ * runs to the end of the day must not read `22:00 – 00:00`. Anything else, including a (currently
+ * uncreatable) slot that runs PAST that midnight, is its plain Bangkok `HH:mm`; either way the row is
+ * listed on its start `date` only and never duplicated onto the next day.
+ *
+ * ⚠️ `status` IS NARROWED BY THE QUERY, NOT HERE: the `where` admits only {@link CALENDAR_STATUSES},
+ * so the cast restates a fact the read already guarantees.
+ */
+function toCalendarSlotDto(row: CalendarSlotRow): CalendarBookingSlotDto {
+  const request = row.bookingRequest;
+  const nextMidnight = bangkokDayRange(row.startAt).end;
+  return {
+    id: row.id,
+    bookingRequestId: request.id,
+    code: request.code,
+    status: request.status as CalendarStatus,
+    purpose: request.purpose,
+    requesterName: requesterOf(request).name,
+    venueId: row.venueId,
+    venueName: row.venue.name,
+    startAt: row.startAt,
+    endAt: row.endAt,
+    date: bangkokIsoDate(row.startAt),
+    start: bangkokClock(row.startAt),
+    end:
+      row.endAt.getTime() === nextMidnight.getTime()
+        ? '24:00'
+        : bangkokClock(row.endAt),
+    // The row is always in its own sibling list (same `isCancelled: false` predicate), so this is
+    // 1-based and never 0 for a consistent read.
+    slotIndex: request.slots.findIndex((s) => s.id === row.id) + 1,
+    slotCount: request.slots.length,
   };
 }

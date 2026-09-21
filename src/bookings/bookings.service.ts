@@ -1,5 +1,4 @@
 import {
-  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -21,11 +20,8 @@ import {
   type SlotSpan,
 } from './booking-overlap';
 import { publishBookingRequests } from './booking-realtime';
+import { resolveWindow } from './booking-window';
 import {
-  AVAILABILITY_MAX_DAYS,
-  AVAILABILITY_RANGE_INVALID,
-  AVAILABILITY_RANGE_TOO_WIDE,
-  BANGKOK_UTC_OFFSET_MINUTES,
   BOOKING_CODE_MAX_ATTEMPTS,
   BOOKING_NOT_ALLOWED,
   BOOKING_NOT_APPROVED,
@@ -802,43 +798,6 @@ export class BookingsService {
 type CreatedRow = Prisma.BookingRequestGetPayload<{
   include: { slots: true };
 }>;
-
-/**
- * The availability window: what the caller asked for, or the current Bangkok calendar month.
- *
- * ⚠️ BANGKOK, NOT THE SERVER'S CLOCK. "This month" has to mean the month the user is looking at on
- * a phone in Thailand; a UTC container would default the first seven hours of every 1st of the month
- * to the previous one and open the calendar on the wrong page.
- *
- * ⚠️ THE PARAMETER IS STRUCTURAL, NOT `VenueAvailabilityQueryDto`, because two endpoints now share
- * this window: the venue calendar and `#/home`'s master schedule ({@link ScheduleQueryDto}). They
- * must agree on the default month and on both bounds — a second copy would be a second chance to
- * default one of them to "today".
- */
-function resolveWindow(query: { from?: string; to?: string }): {
-  from: Date;
-  to: Date;
-} {
-  const offset = BANGKOK_UTC_OFFSET_MINUTES * 60_000;
-  const nowLocal = new Date(Date.now() + offset);
-  const monthStart = new Date(
-    Date.UTC(nowLocal.getUTCFullYear(), nowLocal.getUTCMonth(), 1) - offset,
-  );
-  const monthEnd = new Date(
-    Date.UTC(nowLocal.getUTCFullYear(), nowLocal.getUTCMonth() + 1, 1) - offset,
-  );
-
-  const from = query.from ? new Date(query.from) : monthStart;
-  const to = query.to ? new Date(query.to) : monthEnd;
-
-  if (to.getTime() < from.getTime()) {
-    throw new BadRequestException(AVAILABILITY_RANGE_INVALID);
-  }
-  if (to.getTime() - from.getTime() > AVAILABILITY_MAX_DAYS * 86_400_000) {
-    throw new BadRequestException(AVAILABILITY_RANGE_TOO_WIDE);
-  }
-  return { from, to };
-}
 
 function toRequestDto(
   row: CreatedRow,

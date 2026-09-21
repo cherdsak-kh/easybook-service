@@ -12,6 +12,8 @@ import { AdminBookingsService } from './admin-bookings.service';
 import { BookingNotifier } from './booking-notifier';
 import {
   AUTO_REJECTED_REASON,
+  AVAILABILITY_RANGE_INVALID,
+  AVAILABILITY_RANGE_TOO_WIDE,
   BOOKING_ALREADY_CANCELLED,
   BOOKING_NOT_APPROVED_FOR_CANCEL,
   BOOKING_NOT_FOUND,
@@ -1757,6 +1759,373 @@ describe('AdminBookingsService', () => {
           { bookingId: LOSER_ID, status: 'AUTO_REJECTED' },
         ]);
       });
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────────
+  // GET /booking-requests/calendar — the admin ปฏิทินการจอง (plan B3–B11)
+  // ────────────────────────────────────────────────────────────────────────────────
+  describe('getCalendar', () => {
+    const CODE_A = 'BR-25690903-001';
+    const CODE_B = 'BR-25690903-002';
+
+    /** The `bookingSlot.findMany` argument, as far as these tests read it. */
+    type CalendarArgs = {
+      where: {
+        isCancelled?: boolean;
+        venue?: unknown;
+        venueId?: string;
+        bookingRequest?: { status: unknown };
+        startAt?: { lt: Date };
+        endAt?: { gt: Date };
+      };
+      select: {
+        bookingRequest: { select: { slots: unknown } };
+      };
+    };
+    const calendarArgs = () => callArg<CalendarArgs>(bookingSlot.findMany);
+
+    /**
+     * One row in `CALENDAR_SLOT_SELECT`'s shape. `siblings` is the parent's LIVE slot ids in start
+     * order — what the nested read returns — and defaults to this slot alone.
+     */
+    const calRow = (
+      over: {
+        id?: string;
+        startAt?: string;
+        endAt?: string;
+        requestId?: string;
+        code?: string;
+        status?: BookingStatus;
+        requesterName?: string | null;
+        lineUser?: unknown;
+        siblings?: string[];
+      } = {},
+    ) => {
+      const id = over.id ?? 'slot-1';
+      return {
+        id,
+        startAt: new Date(over.startAt ?? '2026-09-18T02:00:00.000Z'),
+        endAt: new Date(over.endAt ?? '2026-09-18T05:00:00.000Z'),
+        venueId: VENUE_ID,
+        venue: { name: 'หอประชุมวารณ' },
+        bookingRequest: {
+          id: over.requestId ?? BOOKING_ID,
+          code: over.code ?? CODE_A,
+          status: over.status ?? BookingStatus.APPROVED,
+          purpose: 'ประชุมผู้ปกครอง',
+          requesterName: over.requesterName ?? null,
+          contactPhone: null,
+          department: null,
+          lineUser: over.lineUser ?? null,
+          slots: (over.siblings ?? [id]).map((s) => ({ id: s })),
+        },
+      };
+    };
+
+    const WINDOW = {
+      from: '2026-08-31T17:00:00.000Z',
+      to: '2026-09-30T17:00:00.000Z',
+    };
+
+    beforeEach(() => {
+      bookingSlot.findMany.mockResolvedValue([]);
+    });
+
+    it('returns the whole wire contract for one slot — a key added without a decision fails here', async () => {
+      bookingSlot.findMany.mockResolvedValue([
+        calRow({ requesterName: 'ฝ่ายกิจการนักเรียน' }),
+      ]);
+
+      const rows = await service.getCalendar(WINDOW);
+
+      expect(rows).toStrictEqual([
+        {
+          id: 'slot-1',
+          bookingRequestId: BOOKING_ID,
+          code: CODE_A,
+          status: BookingStatus.APPROVED,
+          purpose: 'ประชุมผู้ปกครอง',
+          requesterName: 'ฝ่ายกิจการนักเรียน',
+          venueId: VENUE_ID,
+          venueName: 'หอประชุมวารณ',
+          startAt: new Date('2026-09-18T02:00:00.000Z'),
+          endAt: new Date('2026-09-18T05:00:00.000Z'),
+          date: '2026-09-18',
+          start: '09:00',
+          end: '12:00',
+          slotIndex: 1,
+          slotCount: 1,
+        },
+      ]);
+    });
+
+    // ── B3 — the default window is the current BANGKOK month ──────────────────────
+    it('B3: defaults to the Bangkok month — at 00:30 on 1 Sep Bangkok it is September, not August', async () => {
+      // 2026-08-31T17:30Z is 00:30 on 1 September in Bangkok, but still 31 August in UTC.
+      const now = jest
+        .spyOn(Date, 'now')
+        .mockReturnValue(Date.parse('2026-08-31T17:30:00.000Z'));
+      try {
+        await service.getCalendar({});
+      } finally {
+        now.mockRestore();
+      }
+
+      const { where } = calendarArgs();
+      expect(where.endAt).toEqual({ gt: new Date('2026-08-31T17:00:00.000Z') });
+      expect(where.startAt).toEqual({
+        lt: new Date('2026-09-30T17:00:00.000Z'),
+      });
+    });
+
+    // ── B4 / B5 — the selection ───────────────────────────────────────────────────
+    it('B4: asks for slots that OVERLAP the half-open window — strict on both edges', async () => {
+      await service.getCalendar(WINDOW);
+
+      const { where } = calendarArgs();
+      // `lt`/`gt`, never `lte`/`gte`: a slot ending exactly at `from` or starting exactly at `to`
+      // shares no instant with `[from, to)` and must not be returned; one straddling either edge does.
+      expect(where.startAt).toEqual({ lt: new Date(WINDOW.to) });
+      expect(where.endAt).toEqual({ gt: new Date(WINDOW.from) });
+    });
+
+    it('B5: excludes cancelled slots, non-occupying requests and soft-deleted venues', async () => {
+      await service.getCalendar(WINDOW);
+
+      const { where, select } = calendarArgs();
+      expect(where.isCancelled).toBe(false);
+      expect(where.venue).toEqual({ deletedAt: null });
+      expect(where.bookingRequest).toEqual({
+        status: { in: [BookingStatus.APPROVED, BookingStatus.PENDING] },
+      });
+      // No venue scope unless asked for — this read spans every room.
+      expect(where).not.toHaveProperty('venueId');
+      // The sibling count reads LIVE slots only (B8).
+      expect(select.bookingRequest.select.slots).toMatchObject({
+        where: { isCancelled: false },
+      });
+    });
+
+    // ── B6 — the two filters ──────────────────────────────────────────────────────
+    it('B6: `venueId` narrows to that venue’s slots and `status` to that one status', async () => {
+      await service.getCalendar({
+        ...WINDOW,
+        venueId: VENUE_ID,
+        status: BookingStatus.PENDING,
+      });
+
+      const { where } = calendarArgs();
+      expect(where.venueId).toBe(VENUE_ID);
+      expect(where.bookingRequest).toEqual({ status: BookingStatus.PENDING });
+      // The other exclusions still apply under a filter.
+      expect(where.isCancelled).toBe(false);
+      expect(where.venue).toEqual({ deletedAt: null });
+    });
+
+    // ── B7 — the range guard ──────────────────────────────────────────────────────
+    it('B7: 400s a reversed window and one wider than 366 days, before touching the database', async () => {
+      await expect(
+        service.getCalendar({ from: WINDOW.to, to: WINDOW.from }),
+      ).rejects.toThrow(new BadRequestException(AVAILABILITY_RANGE_INVALID));
+
+      await expect(
+        service.getCalendar({
+          from: '2026-01-01T00:00:00.000Z',
+          to: '2027-01-03T00:00:00.000Z',
+        }),
+      ).rejects.toThrow(new BadRequestException(AVAILABILITY_RANGE_TOO_WIDE));
+
+      expect(bookingSlot.findMany).not.toHaveBeenCalled();
+    });
+
+    it('B7: accepts exactly 366 days', async () => {
+      await service.getCalendar({
+        from: '2026-01-01T00:00:00.000Z',
+        to: '2027-01-02T00:00:00.000Z',
+      });
+      expect(bookingSlot.findMany).toHaveBeenCalledTimes(1);
+    });
+
+    it('B7: answers `to == from` with [] and no read — an empty window holds no instant', async () => {
+      // A slot straddling that instant WOULD satisfy `startAt < to AND endAt > from`, so the empty
+      // answer has to come from the short-circuit, not from the database.
+      bookingSlot.findMany.mockResolvedValue([calRow()]);
+
+      await expect(
+        service.getCalendar({
+          from: '2026-09-18T03:00:00.000Z',
+          to: '2026-09-18T03:00:00.000Z',
+        }),
+      ).resolves.toEqual([]);
+      expect(bookingSlot.findMany).not.toHaveBeenCalled();
+    });
+
+    // ── B8 — one row per slot, numbered over the WHOLE request ────────────────────
+    it('B8: a three-slot request is three rows sharing id/code, numbered 1/2/3 of 3', async () => {
+      const siblings = ['s1', 's2', 's3'];
+      bookingSlot.findMany.mockResolvedValue([
+        calRow({
+          id: 's2',
+          startAt: '2026-09-19T02:00:00.000Z',
+          endAt: '2026-09-19T05:00:00.000Z',
+          siblings,
+        }),
+        calRow({
+          id: 's1',
+          startAt: '2026-09-18T02:00:00.000Z',
+          endAt: '2026-09-18T05:00:00.000Z',
+          siblings,
+        }),
+        calRow({
+          id: 's3',
+          startAt: '2026-09-20T02:00:00.000Z',
+          endAt: '2026-09-20T05:00:00.000Z',
+          siblings,
+        }),
+      ]);
+
+      const rows = await service.getCalendar(WINDOW);
+
+      expect(rows.map((r) => r.id)).toEqual(['s1', 's2', 's3']);
+      expect(rows.map((r) => r.slotIndex)).toEqual([1, 2, 3]);
+      expect(rows.map((r) => r.slotCount)).toEqual([3, 3, 3]);
+      expect(rows.map((r) => r.bookingRequestId)).toEqual([
+        BOOKING_ID,
+        BOOKING_ID,
+        BOOKING_ID,
+      ]);
+      expect(rows.map((r) => r.code)).toEqual([CODE_A, CODE_A, CODE_A]);
+    });
+
+    it('B8: counts over the whole request, not the window, and skips a cancelled sibling', async () => {
+      // Siblings s1, s3, s4 are live; s2 was cancelled, so the nested read never returns it. Only s4
+      // falls inside this window — it is still "3 of 3", not "1 of 1" and not "4 of 4".
+      bookingSlot.findMany.mockResolvedValue([
+        calRow({ id: 's4', siblings: ['s1', 's3', 's4'] }),
+      ]);
+
+      const [row] = await service.getCalendar(WINDOW);
+
+      expect(row.slotIndex).toBe(3);
+      expect(row.slotCount).toBe(3);
+    });
+
+    // ── B9 — Bangkok date and wall clock, and 24:00 ───────────────────────────────
+    it.each([
+      [
+        '17:00Z–19:00Z on the 17th is 00:00–02:00 on the 18th',
+        '2026-09-17T17:00:00.000Z',
+        '2026-09-17T19:00:00.000Z',
+        { date: '2026-09-18', start: '00:00', end: '02:00' },
+      ],
+      [
+        'a slot ending at the next Bangkok midnight reads 24:00',
+        '2026-09-18T15:00:00.000Z',
+        '2026-09-18T17:00:00.000Z',
+        { date: '2026-09-18', start: '22:00', end: '24:00' },
+      ],
+      [
+        'a whole-day slot is 00:00–24:00',
+        '2026-09-17T17:00:00.000Z',
+        '2026-09-18T17:00:00.000Z',
+        { date: '2026-09-18', start: '00:00', end: '24:00' },
+      ],
+      [
+        'a slot running PAST midnight keeps its start date and a plain end clock',
+        '2026-09-18T16:00:00.000Z',
+        '2026-09-18T18:00:00.000Z',
+        { date: '2026-09-18', start: '23:00', end: '01:00' },
+      ],
+    ])('B9: %s', async (_label, startAt, endAt, expected) => {
+      bookingSlot.findMany.mockResolvedValue([calRow({ startAt, endAt })]);
+
+      const rows = await service.getCalendar(WINDOW);
+
+      // One row, on its START date only — never duplicated onto the next day.
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject(expected);
+    });
+
+    // ── B10 — ordering ────────────────────────────────────────────────────────────
+    it('B10: startAt ASC, then APPROVED before PENDING at the same start, then code ASC', async () => {
+      const at9 = '2026-09-18T02:00:00.000Z';
+      bookingSlot.findMany.mockResolvedValue([
+        // A PENDING request with the LOWEST code, at 09:00.
+        calRow({
+          id: 'p-9',
+          startAt: at9,
+          requestId: 'req-p',
+          code: CODE_A,
+          status: BookingStatus.PENDING,
+        }),
+        // Two APPROVED requests at 09:00, codes out of order.
+        calRow({
+          id: 'a-9-c',
+          startAt: at9,
+          requestId: 'req-c',
+          code: 'BR-25690903-003',
+        }),
+        calRow({ id: 'a-9-b', startAt: at9, requestId: 'req-b', code: CODE_B }),
+        // A PENDING slot that starts EARLIER beats every 09:00 row.
+        calRow({
+          id: 'p-8',
+          startAt: '2026-09-18T01:00:00.000Z',
+          requestId: 'req-q',
+          code: 'BR-25690903-009',
+          status: BookingStatus.PENDING,
+        }),
+      ]);
+
+      const rows = await service.getCalendar(WINDOW);
+
+      // 🔴 `status: 'asc'` on the Prisma enum would put `p-9` before the APPROVED 09:00 rows —
+      // `PENDING` is declared first in `schema.prisma`.
+      expect(rows.map((r) => r.id)).toEqual(['p-8', 'a-9-b', 'a-9-c', 'p-9']);
+    });
+
+    // ── B11 — requesterName follows `requesterOf` ─────────────────────────────────
+    it('B11: the registration name wins, else the override column, else null', async () => {
+      bookingSlot.findMany.mockResolvedValue([
+        calRow({
+          id: 'reg',
+          startAt: '2026-09-18T01:00:00.000Z',
+          requestId: 'req-1',
+          code: 'BR-25690903-001',
+          // Both set: the registration wins (a staff booking made ON BEHALF OF a LINE user).
+          requesterName: 'ไม่ควรแสดง',
+          lineUser: {
+            registration: {
+              firstName: 'สมชาย',
+              lastName: 'ใจดี',
+              phone: '0800000000',
+              department: null,
+            },
+          },
+        }),
+        calRow({
+          id: 'override',
+          startAt: '2026-09-18T02:00:00.000Z',
+          requestId: 'req-2',
+          code: 'BR-25690903-002',
+          requesterName: 'ฝ่ายกิจการนักเรียน',
+        }),
+        calRow({
+          id: 'nobody',
+          startAt: '2026-09-18T03:00:00.000Z',
+          requestId: 'req-3',
+          code: 'BR-25690903-003',
+          requesterName: null,
+        }),
+      ]);
+
+      const rows = await service.getCalendar(WINDOW);
+
+      expect(rows.map((r) => r.requesterName)).toEqual([
+        'สมชาย ใจดี',
+        'ฝ่ายกิจการนักเรียน',
+        null,
+      ]);
     });
   });
 });
