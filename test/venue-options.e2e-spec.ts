@@ -13,6 +13,7 @@ import {
   clearThrottleCounters,
   createE2eApp,
   ensureE2eOptions,
+  hideLiveAmenities,
   prismaOf,
   purgeE2eUsers,
   redisOf,
@@ -368,17 +369,31 @@ describe('Venue options admin CRUD (e2e)', () => {
 
     it('may be emptied completely — unlike the FK-backed tables, an empty amenity list breaks nothing', async () => {
       const { agent, token } = await login(SUPER);
-      const before = (await agent.get(url('/amenities')).expect(200))
-        .body as OptionBody[];
-      for (const row of before) {
+      // The real amenities leave by raw UPDATE and come back by id (see `hideLiveAmenities`): the
+      // DELETE route would also strip them off every venue, for good. What goes through the API is
+      // this suite's own rows — at least one, so the loop can never pass by doing nothing.
+      const restore = await hideLiveAmenities(prisma, redis, ROW_PREFIX);
+      try {
         await agent
-          .delete(url(`/amenities/${row.id}`))
+          .post(url('/amenities'))
           .set('x-csrf-token', token)
-          .expect(200);
+          .send({ name: `${ROW_PREFIX}last` })
+          .expect(201);
+        const before = (await agent.get(url('/amenities')).expect(200))
+          .body as OptionBody[];
+        expect(before.length).toBeGreaterThan(0);
+        for (const row of before) {
+          await agent
+            .delete(url(`/amenities/${row.id}`))
+            .set('x-csrf-token', token)
+            .expect(200);
+        }
+        const after = (await agent.get(url('/amenities')).expect(200))
+          .body as OptionBody[];
+        expect(after).toEqual([]);
+      } finally {
+        await restore();
       }
-      const after = (await agent.get(url('/amenities')).expect(200))
-        .body as OptionBody[];
-      expect(after).toEqual([]);
     });
   });
 

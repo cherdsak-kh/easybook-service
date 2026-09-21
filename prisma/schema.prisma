@@ -688,6 +688,10 @@ model SystemUser {
   createdBookings  BookingRequest[] @relation("BookingCreatedBy")
   approvedBookings BookingRequest[] @relation("BookingApprovedBy")
 
+  /// Triage log entries this staff member wrote. HISTORY, not identity: resolve WITHOUT a
+  /// `deletedAt` filter (DD-4). A hard delete nulls FeedbackLog.authorId and keeps the log.
+  feedbackLogs FeedbackLog[] @relation("FeedbackLogAuthor")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1048,16 +1052,20 @@ enum FeedbackType {
   FEEDBACK
 }
 
-/// The admin triage lifecycle.
+/// The admin triage lifecycle (ADMIN-FEEDBACK-1).
 ///
-/// 🔴 NOTHING IN THIS CYCLE TRANSITIONS IT, and nothing reads it. It is absent from every DTO (so
-/// `forbidNonWhitelisted` 400s an attempt to set it, the same construction that protects
-/// `isSystemReserved`), absent from the create response, and no route filters on it. It ships now
-/// because it is the one thing that cannot be added later for free — a new enum type plus an
-/// `ADD COLUMN` on a populated table is a locking migration — and because the admin console is a
-/// named near-term consumer. The plan's objection ("a status with no screen to drive it is a column
-/// that lies") is preserved in full: a column nothing reads and nothing but the default writes
-/// cannot lie. The day the console lands, it owns the transitions and the vocabulary.
+/// 🔴 ONE WRITER PER SIDE. The LIFF submit never names it — `CreateFeedbackDto` has no `status`, so
+/// `forbidNonWhitelisted` 400s an attempt to set it and the column default (`PENDING`) is the only
+/// value a reporter can produce. The admin console owns every transition: `PATCH /feedback/:id` is
+/// the ONLY route that writes it, it may move any state to any of `PENDING` / `IN_PROGRESS` /
+/// `RESOLVED` (there is no transition policy — the prototype draws none), and every accepted save
+/// appends exactly one `FeedbackLog` recording the RESULTING status.
+///
+/// ⚠️ `DISMISSED` IS IN THE ENUM AND ON NO SCREEN (OQ-1). The PATCH DTO refuses it with a 400 under
+/// its own Swagger enum name (`FeedbackUpdateStatus`), the admin list filter accepts it harmlessly,
+/// and no row can reach it today. It stays because removing an enum value is a locking migration and
+/// the PO may yet draw a "ไม่ดำเนินการ / ปิดเรื่อง" state — a status with no screen is a column
+/// that lies, so it must be drawn in the prototype before any route may write it.
 enum FeedbackStatus {
   PENDING
   IN_PROGRESS
@@ -1136,9 +1144,15 @@ model Feedback {
   /// `feedback/` public prefix before it is stored, so a foreign URL can never enter the column.
   photos String[]
 
-  /// Admin triage state. `PENDING` on every insert and NEVER written again in this cycle — see the
-  /// enum's comment for why the column ships anyway.
+  /// Admin triage state. `PENDING` on every insert (the LIFF submit never names it); after that it
+  /// is written ONLY by `PATCH /feedback/:id`, under a `SELECT … FOR UPDATE` row lock and in the
+  /// same transaction as the `FeedbackLog` that records the change. A note-only save leaves it (and
+  /// `updatedAt`) untouched. See the enum's comment for the vocabulary and `DISMISSED`.
   status FeedbackStatus @default(PENDING)
+
+  /// Append-only triage history (ADMIN-FEEDBACK-1). Empty on insert; no synthesised
+  /// "submitted" entry (D-2). Written only by PATCH /feedback/:id, one row per accepted save.
+  logs FeedbackLog[] @relation("FeedbackLogs")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1159,4 +1173,39 @@ model Feedback {
   /// Mechanical pluralisation of the model name, like every other table here — "feedback" being
   /// uncountable in English does not get to make the model and the table disagree.
   @@map("feedbacks")
+}
+
+/// One staff action on a Feedback: a status change, an internal note, or both (D-1).
+/// APPEND-ONLY: no update or delete route exists. `status` is the RESULTING status after the save,
+/// so the log alone replays the report's lifecycle.
+///
+/// PDPA: `note` is internal staff free text that may name people. It is NEVER logged, and it is
+/// never sent to the reporter (OQ-7).
+model FeedbackLog {
+  id String @id @default(cuid())
+
+  /// `onDelete: Cascade`: the log is part of the report and is erased with it, which in turn goes
+  /// with a hard-deleted LineUser (right to erasure).
+  feedbackId String
+  feedback   Feedback @relation("FeedbackLogs", fields: [feedbackId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  /// The status the report was LEFT in by this save. It equals the prior status on a note-only save.
+  status FeedbackStatus
+
+  /// Internal note. Unbounded `text`: the 500-char cap (trim first, then count) lives in
+  /// `UpdateFeedbackDto`, like `Feedback.description`. Null = a status-only change.
+  note String?
+
+  /// FK -> SystemUser.id, taken from the session, never from the body. `SetNull`: a staff hard delete
+  /// keeps the audit row and shows "ไม่พบข้อมูลเจ้าหน้าที่" (OQ-3). A soft-deleted author still resolves.
+  authorId String?
+  author   SystemUser? @relation("FeedbackLogAuthor", fields: [authorId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  createdAt DateTime @default(now())
+
+  /// "Logs of this report in time order": the detail read, AND the scan behind the Cascade delete.
+  @@index([feedbackId, createdAt])
+  /// The scan the SetNull FK performs on a SystemUser hard delete (same reason as SystemUser.createdById).
+  @@index([authorId])
+  @@map("feedback_logs")
 }

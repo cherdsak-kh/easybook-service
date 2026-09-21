@@ -11,7 +11,8 @@ import {
   TOMBSTONE_DEPARTMENT_NAME,
   TOMBSTONE_PERSONNEL_ROLE_NAME,
 } from '../src/options/options.constants';
-import { REDIS_CLIENT } from '../src/redis/redis.constants';
+import { AMENITY_LIST_KEY } from '../src/redis/cache-keys';
+import { CACHE_KEY_PREFIX, REDIS_CLIENT } from '../src/redis/redis.constants';
 
 /**
  * Boots the real application graph with the production middleware wiring (`configureApp`), so the
@@ -67,6 +68,41 @@ export async function waitForRedis(
 export async function clearThrottleCounters(redis: Redis): Promise<void> {
   const keys = await redis.keys('eb:throttle:*');
   if (keys.length > 0) await redis.del(...keys);
+}
+
+/**
+ * Hides every live amenity (except rows named `except…`, when given) and returns the function that
+ * brings back EXACTLY those rows — call it from a `finally`.
+ *
+ * 🔴 The e2e suites run against the dev database, so "every amenity" includes the real ones. Two
+ * tests used to empty the table and never put it back, leaving every real amenity soft-deleted after
+ * each run. Hiding by raw UPDATE, never through `DELETE /amenities/:id`, is the other half of the
+ * fix: `AmenitiesService.softDelete` also HARD-deletes the row's venue ticks, and clearing
+ * `deletedAt` afterwards cannot bring those back.
+ *
+ * Restores by id rather than "everything not prefixed", so an amenity an admin deleted on purpose
+ * stays deleted. Both directions drop the cached `/amenities` list, which a raw UPDATE bypasses.
+ */
+export async function hideLiveAmenities(
+  prisma: PrismaService,
+  redis: Redis,
+  except?: string,
+): Promise<() => Promise<void>> {
+  const hidden = await prisma.$queryRawUnsafe<Array<{ id: number }>>(
+    `UPDATE amenities SET "deletedAt" = now()
+     WHERE "deletedAt" IS NULL AND ($1::text IS NULL OR "name" NOT LIKE ($1 || '%'))
+     RETURNING id`,
+    except ?? null,
+  );
+  const dropCache = () => redis.del(CACHE_KEY_PREFIX + AMENITY_LIST_KEY);
+  await dropCache();
+  return async () => {
+    await prisma.amenity.updateMany({
+      where: { id: { in: hidden.map((row) => row.id) } },
+      data: { deletedAt: null },
+    });
+    await dropCache();
+  };
 }
 
 /** Test-fixture teardown. Raw SQL on purpose: the application code never hard-deletes a row. */

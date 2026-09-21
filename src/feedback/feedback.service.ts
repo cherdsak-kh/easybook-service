@@ -155,8 +155,8 @@ export class FeedbackService {
           subject: dto.subject,
           description: dto.description,
           photos,
-          // `status` is NOT written here: the column's `@default(PENDING)` is its only writer in
-          // this cycle, and naming it would be the first step towards a lifecycle nothing drives.
+          // `status` is NOT written here: on insert the column's `@default(PENDING)` is its only
+          // writer, and every later transition belongs to the admin console (`AdminFeedbackService`).
         },
       });
     });

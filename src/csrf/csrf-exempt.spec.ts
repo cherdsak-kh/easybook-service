@@ -57,6 +57,15 @@ describe('isCsrfExempt', () => {
     }
   });
 
+  it('does NOT exempt the admin feedback console (ADMIN-FEEDBACK-1, AC-14)', () => {
+    // `PATCH /feedback/:id` stands on the cookie session, so it MUST require the double-submit
+    // token. It shares the word "feedback" with the two exempt LIFF literals above, but not their
+    // first segment — if either assertion ever flips, an exemption has been widened onto a
+    // cookie-session write and a foreign origin can triage reports.
+    expect(isCsrfExempt(p('/feedback/ckxyz0000abcd1234efgh5678'))).toBe(false);
+    expect(isCsrfExempt(p('/feedback'))).toBe(false);
+  });
+
   it('exempts the two parameterised booking cancellations', () => {
     // The reason the pattern list had to exist: neither of these is a fixed string.
     expect(isCsrfExempt(p('/line-users/bookings/clx_abc123/cancel'))).toBe(

@@ -15,6 +15,7 @@ import {
   clearThrottleCounters,
   createE2eApp,
   ensureE2eOptions,
+  hideLiveAmenities,
   prismaOf,
   purgeE2eUsers,
   redisOf,
@@ -939,19 +940,22 @@ describe('Venues (e2e)', () => {
     /** AC-A3 — the only curated table that may legitimately be empty. */
     it('AC-A3 · a venue can still be created with zero amenities in the system', async () => {
       const s = await login(ADMIN);
-      await prisma.$executeRawUnsafe(
-        `UPDATE amenities SET "deletedAt" = now()`,
-      );
-      const res = await s.agent
-        .post(url('/venues'))
-        .set('x-csrf-token', s.token)
-        .send({
-          name: `${ROW_PREFIX}no-amen`,
-          venueTypeId: typeId,
-          capacity: 5,
-        })
-        .expect(201);
-      expect((res.body as VenueBody).amenities).toEqual([]);
+      // Every amenity, the real ones included — put back by id however the test ends.
+      const restore = await hideLiveAmenities(prisma, redis);
+      try {
+        const res = await s.agent
+          .post(url('/venues'))
+          .set('x-csrf-token', s.token)
+          .send({
+            name: `${ROW_PREFIX}no-amen`,
+            venueTypeId: typeId,
+            capacity: 5,
+          })
+          .expect(201);
+        expect((res.body as VenueBody).amenities).toEqual([]);
+      } finally {
+        await restore();
+      }
     });
 
     /**

@@ -32,8 +32,9 @@ const trim = ({ value }: { value: unknown }): unknown =>
  *    (`LINK-LINE-1`). A body field would be an impersonation route.
  * 2. **`code`** — server-minted. AC-37: the client displays the value it is given and never
  *    generates or guesses one.
- * 3. **`status`** — the triage column has no API surface in this cycle; this is the same
- *    construction that keeps `isSystemReserved` unsettable.
+ * 3. **`status`** — the triage column is written ONLY by the admin console (`PATCH /feedback/:id`,
+ *    ADMIN-FEEDBACK-1); a reporter can never set it. This is the same construction that keeps
+ *    `isSystemReserved` unsettable.
  * 4. **`category`** — `D-4`. The prototype removed the category chips on 17 ก.ย. 2569 because
  *    *"การจัดหมวดเป็นงานของเจ้าหน้าที่ฝั่ง admin ไม่ใช่ของคนที่มาแจ้ง"*. Not as a column, not as a
  *    DTO field, not as a UI control.
@@ -132,7 +133,8 @@ export class CreateFeedbackDto {
  * snapshot of state it has just cleared — precisely the kind of duplicate record that goes stale.
  * The dialog then renders what was PERSISTED, not what was typed.
  *
- * ⚠️ `status` AND `lineUserId` ARE EXCLUDED. The former has no consumer in this cycle; the latter
+ * ⚠️ `status` AND `lineUserId` ARE EXCLUDED. The former has no consumer on the client — triage is
+ * staff-only and the reporter never reads a status (ADMIN-FEEDBACK-1, plan §2 Out); the latter
  * would tell the sender something they already know while putting an identifier into a response
  * body for no reason (plan §8). The `U…` sub appears in no response body at all.
  */

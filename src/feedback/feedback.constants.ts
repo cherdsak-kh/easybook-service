@@ -1,4 +1,4 @@
-import { FeedbackType } from '@prisma/client';
+import { FeedbackStatus, FeedbackType } from '@prisma/client';
 
 /**
  * One constant per message and per limit, following `src/bookings/bookings.constants.ts` and
@@ -170,3 +170,70 @@ export const FEEDBACK_PHOTO_TOO_LARGE = 'The photo must be 5 MB or smaller.';
 /** One message for "not declared as an image we take", "not one at all", and "mislabelled". */
 export const FEEDBACK_PHOTO_TYPE_UNSUPPORTED =
   'Unsupported image type. Upload a JPEG or PNG image.';
+
+// ── ADMIN TRIAGE (`GET/PATCH /feedback`, ADMIN-FEEDBACK-1) ───────────────────────────────────────
+
+/**
+ * 404 for both an unknown and a malformed id — the lookup is by cuid only, with no `code` lookup
+ * and no cuid pipe (AC-10), the `admin-bookings.service.ts` `getDetail` precedent.
+ */
+export const FEEDBACK_NOT_FOUND = 'Feedback not found.';
+
+/**
+ * 400, D-1(a): a PATCH body carrying neither a `status` nor a non-blank `note`.
+ *
+ * ⚠️ THROWN BY THE SERVICE, NOT A DTO DECORATOR (design C-3). The pipe's refusals are `string[]`;
+ * this has to be ONE machine-readable string (AC-16), and a class-level decorator cannot see that a
+ * `note` of spaces was trimmed to "absent" anyway.
+ */
+export const FEEDBACK_UPDATE_EMPTY =
+  'Provide a new status or a non-blank note.';
+
+/**
+ * 400, D-1(b): `status` equal to the CURRENT status with a blank note. Decided inside the write
+ * transaction, under the row lock, because only the server knows the current status for sure.
+ * Nothing is written — no log row, and `updatedAt` does not move.
+ */
+export const FEEDBACK_NO_CHANGE =
+  'No change: the status is unchanged and the note is blank.';
+
+/**
+ * The internal note's cap — 500 characters AFTER trimming (E-9). Lives in the DTO, never in the
+ * column (`FeedbackLog.note` is unbounded `text`, like `Feedback.description`): `varchar(n)` counts
+ * code points and `@MaxLength` counts UTF-16 units, so a DB cap could 500 a value the DTO accepted.
+ */
+export const FEEDBACK_NOTE_MAX = 500;
+
+/** `q` — the same bound `BOOKING_SEARCH_MAX` puts on the booking queue's search box. */
+export const FEEDBACK_SEARCH_MAX = 100;
+
+/**
+ * The three page sizes `PaginationBar` offers. Anything else is a 400, NEVER a clamp (D-4): the
+ * screen prints each row's ordinal as `(page − 1) × limit + i + 1` from the limit IT sent, so a
+ * silent clamp would make every ordinal on the page wrong. `BOOKING_REQUEST_PAGE_SIZES`' reasoning.
+ */
+export const FEEDBACK_PAGE_SIZES = [10, 20, 50] as const;
+
+/**
+ * The `venueId` literal meaning `venueId IS NULL` — ปัญหาทั่วไป / ไม่ระบุสถานที่. Absent means ALL
+ * venues; the two are different questions and never share a value (plan §3 Venue filter). Cannot
+ * collide with a real id: venue ids are cuids, lowercase alphanumeric beginning with `c`.
+ */
+export const FEEDBACK_VENUE_GENERAL = 'general';
+
+/**
+ * What `PATCH /feedback/:id` may set. Any of the three may move to any of the three — there is no
+ * transition policy (AC-21), so `RESOLVED → PENDING` re-opens a report.
+ *
+ * 🔴 `DISMISSED` IS DELIBERATELY ABSENT (OQ-1). The prototype draws no such state, label, badge or
+ * option, and a status with no screen is a column that lies. It is published under its OWN Swagger
+ * enum name (`FeedbackUpdateStatus`) — reusing `FeedbackStatus` for a 3-value subset would overwrite
+ * the shared 4-value schema in `/docs-json`, since the last registration under a name wins (C-4).
+ */
+export const FEEDBACK_UPDATE_STATUSES = [
+  FeedbackStatus.PENDING,
+  FeedbackStatus.IN_PROGRESS,
+  FeedbackStatus.RESOLVED,
+] as const;
+
+export type FeedbackUpdateStatus = (typeof FEEDBACK_UPDATE_STATUSES)[number];
