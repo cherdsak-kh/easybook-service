@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ThrottlerModule } from '@nestjs/throttler';
 import type { Redis } from 'ioredis';
+import { AnnouncementsModule } from './announcements/announcements.module';
 import { AppController } from './app.controller';
 import { AuthModule } from './auth/auth.module';
 import { BookingsModule } from './bookings/bookings.module';
@@ -111,6 +112,9 @@ const throttlerModule: DynamicModule = {
     // no parameterised POST exists on that family — the table proving it is on
     // `FeedbackController`, and it is the thing to re-read before adding one.
     FeedbackModule,
+    // `ANNOUNCE-API-1` — ประกาศและข่าวสาร, phase 1 (persistence + admin CRUD; nothing is broadcast).
+    // Its routes are `/announcements…`, a first segment no other controller uses.
+    AnnouncementsModule,
     SystemModule,
     // Still future tasks: the admin approval + direct-booking surface (`SessionGuard`), the
     // `/client` realtime namespace, and LINE chat notifications.

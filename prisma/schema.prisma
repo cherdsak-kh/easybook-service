@@ -274,6 +274,9 @@ model Department {
   /// and only this one is a manual override.
   bookingRequests BookingRequest[] @relation("BookingDepartment")
 
+  /// Back-relation for Announcement.departmentId (ANNOUNCE-API-1). VIRTUAL — adds no column.
+  announcements Announcement[] @relation("AnnouncementDepartment")
+
   @@index([deletedAt])
   @@map("departments")
 }
@@ -691,6 +694,10 @@ model SystemUser {
   /// Triage log entries this staff member wrote. HISTORY, not identity: resolve WITHOUT a
   /// `deletedAt` filter (DD-4). A hard delete nulls FeedbackLog.authorId and keeps the log.
   feedbackLogs FeedbackLog[] @relation("FeedbackLogAuthor")
+
+  /// Announcements this staff member drafted. HISTORY, not identity: resolve WITHOUT a `deletedAt`
+  /// filter (DD-4). A hard delete nulls Announcement.createdById and keeps the row.
+  createdAnnouncements Announcement[] @relation("AnnouncementCreatedBy")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1208,4 +1215,74 @@ model FeedbackLog {
   /// The scan the SetNull FK performs on a SystemUser hard delete (same reason as SystemUser.createdById).
   @@index([authorId])
   @@map("feedback_logs")
+}
+
+/// The LINE message shape an announcement will be delivered as (ANNOUNCE-API-1). Phase 1 only stores
+/// it: nothing is rendered or pushed until the send transition exists (phase 2).
+enum AnnouncementFormat {
+  TEXT
+  FLEX
+}
+
+/// 🔴 NO API ROUTE WRITES `SENT` IN PHASE 1 (D-1). POST always inserts `DRAFT` via the column default;
+/// no request DTO has a `status` field, so `forbidNonWhitelisted` 400s any attempt. `SENT` exists so
+/// the immutability guards (D-2: PATCH/DELETE on SENT -> 409) are built and tested now, against rows
+/// seeded directly through Prisma. Phase 2's send transition is its ONLY future writer.
+enum AnnouncementStatus {
+  DRAFT
+  SENT
+}
+
+/// Who an announcement targets. The prototype's `staff` value is deliberately absent (plan: Out).
+enum AnnouncementAudience {
+  ALL
+  DEPARTMENT
+}
+
+/// One "ประกาศและข่าวสาร" entry drafted in the admin portal (ANNOUNCE-API-1, phase 1: persistence + CRUD).
+///
+/// INVARIANT (D-3), enforced in `AnnouncementsService` on the MERGED state, never by the column:
+/// `departmentId IS NOT NULL` iff `audience = DEPARTMENT`.
+///
+/// PDPA: `title`/`body` are staff-authored free text that may name people; NEVER logged — log `id=` only.
+model Announcement {
+  id String @id @default(cuid())
+
+  /// หัวข้อ. Unbounded `text`; the 1–100 (after trim) rule lives in the DTO, like `Feedback.subject`.
+  title String
+
+  /// เนื้อหา. `''` for a title-only draft (D-4). Unbounded `text`; the 1000 cap lives in the DTO.
+  body String @default("")
+
+  format   AnnouncementFormat   @default(TEXT)
+  status   AnnouncementStatus   @default(DRAFT)
+  audience AnnouncementAudience @default(ALL)
+
+  /// FK -> Department.id (an INT, not a cuid). Non-null iff audience = DEPARTMENT (D-3).
+  /// `SetNull` (PO-specified): a stray HARD delete of a department keeps the announcement. Department
+  /// deletes are normally SOFT, so this rarely fires. Reads resolve as HISTORY (no `deletedAt`
+  /// filter); writes require an ACTIVE department (service -> 400), the house read/write asymmetry.
+  departmentId Int?
+  department   Department? @relation("AnnouncementDepartment", fields: [departmentId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  /// Phase 2 writes these two with the real broadcast. Phase 1 never touches them.
+  sentAt    DateTime?
+  sentCount Int       @default(0)
+
+  /// FK -> SystemUser.id, taken from the session, never from the body (D-5). HISTORY: resolve WITHOUT
+  /// a `deletedAt` filter (DD-4). `SetNull` so a hard delete keeps the row (AC-11).
+  createdById String?
+  createdBy   SystemUser? @relation("AnnouncementCreatedBy", fields: [createdById], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The status-filtered list (`status=draft|sent`) with the recency sort.
+  @@index([status, createdAt])
+  /// The unfiltered "all, newest first" list — Postgres cannot use the composite above for it.
+  @@index([createdAt])
+  /// The scans the two SetNull FKs perform on a hard delete.
+  @@index([departmentId])
+  @@index([createdById])
+  @@map("announcements")
 }
