@@ -23,9 +23,14 @@ import { CACHE_KEY_PREFIX, REDIS_CLIENT } from '../src/redis/redis.constants';
  * `customise` lets a suite override a provider (the avatar spec swaps `R2StorageService` for a fake
  * — the e2e suites must NEVER touch real object storage, and CI has no R2 credentials). Everything
  * else stays the production graph.
+ *
+ * `beforeInit` runs after `configureApp` and BEFORE `app.init()`. It exists for `mountSwagger`
+ * (`system-integrations.e2e-spec.ts`): Nest registers its catch-all 404 at init, so a route added
+ * afterwards is unreachable — the docs gate could never be tested from outside it.
  */
 export async function createE2eApp(
   customise?: (builder: TestingModuleBuilder) => TestingModuleBuilder,
+  beforeInit?: (app: INestApplication<App>) => void,
 ): Promise<INestApplication<App>> {
   let builder = Test.createTestingModule({ imports: [AppModule] });
   if (customise) builder = customise(builder);
@@ -34,6 +39,7 @@ export async function createE2eApp(
     rawBody: true,
   });
   configureApp(app);
+  beforeInit?.(app);
   await app.init();
   return app;
 }

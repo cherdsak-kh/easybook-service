@@ -27,6 +27,11 @@ import type { AvatarImageType } from './image-sniff';
  */
 const R2_REGION = 'auto';
 
+/** Where the การเชื่อมต่อระบบ write probe puts (and immediately deletes) its two-byte object. */
+const HEALTHCHECK_PREFIX = '_healthcheck/';
+/** Per-step cap for {@link R2StorageService.probe} — the page waits on it, so it must not hang. */
+const PROBE_STEP_TIMEOUT_MS = 5_000;
+
 /**
  * Where a venue photo lands before a venue owns it. Trailing slash included so callers never have to
  * remember it.
@@ -250,6 +255,84 @@ export class R2StorageService {
       );
       return false;
     }
+  }
+
+  /**
+   * การเชื่อมต่อระบบ's storage probe (`INTEGRATIONS-API-1`). NEVER THROWS — a probe that answers
+   * "no" is a result, not a server error.
+   *
+   *  · read  — `ListObjectsV2` for ONE key under the probe prefix. Proves the endpoint, the
+   *            credentials and the bucket name in one round trip.
+   *  · write — `PutObject` of two bytes to `_healthcheck/probe-<16 hex>.txt`, then `DeleteObject`.
+   *            The avatar and venue-photo uploads depend on exactly this permission, and reading
+   *            proves nothing about it. The key is random, so concurrent probes cannot collide.
+   *            `_healthcheck/` is outside every prefix the orphan sweep reads, and the object is
+   *            deleted at once; a failed delete leaves two bytes behind, logged.
+   *
+   * `latencyMs` covers the whole probe. Each step is capped at {@link PROBE_STEP_TIMEOUT_MS}.
+   * Unconfigured → all false with latency 0, and no S3 client is built.
+   */
+  async probe(): Promise<{
+    ok: boolean;
+    latencyMs: number;
+    read: boolean;
+    write: boolean;
+  }> {
+    if (!this.isConfigured()) {
+      return { ok: false, latencyMs: 0, read: false, write: false };
+    }
+    const bucket = this.config.getOrThrow<string>('R2_BUCKET');
+    const started = Date.now();
+    const step = async (run: () => Promise<unknown>): Promise<boolean> => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          run(),
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('probe step timed out')),
+              PROBE_STEP_TIMEOUT_MS,
+            );
+          }),
+        ]);
+        return true;
+      } catch (error) {
+        this.logger.warn(
+          `R2 probe step failed. reason=${error instanceof Error ? error.name : 'unknown'}`,
+        );
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    const read = await step(() =>
+      this.s3().send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: HEALTHCHECK_PREFIX,
+          MaxKeys: 1,
+        }),
+      ),
+    );
+    const key = `${HEALTHCHECK_PREFIX}probe-${randomBytes(8).toString('hex')}.txt`;
+    const put = await step(() =>
+      this.s3().send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          Body: 'ok',
+          ContentType: 'text/plain',
+        }),
+      ),
+    );
+    const removed = put
+      ? await step(() =>
+          this.s3().send(new DeleteObjectCommand({ Bucket: bucket, Key: key })),
+        )
+      : false;
+    const write = put && removed;
+    return { ok: read && write, latencyMs: Date.now() - started, read, write };
   }
 
   /** The durable, public https URL for a key. */

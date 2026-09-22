@@ -154,6 +154,14 @@ importing `PrismaModule`. Prisma 7 specifics:
   a non-2xx/exception response. Follow this pattern for new event types.
 - `LineService` is a thin wrapper over `@line/bot-sdk`'s `MessagingApiClient` /
   `MessagingApiBlobClient` (reply/push messaging, rich-menu CRUD). Nothing here talks to Prisma.
+- **Channel credentials can change at runtime** (`INTEGRATIONS-API-1`): `LineCredentialsService` holds
+  the Channel ID / secret / access token, `AppSetting` rows (`line.*`, saved by a SUPER_ADMIN through
+  `PATCH /system/integrations/line`) winning over `LINE_CHANNEL_*`. A new token rebuilds
+  `LineService.client` (keep that field name — the e2e suites read it to prove their fake is wired);
+  `LineSignatureGuard` reads the secret from it per request. 🔴 Stored rows are **ignored under
+  `NODE_ENV=test`**, or a token saved in the dev DB would replace the e2e fake client with a real one
+  and `announcements-send` would really multicast. The secret and token sit in **plaintext** in
+  `app_settings` and are never returned by any endpoint.
 - `LineUserService` owns the `LineUser` Prisma model: upsert-on-follow (preserves existing
   `access`/`richMenuType` on re-follow), soft-delete-on-unfollow (`deletedAt`, never a hard
   delete), and applying a user's `richMenuType` to their live LINE account.
@@ -308,8 +316,12 @@ also the only enforcement needed for "PATCH cannot set `password`/`email`/`lineU
 fields simply don't exist on `UpdateSystemUserDto`. Note that `useDefineForClassFields` is effective
 (it defaults to true at `target` >= ES2022; currently ES2022), so `'role' in dto` is *always* true — test presence with `dto.role !== undefined`,
 and use `@ValidateIf((_o, v) => v !== undefined)` (not `@IsOptional()`) on optional non-nullable
-fields, or an explicit `null` reaches a `NOT NULL` column. Swagger is wired in `main.ts` and can be
-disabled via `SWAGGER_ENABLED=false`; controllers not meant for the public contract (like the LINE
+fields, or an explicit `null` reaches a `NOT NULL` column. Swagger is mounted by `mountSwagger`
+(`src/system/swagger.setup.ts`) and gated **at runtime** by `SwaggerGateService`: the stored
+`AppSetting system.swagger_enabled` wins, else `SWAGGER_ENABLED=true`, else **off** (unset = off since
+`INTEGRATIONS-API-1`; `.env.example` sets `true` because the app's `gen:api` needs `/docs-json`). While
+off, the docs paths answer Nest's own 404. The gate must be mounted before `app.init()` — the e2e app
+does it through `createE2eApp`'s `beforeInit` hook; controllers not meant for the public contract (like the LINE
 webhook) should use `@ApiExcludeController()`.
 
 **Environment** (see `.env.example`): `PORT` (3300), `CORS_ORIGIN` (defaults to the Vite dev

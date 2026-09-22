@@ -31,6 +31,15 @@ export interface LineBotInfo {
   markAsReadMode: 'auto' | 'manual';
 }
 
+/**
+ * The OA's monthly push quota (`INTEGRATIONS-API-1`). `total` is `null` when LINE reports no target
+ * limit (`type: none`); `used` is this month's consumption so far. Reading it costs no quota.
+ */
+export interface LineMessageQuota {
+  total: number | null;
+  used: number;
+}
+
 /** Why a multicast stopped. Never `ALREADY_ACCEPTED` — that one counts as accepted. */
 export interface MulticastFailure {
   chunkIndex: number;
@@ -58,12 +67,17 @@ export interface MulticastOutcome {
  * `LINE_CHANNEL_ACCESS_TOKEN` is empty: every call then rejects at once with a `NOT_CONFIGURED`
  * {@link LineCallError} instead of taking a 401 round trip. The blob client (rich-menu images) is
  * still built here from config.
+ *
+ * ⚠️ THE CLIENT CAN BE REPLACED AT RUNTIME (`INTEGRATIONS-API-1`): a SUPER_ADMIN saving a new
+ * channel access token calls {@link useAccessToken} through `LineCredentialsService`. The field is
+ * still named `client` on purpose — the e2e suites read it by that name (`clientHeldBy`) to refuse to
+ * run unless their fake is the one wired in.
  */
 @Injectable()
 export class LineService {
   private readonly logger = new Logger(LineService.name);
-  private readonly client: messagingApi.MessagingApiClient | null;
-  private readonly blobClient: messagingApi.MessagingApiBlobClient;
+  private client: messagingApi.MessagingApiClient | null;
+  private blobClient: messagingApi.MessagingApiBlobClient;
 
   constructor(
     config: ConfigService,
@@ -79,6 +93,32 @@ export class LineService {
     this.blobClient = new messagingApi.MessagingApiBlobClient({
       channelAccessToken: config.get<string>('LINE_CHANNEL_ACCESS_TOKEN', ''),
     });
+  }
+
+  /** Whether a Messaging client is wired in — "configured" means exactly this, and nothing else. */
+  isConfigured(): boolean {
+    return this.client !== null;
+  }
+
+  /**
+   * Swap in a new channel access token without a restart. An empty token leaves NO client, so every
+   * call rejects `NOT_CONFIGURED` — the same state as an empty `LINE_CHANNEL_ACCESS_TOKEN` at boot.
+   *
+   * 🔴 Only `LineCredentialsService` calls this, and it never does under `NODE_ENV=test` from stored
+   * rows (see there): a real client silently replacing an e2e fake would make those suites send.
+   */
+  useAccessToken(channelAccessToken: string): void {
+    this.client = channelAccessToken
+      ? new messagingApi.MessagingApiClient({ channelAccessToken })
+      : null;
+    this.blobClient = new messagingApi.MessagingApiBlobClient({
+      channelAccessToken,
+    });
+    this.logger.log(
+      channelAccessToken
+        ? 'LINE channel access token replaced at runtime.'
+        : 'LINE channel access token cleared at runtime — messaging is now NOT_CONFIGURED.',
+    );
   }
 
   /** The client, or a `NOT_CONFIGURED` rejection. Every method below is `async`, so it never throws synchronously. */
@@ -209,6 +249,33 @@ export class LineService {
         pictureUrl: info.pictureUrl ?? null,
         chatMode: info.chatMode,
         markAsReadMode: info.markAsReadMode,
+      };
+    } catch (err) {
+      throw classifyLineError(err);
+    }
+  }
+
+  /**
+   * The monthly push quota: `GET /v2/bot/message/quota` + `/v2/bot/message/quota/consumption`, in
+   * parallel, each time-boxed like {@link getBotInfo}. Two READS — nothing is sent and no quota is
+   * spent. Rejects only with a classified {@link LineCallError}.
+   */
+  async getMessageQuota(): Promise<LineMessageQuota> {
+    try {
+      const client = this.requireClient();
+      const [quota, consumption] = await Promise.all([
+        withTimeout(client.getMessageQuota(), LINE_BOT_INFO_TIMEOUT_MS),
+        withTimeout(
+          client.getMessageQuotaConsumption(),
+          LINE_BOT_INFO_TIMEOUT_MS,
+        ),
+      ]);
+      return {
+        total:
+          quota.type === 'limited' && typeof quota.value === 'number'
+            ? quota.value
+            : null,
+        used: consumption.totalUsage,
       };
     } catch (err) {
       throw classifyLineError(err);

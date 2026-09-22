@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { VenuesModule } from '../venues/venues.module';
 import { LineController } from './line.controller';
+import { LineCredentialsService } from './line-credentials.service';
 import { lineMessagingClientProvider } from './line-messaging-client';
 import { LineService } from './line.service';
 import { LineSignatureGuard } from './line-signature.guard';
@@ -46,11 +47,14 @@ import { LineIdTokenGuard } from './guards/line-id-token.guard';
   providers: [
     lineMessagingClientProvider,
     LineService,
+    // Runtime channel credentials (INTEGRATIONS-API-1): the webhook guard's secret and the token
+    // `LineService` runs on. Exported for `SystemModule`'s การเชื่อมต่อระบบ endpoints.
+    LineCredentialsService,
     LineWebhookService,
     LineUserService,
     LineSignatureGuard,
     LineIdTokenGuard,
   ],
-  exports: [LineService, LineUserService],
+  exports: [LineService, LineUserService, LineCredentialsService],
 })
 export class LineModule {}
