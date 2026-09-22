@@ -66,7 +66,7 @@ export class AnnouncementDto {
     enum: AnnouncementStatus,
     enumName: 'AnnouncementStatus',
     description:
-      'Always `DRAFT` for a row created through the API in phase 1 — there is no send route. `SENT` rows are immutable (PATCH/DELETE → 409).',
+      'A row is created as `DRAFT`; only `POST /announcements/{id}/send` makes it `SENT`. `SENT` rows are immutable (PATCH/DELETE → 409) and cannot be sent again.',
   })
   status!: AnnouncementStatus;
 
@@ -85,14 +85,15 @@ export class AnnouncementDto {
     type: String,
     format: 'date-time',
     nullable: true,
-    description: 'Always null in phase 1 through the API.',
+    description: 'When the send committed; null for a DRAFT.',
   })
   sentAt!: string | null;
 
   @ApiProperty({
     example: 0,
     minimum: 0,
-    description: 'Always 0 in phase 1 through the API.',
+    description:
+      'Recipients whose multicast request LINE **accepted** (HTTP 200, or 409 on a repeated retry key). Not a delivered or read count: LINE silently drops users who blocked the OA. On a partial send (502 `ANNOUNCEMENT_PARTIALLY_SENT`) it is less than the targeted count. 0 for a DRAFT.',
   })
   sentCount!: number;
 

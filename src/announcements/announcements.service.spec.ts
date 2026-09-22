@@ -11,6 +11,7 @@ import {
   AnnouncementStatus,
   Prisma,
 } from '@prisma/client';
+import { LineService } from '../line/line.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   ANNOUNCEMENT_DEPARTMENT_INVALID,
@@ -132,6 +133,8 @@ describe('AnnouncementsService', () => {
           provide: PrismaService,
           useValue: { announcement, department, $transaction },
         },
+        // CRUD never touches LINE; the send's tests live in `announcements-send.service.spec.ts`.
+        { provide: LineService, useValue: {} },
       ],
     }).compile();
     service = module.get(AnnouncementsService);

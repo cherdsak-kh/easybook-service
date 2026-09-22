@@ -1,25 +1,55 @@
 import {
+  BadGatewayException,
   BadRequestException,
   ConflictException,
+  HttpException,
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import {
   AnnouncementAudience,
+  AnnouncementFormat,
   AnnouncementStatus,
+  AppAccess,
   Prisma,
 } from '@prisma/client';
+import { bangkokClock, thaiShortDate } from '../bookings/booking-notifier';
+import {
+  isLockNotAvailable,
+  mapTransactionError,
+} from '../common/prisma-tx.util';
+import {
+  buildAnnouncementCard,
+  buildAnnouncementText,
+} from '../line/announcement-card';
+import { classifyLineError } from '../line/line-call-error';
+import { LINE_USER_ID_PATTERN } from '../line/line.constants';
+import { toNotificationPreferences } from '../line/line-user.service';
+import { LineService, type MulticastFailure } from '../line/line.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
+  ANNOUNCEMENT_ALREADY_SENT,
+  ANNOUNCEMENT_BODY_REQUIRED,
   ANNOUNCEMENT_DEPARTMENT_INVALID,
   ANNOUNCEMENT_DEPARTMENT_NOT_ALLOWED,
   ANNOUNCEMENT_DEPARTMENT_REQUIRED,
+  ANNOUNCEMENT_LINE_BOT_INFO_UNAVAILABLE,
+  ANNOUNCEMENT_LINE_NOT_CONFIGURED,
+  ANNOUNCEMENT_LINE_RATE_LIMITED,
+  ANNOUNCEMENT_LINE_SEND_FAILED,
+  ANNOUNCEMENT_NO_RECIPIENTS_FOUND,
   ANNOUNCEMENT_NOT_FOUND,
+  ANNOUNCEMENT_PARTIALLY_SENT,
+  ANNOUNCEMENT_SEND_DEADLINE_MS,
+  ANNOUNCEMENT_SEND_IN_PROGRESS,
+  ANNOUNCEMENT_SEND_TX_TIMEOUT_MS,
   ANNOUNCEMENT_SENT_IMMUTABLE,
   ANNOUNCEMENT_UPDATE_EMPTY,
   type AnnouncementStatusFilter,
 } from './announcements.constants';
+import type { AnnouncementErrorCode } from './dto/announcement-error.dto';
 import type { ListAnnouncementsQueryDto } from './dto/announcement-query.dto';
 import type {
   AnnouncementDto,
@@ -29,6 +59,7 @@ import type {
   CreateAnnouncementDto,
   UpdateAnnouncementDto,
 } from './dto/announcement-write.dto';
+import type { LineBotInfoDto } from './dto/line-bot-info.dto';
 
 /**
  * What every response renders — list and detail alike (design S-4).
@@ -78,18 +109,74 @@ const STATUS_FILTER: Record<
   sent: AnnouncementStatus.SENT,
 };
 
+/** What the send reads under the lock (design §2 step 4) — typed Prisma decoding, not the raw SELECT. */
+const SEND_SELECT = {
+  title: true,
+  body: true,
+  format: true,
+  audience: true,
+  departmentId: true,
+  updatedAt: true,
+} satisfies Prisma.AnnouncementSelect;
+
+/** A Nest exception class whose first argument becomes the response body when it is an object. */
+type HttpExceptionClass = new (objectOrError?: unknown) => HttpException;
+
 /**
- * `ANNOUNCE-API-1` phase 1 — persistence + CRUD for `ประกาศและข่าวสาร`. NOTHING IS BROADCAST (D-1):
- * there is no LINE push, no send transition, and no writer of `SENT` / `sentAt` / `sentCount`.
+ * An exception whose body is the house `{ statusCode, error, message }` plus `code` (design S-6), and
+ * `acceptedCount`/`targetedCount` on a partial send. The house fields come from Nest itself, so the
+ * shape cannot drift from every other error body.
+ */
+function codedError(
+  Exception: HttpExceptionClass,
+  code: AnnouncementErrorCode,
+  message: string,
+  extra: { acceptedCount?: number; targetedCount?: number } = {},
+): HttpException {
+  const base = new Exception(message).getResponse() as Record<string, unknown>;
+  return new Exception({ ...base, code, ...extra });
+}
+
+/** D-C — nothing was accepted, so the send rolls back; this is its answer. */
+function lineSendError(kind: MulticastFailure['kind']): HttpException {
+  switch (kind) {
+    case 'NOT_CONFIGURED':
+      return codedError(
+        ServiceUnavailableException,
+        'LINE_NOT_CONFIGURED',
+        ANNOUNCEMENT_LINE_NOT_CONFIGURED,
+      );
+    case 'RATE_LIMITED':
+      return codedError(
+        ServiceUnavailableException,
+        'LINE_RATE_LIMITED',
+        ANNOUNCEMENT_LINE_RATE_LIMITED,
+      );
+    default:
+      return codedError(
+        BadGatewayException,
+        'LINE_SEND_FAILED',
+        ANNOUNCEMENT_LINE_SEND_FAILED,
+      );
+  }
+}
+
+/**
+ * `ประกาศและข่าวสาร` — persistence + CRUD (`ANNOUNCE-API-1`) and the LINE send (`ANNOUNCE-API-2`).
+ * `send` is the ONLY writer of `SENT` / `sentAt` / `sentCount`.
  *
- * 🔴 PDPA: `title` / `body` are staff-authored free text that may name people. They are never logged
- * and never interpolated into an exception message — log lines carry ids only.
+ * 🔴 PDPA: `title` / `body` are staff-authored free text that may name people, and LINE user ids are
+ * personal data. None of them is ever logged or interpolated into an exception message — log lines
+ * carry ids of rows, counts, chunk indexes and LINE error kinds only.
  */
 @Injectable()
 export class AnnouncementsService {
   private readonly logger = new Logger(AnnouncementsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly line: LineService,
+  ) {}
 
   /**
    * `GET /announcements` — one page and the FILTERED total. Newest first; `id` breaks `createdAt`
@@ -257,6 +344,256 @@ export class AnnouncementsService {
     if (count === 0) throw new ConflictException(ANNOUNCEMENT_SENT_IMMUTABLE);
 
     this.logger.log(`Announcement deleted id=${id} by=${actorId}`);
+  }
+
+  /**
+   * `POST /announcements/:id/send` — the one DRAFT → SENT transition (`ANNOUNCE-API-2`, D-A…D-E,
+   * design §2). One interactive transaction, holding the row lock for the whole LINE call:
+   *
+   *   1. `SELECT … FOR UPDATE NOWAIT` — `55P03` (someone else holds the row) → 409 `SEND_IN_PROGRESS`.
+   *   2. No row → 404. 3. Already `SENT` → 409 `ALREADY_SENT` (also the race loser after a commit).
+   *   4. Read the content under the lock. 5. Blank body → 400. 6. DEPARTMENT with a null, missing or
+   *      soft-deleted department → 400 (the reserved flag is NOT re-checked: it governs authoring).
+   *   7. Recipients (see {@link resolveRecipients}); none → 400, and no LINE call.
+   *   8. Multicast. Nothing accepted → throw the mapped 502/503: the rollback leaves the row DRAFT.
+   *   9. Something accepted → write SENT, `sentAt`, `sentCount = accepted` and RETURN — a partial send
+   *      must COMMIT, so its 502 is raised only after `$transaction` has resolved.
+   *
+   * Phase 1's PATCH/DELETE write `WHERE status = DRAFT`, so they block on this lock and then match 0
+   * rows → 409: content cannot change during a send (D-A.6).
+   */
+  async send(id: string, actorId: string): Promise<AnnouncementDto> {
+    // Captured OUTSIDE the callback so the catch can tell "LINE accepted, then the write failed".
+    let acceptedByLine = 0;
+
+    const { saved, outcome } = await this.prisma
+      .$transaction(
+        async (tx) => {
+          const start = Date.now();
+
+          let locked: { status: AnnouncementStatus }[];
+          try {
+            // Parameterised tagged template — `id` is a bound value, never spliced into the SQL.
+            locked = await tx.$queryRaw<{ status: AnnouncementStatus }[]>`
+              SELECT "status" FROM "announcements" WHERE "id" = ${id} FOR UPDATE NOWAIT`;
+          } catch (e) {
+            if (isLockNotAvailable(e)) {
+              throw codedError(
+                ConflictException,
+                'ANNOUNCEMENT_SEND_IN_PROGRESS',
+                ANNOUNCEMENT_SEND_IN_PROGRESS,
+              );
+            }
+            throw e;
+          }
+          if (locked.length === 0) {
+            throw codedError(
+              NotFoundException,
+              'ANNOUNCEMENT_NOT_FOUND',
+              ANNOUNCEMENT_NOT_FOUND,
+            );
+          }
+          if (locked[0].status === AnnouncementStatus.SENT) {
+            throw codedError(
+              ConflictException,
+              'ANNOUNCEMENT_ALREADY_SENT',
+              ANNOUNCEMENT_ALREADY_SENT,
+            );
+          }
+
+          const row = await tx.announcement.findUniqueOrThrow({
+            where: { id },
+            select: SEND_SELECT,
+          });
+          if (row.body.trim() === '') {
+            throw codedError(
+              BadRequestException,
+              'ANNOUNCEMENT_BODY_REQUIRED',
+              ANNOUNCEMENT_BODY_REQUIRED,
+            );
+          }
+          // `null` = audience ALL. Only a validated, live department id narrows the recipients.
+          let departmentId: number | null = null;
+          if (row.audience === AnnouncementAudience.DEPARTMENT) {
+            const department =
+              row.departmentId === null
+                ? null
+                : await tx.department.findFirst({
+                    where: { id: row.departmentId, deletedAt: null },
+                    select: { id: true },
+                  });
+            if (!department) {
+              throw codedError(
+                BadRequestException,
+                'ANNOUNCEMENT_DEPARTMENT_INVALID',
+                ANNOUNCEMENT_DEPARTMENT_INVALID,
+              );
+            }
+            departmentId = department.id;
+          }
+
+          const to = await this.resolveRecipients(tx, id, departmentId);
+          if (to.length === 0) {
+            throw codedError(
+              BadRequestException,
+              'NO_RECIPIENTS_FOUND',
+              ANNOUNCEMENT_NO_RECIPIENTS_FOUND,
+            );
+          }
+
+          // ONE instant: the card's timestamp and `sentAt` are the same Date (design S-8).
+          const now = new Date();
+          const message =
+            row.format === AnnouncementFormat.FLEX
+              ? buildAnnouncementCard({
+                  title: row.title,
+                  body: row.body,
+                  sentAtText: `${thaiShortDate(now)} ${bangkokClock(now)} น.`,
+                })
+              : buildAnnouncementText(row.title, row.body);
+
+          const result = await this.line.multicast(to, [message], {
+            retryKeySeed: `${id}|${row.updatedAt.toISOString()}`,
+            deadlineAt: start + ANNOUNCEMENT_SEND_DEADLINE_MS,
+          });
+          acceptedByLine = result.acceptedCount;
+
+          if (result.acceptedCount === 0) {
+            // D-C: the first chunk failed after its retry. Throwing rolls back — the row stays DRAFT.
+            const kind = result.failure?.kind ?? 'TRANSIENT';
+            this.logger.warn(
+              `Announcement not sent id=${id} kind=${kind} status=${result.failure?.status ?? null} targeted=${result.targetedCount}`,
+            );
+            throw lineSendError(kind);
+          }
+
+          // A plain `update` is correct: this transaction holds the row lock.
+          const written = await tx.announcement.update({
+            where: { id },
+            data: {
+              status: AnnouncementStatus.SENT,
+              sentAt: now,
+              sentCount: result.acceptedCount,
+            },
+            select: ANNOUNCEMENT_SELECT,
+          });
+          // 🔴 RETURN, never throw, on a partial send: throwing here would roll back the SENT write.
+          return { saved: written, outcome: result };
+        },
+        { timeout: ANNOUNCEMENT_SEND_TX_TIMEOUT_MS },
+      )
+      .catch((e: unknown) => {
+        if (!(e instanceof HttpException) && acceptedByLine > 0) {
+          // D-A's documented residual: LINE has the message, the row does not say so. A resend within
+          // 24 h reuses the retry keys (409 → accepted); after that it would deliver twice.
+          this.logger.error(
+            `LINE accepted recipients but the SENT write did not commit; row left DRAFT. id=${id} accepted=${acceptedByLine}`,
+          );
+        }
+        return mapTransactionError(e);
+      });
+
+    if (outcome.failure !== null) {
+      this.logger.warn(
+        `Announcement partially sent id=${id} accepted=${outcome.acceptedCount} targeted=${outcome.targetedCount} failedChunk=${outcome.failure.chunkIndex} kind=${outcome.failure.kind} by=${actorId}`,
+      );
+      throw codedError(
+        BadGatewayException,
+        'ANNOUNCEMENT_PARTIALLY_SENT',
+        ANNOUNCEMENT_PARTIALLY_SENT,
+        {
+          acceptedCount: outcome.acceptedCount,
+          targetedCount: outcome.targetedCount,
+        },
+      );
+    }
+
+    this.logger.log(
+      `Announcement sent id=${id} recipients=${saved.sentCount} requests=${outcome.requestCount} by=${actorId}`,
+    );
+    return toAnnouncementDto(saved);
+  }
+
+  /**
+   * `GET /announcements/line-bot-info` (D-G) — the OA the send goes out from. No cache (D-I).
+   *
+   * Every failure is a 503 with a `code`, never a 500: `LINE_NOT_CONFIGURED` for a missing or rejected
+   * token, `LINE_BOT_INFO_UNAVAILABLE` for anything else. Logs carry kind and status only.
+   */
+  async getLineBotInfo(): Promise<LineBotInfoDto> {
+    try {
+      const info = await this.line.getBotInfo();
+      return {
+        basicId: info.basicId,
+        displayName: info.displayName,
+        pictureUrl: info.pictureUrl,
+        chatMode: info.chatMode,
+      };
+    } catch (err) {
+      const e = classifyLineError(err);
+      this.logger.warn(
+        `LINE bot info unavailable kind=${e.kind} status=${e.status}`,
+      );
+      throw e.kind === 'NOT_CONFIGURED'
+        ? codedError(
+            ServiceUnavailableException,
+            'LINE_NOT_CONFIGURED',
+            ANNOUNCEMENT_LINE_NOT_CONFIGURED,
+          )
+        : codedError(
+            ServiceUnavailableException,
+            'LINE_BOT_INFO_UNAVAILABLE',
+            ANNOUNCEMENT_LINE_BOT_INFO_UNAVAILABLE,
+          );
+    }
+  }
+
+  /**
+   * The LINE `U…` ids an announcement goes to, in `LineUser.id` order (D-B: deterministic chunks):
+   * `ALLOWED`, not soft-deleted, and — for DEPARTMENT — holding a live registration in that department.
+   *
+   * Two filters run here rather than in SQL:
+   * - **D-J opt-out**, through the SAME helper and the SAME `settings` select as
+   *   `booking-notifier.recipientOf`: a missing row or a malformed value means "on". A JSON-path
+   *   `where` would re-implement that fallback differently.
+   * - **A malformed `lineUserId` is skipped** (design S-5): one bad id fails LINE's whole request.
+   *
+   * Counts only in the log line — never an id.
+   *
+   * @param departmentId the VALIDATED department of a DEPARTMENT announcement; `null` for audience ALL.
+   */
+  private async resolveRecipients(
+    tx: Prisma.TransactionClient,
+    id: string,
+    departmentId: number | null,
+  ): Promise<string[]> {
+    const users = await tx.lineUser.findMany({
+      where: {
+        access: AppAccess.ALLOWED,
+        deletedAt: null,
+        lineUserId: { not: '' },
+        ...(departmentId !== null
+          ? { registration: { is: { deletedAt: null, departmentId } } }
+          : {}),
+      },
+      select: {
+        lineUserId: true,
+        settings: { select: { notifications: true } },
+      },
+      orderBy: { id: 'asc' },
+    });
+
+    const optedIn = users.filter(
+      (u) => toNotificationPreferences(u.settings?.notifications).announcements,
+    );
+    const to = optedIn
+      .filter((u) => LINE_USER_ID_PATTERN.test(u.lineUserId))
+      .map((u) => u.lineUserId);
+
+    this.logger.log(
+      `Announcement recipients id=${id} eligible=${users.length} optedOut=${users.length - optedIn.length} malformed=${optedIn.length - to.length} targeted=${to.length}`,
+    );
+    return to;
   }
 
   /**

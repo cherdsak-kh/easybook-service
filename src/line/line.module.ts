@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { VenuesModule } from '../venues/venues.module';
 import { LineController } from './line.controller';
+import { lineMessagingClientProvider } from './line-messaging-client';
 import { LineService } from './line.service';
 import { LineSignatureGuard } from './line-signature.guard';
 import { LineRegistrationController } from './line-registration.controller';
@@ -39,7 +40,11 @@ import { LineIdTokenGuard } from './guards/line-id-token.guard';
     LineSettingsController,
     LineUsersController,
   ],
+  // `lineMessagingClientProvider` (ANNOUNCE-API-2, design S-1) is the ONE Messaging client, injected
+  // into `LineService`. It is deliberately NOT exported: tests replace it with
+  // `overrideProvider(LINE_MESSAGING_CLIENT)`, and nothing but `LineService` may hold it.
   providers: [
+    lineMessagingClientProvider,
     LineService,
     LineWebhookService,
     LineUserService,

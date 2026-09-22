@@ -1,5 +1,6 @@
 /**
- * `ประกาศและข่าวสาร` — the admin announcements surface (ANNOUNCE-API-1, phase 1: persistence + CRUD).
+ * `ประกาศและข่าวสาร` — the admin announcements surface (ANNOUNCE-API-1 persistence + CRUD;
+ * ANNOUNCE-API-2 the LINE send and the OA's bot info).
  *
  * ⚠️ THIS MODULE OWNS ITS OWN STRINGS, rather than importing the feedback module's — the house rule
  * `feedback.constants.ts` and `bookings.constants.ts` state: importing one module's user-facing string
@@ -85,3 +86,55 @@ export const ANNOUNCEMENT_DEPARTMENT_INVALID =
  */
 export const ANNOUNCEMENT_UPDATE_EMPTY =
   'Provide at least one field to update.';
+
+// ── SEND (ANNOUNCE-API-2) ────────────────────────────────────────────────────────────────────────
+
+/**
+ * The send transaction's timeout (D-A.5). Prisma's 5 s default is far too short for LINE calls; the
+ * transaction holds the row lock and one pooled connection for its whole length.
+ */
+export const ANNOUNCEMENT_SEND_TX_TIMEOUT_MS = 120_000;
+
+/**
+ * No new LINE attempt starts after this much of the transaction has passed (design S-2). The 30 s
+ * left over covers one in-flight attempt's tail, the SENT write and the commit, so the transaction
+ * cannot expire mid-loop and end as an unmapped 500.
+ */
+export const ANNOUNCEMENT_SEND_DEADLINE_MS = 90_000;
+
+/**
+ * The send and bot-info routes answer with a `code` next to `message` (design S-6); these are the
+ * `message`s. Human English constants — the frontend switches on `code`, never on these.
+ */
+export const ANNOUNCEMENT_BODY_REQUIRED =
+  'An announcement needs a body before it can be sent.';
+
+export const ANNOUNCEMENT_NO_RECIPIENTS_FOUND =
+  'No LINE users match this announcement’s audience.';
+
+/** 409 — `FOR UPDATE NOWAIT` found the row locked. A PATCH/DELETE holds it briefly too, hence "or edited". */
+export const ANNOUNCEMENT_SEND_IN_PROGRESS =
+  'This announcement is being sent or edited right now. Try again in a moment.';
+
+export const ANNOUNCEMENT_ALREADY_SENT =
+  'This announcement has already been sent.';
+
+/** 502 — the row IS committed as SENT. Carries `acceptedCount` / `targetedCount`. */
+export const ANNOUNCEMENT_PARTIALLY_SENT =
+  'LINE accepted the announcement for only some recipients. It is marked as sent and cannot be sent again.';
+
+/**
+ * 502 — deliberately does NOT say "nothing was sent": a timed-out request may have landed. The retry
+ * keys make a resend within 24 h safe.
+ */
+export const ANNOUNCEMENT_LINE_SEND_FAILED =
+  'LINE did not accept the announcement. It was not marked as sent; please try again.';
+
+export const ANNOUNCEMENT_LINE_NOT_CONFIGURED =
+  'The LINE Official Account is not configured or its access token was rejected.';
+
+export const ANNOUNCEMENT_LINE_RATE_LIMITED =
+  'LINE refused the request because a rate limit or the monthly message quota was reached.';
+
+export const ANNOUNCEMENT_LINE_BOT_INFO_UNAVAILABLE =
+  'The LINE Official Account details are unavailable right now.';

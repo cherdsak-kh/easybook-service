@@ -12,6 +12,7 @@ import {
 } from '@nestjs/common';
 import { SystemRole } from '@prisma/client';
 import {
+  ApiBadGatewayResponse,
   ApiBadRequestResponse,
   ApiConflictResponse,
   ApiCookieAuth,
@@ -38,6 +39,7 @@ import {
   AnnouncementsService,
   type AnnouncementActor,
 } from './announcements.service';
+import { AnnouncementCodedErrorDto } from './dto/announcement-error.dto';
 import { ListAnnouncementsQueryDto } from './dto/announcement-query.dto';
 import {
   AnnouncementDto,
@@ -47,6 +49,7 @@ import {
   CreateAnnouncementDto,
   UpdateAnnouncementDto,
 } from './dto/announcement-write.dto';
+import { LineBotInfoDto } from './dto/line-bot-info.dto';
 
 /**
  * Mirrors `departments.controller.ts`'s helper — copied rather than exported across modules; it is
@@ -75,13 +78,42 @@ const SENT_IMMUTABLE_DESCRIPTION =
 const AUDIENCE_RULE =
   '`departmentId` is required (non-null) iff `audience` is `DEPARTMENT`, and must be null/omitted for `ALL`; it must reference an ACTIVE department (unknown, soft-deleted, or — for non-SUPER_ADMIN — system-reserved is one indistinguishable 400).';
 
+/** Design §3.3 — published verbatim in the send operation's description (AC-15). */
+const SEND_DESCRIPTION = [
+  '**Irreversible.** Sends a DRAFT to LINE users as one multicast message — `TEXT`: `title` + blank line + `body`; `FLEX`: one card — and marks it `SENT`. No request body.',
+  '',
+  'Recipients: LINE users with `access = ALLOWED`, not deleted, with a well-formed LINE id, who have not switched announcements off in their settings; for `DEPARTMENT`, also a live registration in that department. Sent in chunks of up to 500, each with its own `X-Line-Retry-Key`.',
+  '',
+  '`sentCount` is the number of recipients LINE **accepted**, not delivered or read.',
+  '',
+  'CSRF applies: a request with no session AND no `x-csrf-token` is a 403 (the CSRF middleware runs before the guards).',
+  '',
+  '| Status | `code` | When | Row after |',
+  '|---|---|---|---|',
+  '| 200 | — | every chunk accepted | SENT, `sentAt` = now, `sentCount` = targeted |',
+  '| 400 | `ANNOUNCEMENT_BODY_REQUIRED` | `body` is blank | unchanged |',
+  '| 400 | `ANNOUNCEMENT_DEPARTMENT_INVALID` | `DEPARTMENT` with a null, missing or soft-deleted department | unchanged |',
+  '| 400 | `NO_RECIPIENTS_FOUND` | nobody eligible after every filter | unchanged |',
+  '| 404 | `ANNOUNCEMENT_NOT_FOUND` | unknown or malformed id | — |',
+  '| 409 | `ANNOUNCEMENT_SEND_IN_PROGRESS` | the row is being sent or edited right now | unchanged |',
+  '| 409 | `ANNOUNCEMENT_ALREADY_SENT` | the row is `SENT` | unchanged |',
+  '| 502 | `ANNOUNCEMENT_PARTIALLY_SENT` (+ `acceptedCount`, `targetedCount`) | at least one chunk accepted, then a failure | **SENT and final**, `sentCount` = `acceptedCount` |',
+  '| 502 | `LINE_SEND_FAILED` | first chunk: network, 5xx or timeout after one retry, or another 4xx | DRAFT, untouched |',
+  '| 503 | `LINE_NOT_CONFIGURED` | no token, or LINE answered 401/403 | DRAFT, untouched |',
+  '| 503 | `LINE_RATE_LIMITED` | LINE answered 429 (rate limit or monthly quota) | DRAFT, untouched |',
+  '',
+  'A partial send is final: a resend is a 409, and the missed users need a new announcement. After a total failure (DRAFT untouched) a resend is safe within 24 h — the retry keys make LINE answer 409 for any chunk it had in fact accepted. Editing the draft changes the keys.',
+].join('\n');
+
 /**
  * `ประกาศและข่าวสาร` — the admin announcements surface, route prefix `/api/v1/announcements`
- * (ANNOUNCE-API-1, phase 1: persistence + CRUD).
+ * (ANNOUNCE-API-1 persistence + CRUD; ANNOUNCE-API-2 the LINE send and the OA's bot info).
  *
- * ⚠️ NOTHING HERE SENDS ANYTHING (D-1). There is no send / publish route and no LINE push; POST always
- * creates a `DRAFT`. `SENT` is unreachable through the API in phase 1 and exists so the immutability
- * guards (PATCH/DELETE → 409) are built and tested now.
+ * ⚠️ ONE ROUTE SENDS: `POST :id/send` (ADMIN / SUPER_ADMIN). POST `/announcements` always creates a
+ * `DRAFT` and pushes nothing.
+ *
+ * ⚠️ ROUTE ORDER IS LOAD-BEARING (D-H): `GET line-bot-info` is declared ABOVE `GET :id`, or
+ * `line-bot-info` would be read as an id and answer 404.
  *
  * ⚠️ `VIEWER` READS AND CHANGES NOTHING — the split every admin surface uses. `@Roles` per method is
  * the boundary; hiding a button in React is UX.
@@ -134,6 +166,32 @@ export class AnnouncementsController {
     return this.announcements.list(query);
   }
 
+  // 🔴 MUST STAY ABOVE `@Get(':id')` (D-H) — otherwise `line-bot-info` is captured as an id → 404.
+  @Get('line-bot-info')
+  @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN, SystemRole.VIEWER)
+  @ApiOperation({
+    summary: 'The LINE Official Account announcements are sent from.',
+    description:
+      'One live call to LINE per request — **not cached**, so a fixed token shows at once. Exactly four fields; `pictureUrl` is null when the OA has none. Any LINE failure is a **503 with a `code`, never a 500**: `LINE_NOT_CONFIGURED` when the channel token is missing or rejected (401/403), `LINE_BOT_INFO_UNAVAILABLE` for anything else (429, network, 5xx, timeout).',
+  })
+  @ApiOkResponse({ description: 'The OA.', type: LineBotInfoDto })
+  @ApiUnauthorizedResponse({
+    description: 'No session.',
+    type: ErrorResponseDto,
+  })
+  @ApiForbiddenResponse({
+    description: 'Password change required (`mustChangePassword`).',
+    type: ErrorResponseDto,
+  })
+  @ApiServiceUnavailableResponse({
+    description:
+      'LINE is unavailable or not configured — `code` is `LINE_NOT_CONFIGURED` or `LINE_BOT_INFO_UNAVAILABLE`. Never a 500, never cached. (A session-store outage is also a 503, with the house body and no `code`.)',
+    type: AnnouncementCodedErrorDto,
+  })
+  getLineBotInfo(): Promise<LineBotInfoDto> {
+    return this.announcements.getLineBotInfo();
+  }
+
   @Get(':id')
   @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN, SystemRole.VIEWER)
   @ApiOperation({
@@ -167,7 +225,7 @@ export class AnnouncementsController {
   @ApiHeader({ name: 'x-csrf-token', required: true })
   @ApiOperation({
     summary: 'Create a draft announcement.',
-    description: `ALWAYS creates a \`DRAFT\` — there is no send route in phase 1 and nothing is pushed to LINE. \`status\`, \`sentAt\`, \`sentCount\` and \`createdById\` are not accepted (400); the author is the session user. ${AUDIENCE_RULE}`,
+    description: `ALWAYS creates a \`DRAFT\` and pushes nothing to LINE — sending is \`POST /announcements/{id}/send\`. \`status\`, \`sentAt\`, \`sentCount\` and \`createdById\` are not accepted (400); the author is the session user. ${AUDIENCE_RULE}`,
   })
   @ApiCreatedResponse({
     description: 'Created — status `DRAFT`.',
@@ -238,6 +296,61 @@ export class AnnouncementsController {
     @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<AnnouncementDto> {
     return this.announcements.update(id, dto, announcementActorOf(user));
+  }
+
+  // @HttpCode(200) is MANDATORY — Nest defaults POST to 201, and a send creates nothing (design S-7).
+  // No `@Body()`: the handler reads no body, so none is validated or needed.
+  @Post(':id/send')
+  @HttpCode(200)
+  @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN)
+  @ApiHeader({ name: 'x-csrf-token', required: true })
+  @ApiOperation({
+    summary: 'Send a draft announcement to LINE users.',
+    description: SEND_DESCRIPTION,
+  })
+  @ApiOkResponse({
+    description:
+      'Sent — status `SENT`, `sentAt` set, `sentCount` = recipients LINE accepted.',
+    type: AnnouncementDto,
+  })
+  @ApiBadRequestResponse({
+    description:
+      '`ANNOUNCEMENT_BODY_REQUIRED`, `ANNOUNCEMENT_DEPARTMENT_INVALID` or `NO_RECIPIENTS_FOUND`. Nothing is sent or written.',
+    type: AnnouncementCodedErrorDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'No session.',
+    type: ErrorResponseDto,
+  })
+  @ApiForbiddenResponse({
+    description:
+      'VIEWER, CSRF failure (a missing or forged `x-csrf-token`, including with no session), or password change required. Nothing is sent or written.',
+    type: ErrorResponseDto,
+  })
+  @ApiNotFoundResponse({
+    description: '`ANNOUNCEMENT_NOT_FOUND` — unknown or malformed id.',
+    type: AnnouncementCodedErrorDto,
+  })
+  @ApiConflictResponse({
+    description:
+      '`ANNOUNCEMENT_ALREADY_SENT` — the row is `SENT` (a partial send included); or `ANNOUNCEMENT_SEND_IN_PROGRESS` — another request is sending or editing this row right now. Nothing is sent.',
+    type: AnnouncementCodedErrorDto,
+  })
+  @ApiBadGatewayResponse({
+    description:
+      '`ANNOUNCEMENT_PARTIALLY_SENT` (with `acceptedCount`, `targetedCount`) — the row IS `SENT` and final, `sentCount` = `acceptedCount`; or `LINE_SEND_FAILED` — LINE accepted nobody, the row stays DRAFT and a resend within 24 h is safe.',
+    type: AnnouncementCodedErrorDto,
+  })
+  @ApiServiceUnavailableResponse({
+    description:
+      '`LINE_NOT_CONFIGURED` (no token, or LINE answered 401/403) or `LINE_RATE_LIMITED` (429 — rate limit or monthly quota). The row stays DRAFT. (A session-store outage is also a 503, with the house body and no `code`.)',
+    type: AnnouncementCodedErrorDto,
+  })
+  send(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthenticatedSystemUser,
+  ): Promise<AnnouncementDto> {
+    return this.announcements.send(id, user.id);
   }
 
   // @HttpCode(204) is MANDATORY — Nest defaults DELETE to 200 (design S-7, house convention).

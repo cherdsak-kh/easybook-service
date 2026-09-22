@@ -62,8 +62,11 @@ export interface ReminderCardOptions {
   periodText: string;
 }
 
-/** Spec §1.1: the five status tokens. WARNING carries dark ink; see `access-card.ts` `TONE`. */
-const TONE = {
+/**
+ * Spec §1.1: the five status tokens. WARNING carries dark ink; see `access-card.ts` `TONE`.
+ * Exported (with `INK`, `INK_SOFT`, `LINE_SOFT`) for `announcement-card.ts`, so the palette cannot fork.
+ */
+export const TONE = {
   SUCCESS: { fill: '#047857', ink: '#ffffff' }, // emerald-700
   WARNING: { fill: '#f59e0b', ink: '#0f172a' }, // amber-500 + slate-900
   INFO: { fill: '#0369a1', ink: '#ffffff' }, // sky-700
@@ -77,10 +80,10 @@ type Tone = (typeof TONE)[keyof typeof TONE];
 const EYEBROW_ALPHA = 'bf';
 
 /** Spec §1.2. */
-const INK = '#0f172a'; // slate-900
-const INK_SOFT = '#475569'; // slate-600
+export const INK = '#0f172a'; // slate-900
+export const INK_SOFT = '#475569'; // slate-600
 const SURFACE_SOFT = '#f1f5f9'; // slate-100
-const LINE_SOFT = '#e2e8f0'; // slate-200
+export const LINE_SOFT = '#e2e8f0'; // slate-200
 
 /**
  * Spec §1.4 `AUTO_REJECTED_REASON` — the ONLY explanation an auto-rejected requester is given.
