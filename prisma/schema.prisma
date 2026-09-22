@@ -1269,6 +1269,11 @@ model Announcement {
   sentAt    DateTime?
   sentCount Int       @default(0)
 
+  /// ANNOUNCE-API-5 (D-1) — soft delete, for DRAFT and SENT alike. Non-null = invisible to every route
+  /// (list, count, get, patch, send, delete → 404). The row and its FKs survive for the broadcast
+  /// audit trail; there is no restore route and no purge job. Set only by `AnnouncementsService.remove`.
+  deletedAt DateTime?
+
   /// FK -> SystemUser.id, taken from the session, never from the body (D-5). HISTORY: resolve WITHOUT
   /// a `deletedAt` filter (DD-4). `SetNull` so a hard delete keeps the row (AC-11).
   createdById String?
@@ -1281,8 +1286,30 @@ model Announcement {
   @@index([status, createdAt])
   /// The unfiltered "all, newest first" list — Postgres cannot use the composite above for it.
   @@index([createdAt])
+  /// ANNOUNCE-API-5 — every read now filters `deletedAt IS NULL`; this serves the unfiltered
+  /// "live rows, newest first" list and any `deletedAt` lookup (leading column).
+  @@index([deletedAt, createdAt])
   /// The scans the two SetNull FKs perform on a hard delete.
   @@index([departmentId])
   @@index([createdById])
   @@map("announcements")
+}
+
+/// ข้อความตอบกลับด่วน (ANNOUNCE-API-5) — admin-curated snippets staff copy into the LINE OA chat
+/// console. Capped at 5 rows by `CannedRepliesService.create` under an advisory lock (D-3), never by
+/// the DB. HARD delete (no `deletedAt`, PO model). The four defaults are seeded by the
+/// `add_canned_replies_table` migration SQL with fixed ids `canned_reply_default_1…4`.
+///
+/// `title` (1–100) / `text` (1–1000) caps live in the DTO; the columns are unbounded `text` (house rule).
+/// No secondary index: at ≤ 5 rows a sort is free.
+model CannedReply {
+  id        String   @id @default(cuid())
+  title     String
+  text      String
+  /// Display order, ASC; ties → `createdAt` ASC → `id` ASC. 0–9999 (DTO). Duplicates allowed.
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("canned_replies")
 }

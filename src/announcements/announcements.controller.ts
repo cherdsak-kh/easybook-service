@@ -73,7 +73,7 @@ const announcementActorOf = (
 });
 
 const SENT_IMMUTABLE_DESCRIPTION =
-  'The announcement is `SENT` — sent rows are immutable (D-2). Also answered when the row stopped being a draft between the read and the conditional write. Nothing is written.';
+  'The announcement is `SENT`: sent rows cannot be edited. Also answered when the row stopped being a draft between the read and the conditional write. Nothing is written.';
 
 const AUDIENCE_RULE =
   '`departmentId` is required (non-null) iff `audience` is `DEPARTMENT`, and must be null/omitted for `ALL`; it must reference an ACTIVE department (unknown, soft-deleted, or — for non-SUPER_ADMIN — system-reserved is one indistinguishable 400).';
@@ -82,19 +82,21 @@ const AUDIENCE_RULE =
 const SEND_DESCRIPTION = [
   '**Irreversible.** Sends a DRAFT to LINE users as one multicast message — `TEXT`: `title` + blank line + `body`; `FLEX`: one card — and marks it `SENT`. No request body.',
   '',
-  'Recipients: LINE users with `access = ALLOWED`, not deleted, with a well-formed LINE id, who have not switched announcements off in their settings; for `DEPARTMENT`, also a live registration in that department. Sent in chunks of up to 500, each with its own `X-Line-Retry-Key`.',
+  'Recipients: LINE users with `access = ALLOWED`, not deleted, with a well-formed LINE id, who have not switched announcements off in their settings; for `DEPARTMENT`, also a live registration in that department. Sent in chunks of up to 500, each with its own `X-Line-Retry-Key`. An empty audience is not an error.',
   '',
   '`sentCount` is the number of recipients LINE **accepted**, not delivered or read.',
+  '',
+  'Zero eligible recipients → 200, `sentCount` 0, no LINE call — the former 400 "no recipients found" answer was removed in ANNOUNCE-API-5.',
   '',
   'CSRF applies: a request with no session AND no `x-csrf-token` is a 403 (the CSRF middleware runs before the guards).',
   '',
   '| Status | `code` | When | Row after |',
   '|---|---|---|---|',
   '| 200 | — | every chunk accepted | SENT, `sentAt` = now, `sentCount` = targeted |',
+  '| 200 | — | zero eligible recipients after every filter | SENT, `sentAt` = now, `sentCount` = 0, **no LINE call** |',
   '| 400 | `ANNOUNCEMENT_BODY_REQUIRED` | `body` is blank | unchanged |',
   '| 400 | `ANNOUNCEMENT_DEPARTMENT_INVALID` | `DEPARTMENT` with a null, missing or soft-deleted department | unchanged |',
-  '| 400 | `NO_RECIPIENTS_FOUND` | nobody eligible after every filter | unchanged |',
-  '| 404 | `ANNOUNCEMENT_NOT_FOUND` | unknown or malformed id | — |',
+  '| 404 | `ANNOUNCEMENT_NOT_FOUND` | unknown, malformed or deleted id | — |',
   '| 409 | `ANNOUNCEMENT_SEND_IN_PROGRESS` | the row is being sent or edited right now | unchanged |',
   '| 409 | `ANNOUNCEMENT_ALREADY_SENT` | the row is `SENT` | unchanged |',
   '| 502 | `ANNOUNCEMENT_PARTIALLY_SENT` (+ `acceptedCount`, `targetedCount`) | at least one chunk accepted, then a failure | **SENT and final**, `sentCount` = `acceptedCount` |',
@@ -111,6 +113,8 @@ const SEND_DESCRIPTION = [
  *
  * ⚠️ ONE ROUTE SENDS: `POST :id/send` (ADMIN / SUPER_ADMIN). POST `/announcements` always creates a
  * `DRAFT` and pushes nothing.
+ *
+ * DELETE is a soft delete for DRAFT and SENT (ANNOUNCE-API-5); a deleted row is a 404 on every route.
  *
  * ⚠️ ROUTE ORDER IS LOAD-BEARING (D-H): `GET line-bot-info` is declared ABOVE `GET :id`, or
  * `line-bot-info` would be read as an id and answer 404.
@@ -209,7 +213,7 @@ export class AnnouncementsController {
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
-    description: 'Unknown or malformed id.',
+    description: 'Unknown, malformed or deleted id.',
     type: ErrorResponseDto,
   })
   @ApiServiceUnavailableResponse({
@@ -279,7 +283,7 @@ export class AnnouncementsController {
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
-    description: 'Unknown or malformed id.',
+    description: 'Unknown, malformed or deleted id.',
     type: ErrorResponseDto,
   })
   @ApiConflictResponse({
@@ -310,12 +314,12 @@ export class AnnouncementsController {
   })
   @ApiOkResponse({
     description:
-      'Sent — status `SENT`, `sentAt` set, `sentCount` = recipients LINE accepted.',
+      'Sent — status `SENT`, `sentAt` set, `sentCount` = recipients LINE accepted. `sentCount` 0 when nobody was eligible (no LINE call).',
     type: AnnouncementDto,
   })
   @ApiBadRequestResponse({
     description:
-      '`ANNOUNCEMENT_BODY_REQUIRED`, `ANNOUNCEMENT_DEPARTMENT_INVALID` or `NO_RECIPIENTS_FOUND`. Nothing is sent or written.',
+      '`ANNOUNCEMENT_BODY_REQUIRED` or `ANNOUNCEMENT_DEPARTMENT_INVALID`. Nothing is sent or written.',
     type: AnnouncementCodedErrorDto,
   })
   @ApiUnauthorizedResponse({
@@ -328,7 +332,7 @@ export class AnnouncementsController {
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
-    description: '`ANNOUNCEMENT_NOT_FOUND` — unknown or malformed id.',
+    description: '`ANNOUNCEMENT_NOT_FOUND` — unknown, malformed or deleted id.',
     type: AnnouncementCodedErrorDto,
   })
   @ApiConflictResponse({
@@ -359,11 +363,11 @@ export class AnnouncementsController {
   @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN)
   @ApiHeader({ name: 'x-csrf-token', required: true })
   @ApiOperation({
-    summary: 'Delete a draft announcement.',
+    summary: 'Delete an announcement (soft delete).',
     description:
-      'A HARD delete, DRAFT only. A `SENT` row cannot be deleted (409). A second DELETE on the same id is a 404.',
+      'A SOFT delete of a DRAFT or a SENT announcement: the row is kept for audit with `deletedAt` set and disappears from every route (list, counts, get, edit, send → 404). Irreversible through the API. Fails fast with 409 `ANNOUNCEMENT_SEND_IN_PROGRESS` if the row is being sent or edited at that moment; retry after the send completes. A second DELETE is a 404.',
   })
-  @ApiNoContentResponse({ description: 'Deleted. Empty body.' })
+  @ApiNoContentResponse({ description: 'Soft-deleted. Empty body.' })
   @ApiUnauthorizedResponse({
     description: 'No session.',
     type: ErrorResponseDto,
@@ -374,12 +378,14 @@ export class AnnouncementsController {
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
-    description: 'Unknown or malformed id.',
-    type: ErrorResponseDto,
+    description:
+      '`ANNOUNCEMENT_NOT_FOUND`: unknown, malformed or already deleted id.',
+    type: AnnouncementCodedErrorDto,
   })
   @ApiConflictResponse({
-    description: SENT_IMMUTABLE_DESCRIPTION,
-    type: ErrorResponseDto,
+    description:
+      '`ANNOUNCEMENT_SEND_IN_PROGRESS`: the row is being sent or edited right now. Nothing is deleted.',
+    type: AnnouncementCodedErrorDto,
   })
   @ApiServiceUnavailableResponse({
     description: 'Session store unavailable.',

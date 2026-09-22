@@ -57,12 +57,13 @@ export type AnnouncementStatusFilter =
 export const ANNOUNCEMENT_NOT_FOUND = 'Announcement not found.';
 
 /**
- * 409 (D-2). A `SENT` row can be neither edited nor deleted. Also the answer when the conditional
- * write (`WHERE status = DRAFT`) matched nothing: the row was a draft a moment ago, and the write did
- * not apply (design S-6).
+ * 409 — PATCH ONLY (ANNOUNCE-API-5 D-1: a SENT row can now be soft-deleted). A `SENT` row cannot be
+ * edited. Also the answer when the conditional write (`WHERE status = DRAFT AND deletedAt IS NULL`)
+ * matched 0 rows and the re-read shows a live SENT row (design S-6); a re-read showing the row gone or
+ * soft-deleted is a 404 instead.
  */
 export const ANNOUNCEMENT_SENT_IMMUTABLE =
-  'A sent announcement cannot be edited or deleted.';
+  'A sent announcement cannot be edited.';
 
 /** 400 (D-3). `audience = DEPARTMENT` with no department — sent or (on PATCH) stored. */
 export const ANNOUNCEMENT_DEPARTMENT_REQUIRED =
@@ -103,16 +104,17 @@ export const ANNOUNCEMENT_SEND_TX_TIMEOUT_MS = 120_000;
 export const ANNOUNCEMENT_SEND_DEADLINE_MS = 90_000;
 
 /**
- * The send and bot-info routes answer with a `code` next to `message` (design S-6); these are the
- * `message`s. Human English constants — the frontend switches on `code`, never on these.
+ * The send, bot-info and (ANNOUNCE-API-5) DELETE routes answer with a `code` next to `message`
+ * (design S-6); these are the `message`s. Human English constants — the frontend switches on `code`,
+ * never on these.
  */
 export const ANNOUNCEMENT_BODY_REQUIRED =
   'An announcement needs a body before it can be sent.';
 
-export const ANNOUNCEMENT_NO_RECIPIENTS_FOUND =
-  'No LINE users match this announcement’s audience.';
-
-/** 409 — `FOR UPDATE NOWAIT` found the row locked. A PATCH/DELETE holds it briefly too, hence "or edited". */
+/**
+ * 409 — `FOR UPDATE NOWAIT` found the row locked. A PATCH/DELETE holds it briefly too, hence "or edited".
+ * Also DELETE's answer when a send (or another DELETE) holds the row (ANNOUNCE-API-5 D-1).
+ */
 export const ANNOUNCEMENT_SEND_IN_PROGRESS =
   'This announcement is being sent or edited right now. Try again in a moment.';
 

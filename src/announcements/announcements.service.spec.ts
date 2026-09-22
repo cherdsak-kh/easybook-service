@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  HttpException,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
@@ -18,6 +19,7 @@ import {
   ANNOUNCEMENT_DEPARTMENT_NOT_ALLOWED,
   ANNOUNCEMENT_DEPARTMENT_REQUIRED,
   ANNOUNCEMENT_NOT_FOUND,
+  ANNOUNCEMENT_SEND_IN_PROGRESS,
   ANNOUNCEMENT_SENT_IMMUTABLE,
   ANNOUNCEMENT_UPDATE_EMPTY,
 } from './announcements.constants';
@@ -103,6 +105,7 @@ describe('AnnouncementsService', () => {
 
   const announcement = {
     findMany: jest.fn(),
+    findFirst: jest.fn(),
     findUnique: jest.fn(),
     count: jest.fn(),
     create: jest.fn(),
@@ -110,19 +113,42 @@ describe('AnnouncementsService', () => {
     deleteMany: jest.fn(),
   };
   const department = { findFirst: jest.fn() };
-  /** The BATCH form: resolves the array of already-issued operations. */
-  const $transaction = jest.fn((ops: Promise<unknown>[]) => Promise.all(ops));
+  /** The interactive transaction's client (`remove`, ANNOUNCE-API-5). */
+  const tx = {
+    $queryRaw: jest.fn(),
+    announcement: { updateMany: jest.fn() },
+  };
+  /** Records whether the callback RETURNED (the tx would commit). */
+  const events: string[] = [];
+  /**
+   * BOTH forms: the BATCH form (`list`) resolves the array of already-issued operations; the
+   * CALLBACK form (`remove`) runs the callback against `tx`.
+   */
+  const $transaction = jest.fn(async (arg: unknown) => {
+    if (typeof arg === 'function') {
+      const result: unknown = await (arg as (t: typeof tx) => Promise<unknown>)(
+        tx,
+      );
+      events.push('commit');
+      return result;
+    }
+    return Promise.all(arg as Promise<unknown>[]);
+  });
 
   let logSpy: jest.SpyInstance;
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    events.length = 0;
     announcement.findMany.mockResolvedValue([]);
     announcement.count.mockResolvedValue(0);
+    announcement.findFirst.mockResolvedValue(row());
     announcement.findUnique.mockResolvedValue(row());
     announcement.create.mockResolvedValue(row());
     announcement.updateMany.mockResolvedValue({ count: 1 });
     announcement.deleteMany.mockResolvedValue({ count: 1 });
+    tx.$queryRaw.mockResolvedValue([{ status: AnnouncementStatus.DRAFT }]);
+    tx.announcement.updateMany.mockResolvedValue({ count: 1 });
     department.findFirst.mockResolvedValue({ id: 3 });
     logSpy = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => {});
 
@@ -195,16 +221,19 @@ describe('AnnouncementsService', () => {
   });
 
   describe('announcementListWhere', () => {
+    // ANNOUNCE-API-5 D-1: EVERY combination carries `deletedAt: null` — it feeds `count` too, so
+    // `meta.total` (the tab counts) excludes soft-deleted rows.
     it.each([
-      ['all', {}],
-      ['draft', { status: AnnouncementStatus.DRAFT }],
-      ['sent', { status: AnnouncementStatus.SENT }],
+      ['all', { deletedAt: null }],
+      ['draft', { deletedAt: null, status: AnnouncementStatus.DRAFT }],
+      ['sent', { deletedAt: null, status: AnnouncementStatus.SENT }],
     ] as const)('status=%s → %j', (status, where) => {
       expect(announcementListWhere({ status })).toEqual(where);
     });
 
     it('q is a case-insensitive contains on title ONLY', () => {
       expect(announcementListWhere({ status: 'draft', q: 'Pool' })).toEqual({
+        deletedAt: null,
         status: AnnouncementStatus.DRAFT,
         title: { contains: 'Pool', mode: 'insensitive' },
       });
@@ -213,14 +242,30 @@ describe('AnnouncementsService', () => {
     it.each([undefined, '', '   '])(
       'q=%j is no predicate at all, never contains ""',
       (q) => {
-        expect(announcementListWhere({ status: 'all', q })).toEqual({});
+        expect(announcementListWhere({ status: 'all', q })).toEqual({
+          deletedAt: null,
+        });
       },
     );
 
     it('escapes LIKE metacharacters so % and _ match literally', () => {
       expect(announcementListWhere({ status: 'all', q: '100%_off' })).toEqual({
+        deletedAt: null,
         title: { contains: '100\\%\\_off', mode: 'insensitive' },
       });
+    });
+
+    it('list passes the live-rows where to BOTH findMany and count', async () => {
+      await service.list(query({ status: 'sent', q: 'x' }));
+      const expected = announcementListWhere({ status: 'sent', q: 'x' });
+      expect(
+        callArg<{ where: Prisma.AnnouncementWhereInput }>(announcement.findMany)
+          .where,
+      ).toEqual(expected);
+      expect(callArg<unknown>(announcement.count)).toEqual({
+        where: expected,
+      });
+      expect(expected).toHaveProperty('deletedAt', null);
     });
   });
 
@@ -254,16 +299,16 @@ describe('AnnouncementsService', () => {
   // ── GET ──────────────────────────────────────────────────────────────────────────────────────
 
   describe('get', () => {
-    it('returns the item shape', async () => {
+    it('returns the item shape, reading LIVE rows only (ANNOUNCE-API-5)', async () => {
       await expect(service.get(ID)).resolves.toEqual(toAnnouncementDto(row()));
-      expect(callArg<unknown>(announcement.findUnique)).toEqual({
-        where: { id: ID },
+      expect(callArg<unknown>(announcement.findFirst)).toEqual({
+        where: { id: ID, deletedAt: null },
         select: ANNOUNCEMENT_SELECT,
       });
     });
 
-    it('unknown id → 404', async () => {
-      announcement.findUnique.mockResolvedValue(null);
+    it('unknown or soft-deleted id → 404', async () => {
+      announcement.findFirst.mockResolvedValue(null);
       await expect(service.get('nope')).rejects.toThrow(
         new NotFoundException(ANNOUNCEMENT_NOT_FOUND),
       );
@@ -386,23 +431,29 @@ describe('AnnouncementsService', () => {
     const update = (dto: UpdateAnnouncementDto, actor = ADMIN) =>
       service.update(ID, dto, actor);
 
-    /** First `findUnique` = the pre-write read; later ones = the echo. */
+    /** First `findFirst` = the pre-write read (live rows only); later ones = the echo (`get`). */
     const storedAs = (s: ReturnType<typeof stored> | null) =>
-      announcement.findUnique.mockResolvedValueOnce(s);
+      announcement.findFirst.mockResolvedValueOnce(s);
 
     it('an empty patch → 400 UPDATE_EMPTY with no DB call at all (S-2)', async () => {
       await expect(update({})).rejects.toThrow(
         new BadRequestException(ANNOUNCEMENT_UPDATE_EMPTY),
       );
+      expect(announcement.findFirst).not.toHaveBeenCalled();
       expect(announcement.findUnique).not.toHaveBeenCalled();
       expect(announcement.updateMany).not.toHaveBeenCalled();
     });
 
-    it('unknown id → 404, nothing written', async () => {
+    it('unknown or soft-deleted id → 404, nothing written; the read filters deletedAt: null', async () => {
       storedAs(null);
       await expect(update({ title: 'x' })).rejects.toThrow(
         new NotFoundException(ANNOUNCEMENT_NOT_FOUND),
       );
+      expect(
+        callArg<{ where: Prisma.AnnouncementWhereInput }>(
+          announcement.findFirst,
+        ).where,
+      ).toEqual({ id: ID, deletedAt: null });
       expect(announcement.updateMany).not.toHaveBeenCalled();
     });
 
@@ -415,20 +466,57 @@ describe('AnnouncementsService', () => {
       expect(announcement.updateMany).not.toHaveBeenCalled();
     });
 
-    it('the conditional write matched nothing → 409 (S-6)', async () => {
+    it('the conditional write matched nothing and the re-read shows a live SENT row → 409 with the new message (S-6)', async () => {
       storedAs(stored());
       announcement.updateMany.mockResolvedValue({ count: 0 });
+      announcement.findUnique.mockResolvedValueOnce({
+        status: AnnouncementStatus.SENT,
+        deletedAt: null,
+      });
       await expect(update({ title: 'x' })).rejects.toThrow(
         new ConflictException(ANNOUNCEMENT_SENT_IMMUTABLE),
       );
+      expect(ANNOUNCEMENT_SENT_IMMUTABLE).toBe(
+        'A sent announcement cannot be edited.',
+      );
+      expect(callArg<unknown>(announcement.findUnique)).toEqual({
+        where: { id: ID },
+        select: { status: true, deletedAt: true },
+      });
     });
 
-    it('writes with status DRAFT in the predicate and answers with a re-read', async () => {
+    it.each([
+      [
+        'soft-deleted meanwhile (a PATCH blocked behind a DELETE)',
+        { status: AnnouncementStatus.DRAFT, deletedAt: new Date() },
+      ],
+      [
+        'soft-deleted SENT row',
+        { status: AnnouncementStatus.SENT, deletedAt: new Date() },
+      ],
+      ['hard-deleted meanwhile', null],
+    ])(
+      'the conditional write matched nothing and the re-read shows the row %s → 404, not 409 (ANNOUNCE-API-5 D-1)',
+      async (_label, reread) => {
+        storedAs(stored());
+        announcement.updateMany.mockResolvedValue({ count: 0 });
+        announcement.findUnique.mockResolvedValueOnce(reread);
+        await expect(update({ title: 'x' })).rejects.toThrow(
+          new NotFoundException(ANNOUNCEMENT_NOT_FOUND),
+        );
+      },
+    );
+
+    it('writes with status DRAFT AND deletedAt null in the predicate and answers with a re-read', async () => {
       storedAs(stored());
       const result = await update({ title: 'ใหม่', body: '' });
 
       const args = callArg<UpdateManyArgs>(announcement.updateMany);
-      expect(args.where).toEqual({ id: ID, status: AnnouncementStatus.DRAFT });
+      expect(args.where).toEqual({
+        id: ID,
+        status: AnnouncementStatus.DRAFT,
+        deletedAt: null,
+      });
       expect(args.data).toEqual({
         title: 'ใหม่',
         body: '',
@@ -436,7 +524,9 @@ describe('AnnouncementsService', () => {
         audience: AnnouncementAudience.ALL,
         departmentId: null,
       });
-      expect(announcement.findUnique).toHaveBeenCalledTimes(2);
+      // The pre-write read and the echo — both live-rows `findFirst`; no disambiguating re-read.
+      expect(announcement.findFirst).toHaveBeenCalledTimes(2);
+      expect(announcement.findUnique).not.toHaveBeenCalled();
       expect(result).toEqual(toAnnouncementDto(row()));
     });
 
@@ -537,39 +627,117 @@ describe('AnnouncementsService', () => {
 
   // ── DELETE ───────────────────────────────────────────────────────────────────────────────────
 
-  describe('remove', () => {
-    it('deletes a DRAFT with status DRAFT in the predicate', async () => {
-      announcement.findUnique.mockResolvedValueOnce(stored());
-      await expect(service.remove(ID, ADMIN.id)).resolves.toBeUndefined();
-      expect(callArg<unknown>(announcement.deleteMany)).toEqual({
-        where: { id: ID, status: AnnouncementStatus.DRAFT },
+  // ANNOUNCE-API-5 D-1 / design §2.5 — a SOFT delete, DRAFT and SENT alike, behind FOR UPDATE NOWAIT.
+  describe('remove (soft delete)', () => {
+    /** Resolves to the thrown error; fails the test if the promise resolved. */
+    const caught = async (p: Promise<unknown>): Promise<HttpException> => {
+      try {
+        await p;
+      } catch (e) {
+        return e as HttpException;
+      }
+      throw new Error('expected a rejection');
+    };
+    const bodyOf = (e: HttpException) =>
+      e.getResponse() as Record<string, unknown>;
+
+    afterEach(() => {
+      // Never a hard delete, and never the phase-1 status predicate.
+      expect(announcement.deleteMany).not.toHaveBeenCalled();
+      expect(announcement.updateMany).not.toHaveBeenCalled();
+    });
+
+    it.each([AnnouncementStatus.DRAFT, AnnouncementStatus.SENT])(
+      'a %s row → soft-deleted in ONE transaction: NOWAIT lock on live rows, then deletedAt = now',
+      async (status) => {
+        tx.$queryRaw.mockResolvedValue([{ id: ID, status }]);
+        const before = Date.now();
+        await expect(service.remove(ID, ADMIN.id)).resolves.toBeUndefined();
+
+        expect($transaction).toHaveBeenCalledTimes(1);
+        const [strings, ...values] = tx.$queryRaw.mock.calls[0] as [
+          TemplateStringsArray,
+          ...unknown[],
+        ];
+        expect(strings.join('?').replace(/\s+/g, ' ').trim()).toBe(
+          'SELECT "id", "status" FROM "announcements" WHERE "id" = ? AND "deletedAt" IS NULL FOR UPDATE NOWAIT',
+        );
+        expect(values).toEqual([ID]);
+
+        const args = callArg<{
+          where: Prisma.AnnouncementWhereInput;
+          data: { deletedAt: Date };
+        }>(tx.announcement.updateMany);
+        expect(args.where).toEqual({ id: ID, deletedAt: null });
+        expect(Object.keys(args.data)).toEqual(['deletedAt']); // no other column changes
+        expect(args.data.deletedAt).toBeInstanceOf(Date);
+        expect(args.data.deletedAt.getTime()).toBeGreaterThanOrEqual(before);
+        expect(events).toEqual(['commit']);
+
+        expect(logSpy).toHaveBeenCalledWith(
+          `Announcement soft-deleted id=${ID} status=${status} by=${ADMIN.id}`,
+        );
+        expect(logged()).not.toContain(TITLE);
+        expect(logged()).not.toContain(BODY);
+      },
+    );
+
+    it('no live row (unknown, malformed or already soft-deleted) → coded 404, nothing written', async () => {
+      tx.$queryRaw.mockResolvedValue([]);
+      const e = await caught(service.remove(ID, ADMIN.id));
+      expect(e).toBeInstanceOf(NotFoundException);
+      expect(bodyOf(e)).toEqual({
+        statusCode: 404,
+        error: 'Not Found',
+        message: ANNOUNCEMENT_NOT_FOUND,
+        code: 'ANNOUNCEMENT_NOT_FOUND',
       });
+      expect(tx.announcement.updateMany).not.toHaveBeenCalled();
+      expect(events).toEqual([]);
+      expect(logged()).not.toContain('soft-deleted');
     });
 
-    it('unknown id → 404, nothing deleted', async () => {
-      announcement.findUnique.mockResolvedValueOnce(null);
-      await expect(service.remove(ID, ADMIN.id)).rejects.toThrow(
-        new NotFoundException(ANNOUNCEMENT_NOT_FOUND),
+    it('55P03 (Prisma P2010 — a send holds the row) → coded 409 ANNOUNCEMENT_SEND_IN_PROGRESS, nothing written', async () => {
+      tx.$queryRaw.mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError(
+          'Raw query failed. Code: `55P03`. Message: `could not obtain lock on row in relation "announcements"`',
+          {
+            code: 'P2010',
+            clientVersion: '7.8.0',
+            meta: {
+              driverAdapterError: { cause: { originalCode: '55P03' } },
+            },
+          },
+        ),
       );
-      expect(announcement.deleteMany).not.toHaveBeenCalled();
+      const e = await caught(service.remove(ID, ADMIN.id));
+      expect(e).toBeInstanceOf(ConflictException);
+      expect(bodyOf(e)).toEqual({
+        statusCode: 409,
+        error: 'Conflict',
+        message: ANNOUNCEMENT_SEND_IN_PROGRESS,
+        code: 'ANNOUNCEMENT_SEND_IN_PROGRESS',
+      });
+      expect(tx.announcement.updateMany).not.toHaveBeenCalled();
+      expect(events).toEqual([]);
     });
 
-    it('a SENT row → 409 with no delete call (D-2)', async () => {
-      announcement.findUnique.mockResolvedValueOnce(
-        stored({ status: AnnouncementStatus.SENT }),
-      );
-      await expect(service.remove(ID, ADMIN.id)).rejects.toThrow(
-        new ConflictException(ANNOUNCEMENT_SENT_IMMUTABLE),
-      );
-      expect(announcement.deleteMany).not.toHaveBeenCalled();
+    it('any other lock-query failure is rethrown unchanged (not a 409)', async () => {
+      const boom = new Error('connection reset');
+      tx.$queryRaw.mockRejectedValue(boom);
+      await expect(service.remove(ID, ADMIN.id)).rejects.toBe(boom);
+      expect(tx.announcement.updateMany).not.toHaveBeenCalled();
     });
 
-    it('the conditional delete matched nothing → 409 (S-6)', async () => {
-      announcement.findUnique.mockResolvedValueOnce(stored());
-      announcement.deleteMany.mockResolvedValue({ count: 0 });
-      await expect(service.remove(ID, ADMIN.id)).rejects.toThrow(
-        new ConflictException(ANNOUNCEMENT_SENT_IMMUTABLE),
-      );
+    it('the guarded write matched nothing (defensive; cannot happen under the lock) → coded 404, no log', async () => {
+      tx.announcement.updateMany.mockResolvedValue({ count: 0 });
+      const e = await caught(service.remove(ID, ADMIN.id));
+      expect(bodyOf(e)).toMatchObject({
+        statusCode: 404,
+        code: 'ANNOUNCEMENT_NOT_FOUND',
+      });
+      expect(events).toEqual([]);
+      expect(logged()).not.toContain('soft-deleted');
     });
   });
 });

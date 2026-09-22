@@ -4,6 +4,7 @@ import {
   HttpException,
   Logger,
 } from '@nestjs/common';
+import type { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import type { messagingApi } from '@line/bot-sdk';
 import {
@@ -14,6 +15,7 @@ import {
   Prisma,
 } from '@prisma/client';
 import { bangkokClock, thaiShortDate } from '../bookings/booking-notifier';
+import * as announcementCard from '../line/announcement-card';
 import { LineCallError, type LineErrorKind } from '../line/line-call-error';
 import { LineService, type MulticastOutcome } from '../line/line.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -26,7 +28,6 @@ import {
   ANNOUNCEMENT_LINE_NOT_CONFIGURED,
   ANNOUNCEMENT_LINE_RATE_LIMITED,
   ANNOUNCEMENT_LINE_SEND_FAILED,
-  ANNOUNCEMENT_NO_RECIPIENTS_FOUND,
   ANNOUNCEMENT_NOT_FOUND,
   ANNOUNCEMENT_PARTIALLY_SENT,
   ANNOUNCEMENT_SEND_DEADLINE_MS,
@@ -205,14 +206,14 @@ describe('AnnouncementsService — send / getLineBotInfo (ANNOUNCE-API-2)', () =
 
   // ── The lock (D-A) ────────────────────────────────────────────────────────────────────────────
   describe('D-A — the row lock', () => {
-    it('takes SELECT … FOR UPDATE NOWAIT first, binding the id as a parameter', async () => {
+    it('takes SELECT … FOR UPDATE NOWAIT first — live rows only (ANNOUNCE-API-5) — binding the id as a parameter', async () => {
       await send();
       const [strings, ...values] = tx.$queryRaw.mock.calls[0] as [
         TemplateStringsArray,
         ...unknown[],
       ];
       expect(strings.join('?').replace(/\s+/g, ' ').trim()).toBe(
-        'SELECT "status" FROM "announcements" WHERE "id" = ? FOR UPDATE NOWAIT',
+        'SELECT "status" FROM "announcements" WHERE "id" = ? AND "deletedAt" IS NULL FOR UPDATE NOWAIT',
       );
       expect(values).toEqual([ID]);
     });
@@ -279,7 +280,7 @@ describe('AnnouncementsService — send / getLineBotInfo (ANNOUNCE-API-2)', () =
       expect(tx.announcement.update).not.toHaveBeenCalled();
     });
 
-    it('unknown id (lock finds no row) → 404 ANNOUNCEMENT_NOT_FOUND', async () => {
+    it('unknown or soft-deleted id (the live-rows lock finds no row) → 404 ANNOUNCEMENT_NOT_FOUND', async () => {
       lockReturns(null);
       const e = await caught(send());
       expect(e.getStatus()).toBe(404);
@@ -355,26 +356,183 @@ describe('AnnouncementsService — send / getLineBotInfo (ANNOUNCE-API-2)', () =
       });
       expect(tx.lineUser.findMany).not.toHaveBeenCalled();
     });
+  });
 
-    it('zero recipients → 400 NO_RECIPIENTS_FOUND', async () => {
+  // ── Zero recipients (ANNOUNCE-API-5 D-2, AC-8, AC-9) ──────────────────────────────────────────
+  describe('D-2 — zero eligible recipients completes the send: SENT, sentCount 0, no LINE call (AC-8)', () => {
+    /** Byte-exact per plan D-2. */
+    const ZERO_LOG = `Announcement sent id=${ID} recipients=0 (skipped LINE call: zero recipients) by=${ACTOR}`;
+    const logSpy = () => logSpies[0]; // 'log' — see the beforeEach order
+
+    it.each<[string, () => void]>([
+      [
+        'no ALLOWED users at all',
+        () => tx.lineUser.findMany.mockResolvedValue([]),
+      ],
+      [
+        'every eligible user opted out',
+        () =>
+          tx.lineUser.findMany.mockResolvedValue([
+            user(uid(1), { notifications: { announcements: false } }),
+            user(uid(2), {
+              notifications: { announcements: false, decisions: true },
+            }),
+          ]),
+      ],
+      [
+        'a DEPARTMENT with no eligible members',
+        () => {
+          tx.announcement.findUniqueOrThrow.mockResolvedValue(
+            content({
+              audience: AnnouncementAudience.DEPARTMENT,
+              departmentId: 7,
+            }),
+          );
+          tx.lineUser.findMany.mockResolvedValue([]);
+        },
+      ],
+      [
+        'every remaining lineUserId malformed',
+        () =>
+          tx.lineUser.findMany.mockResolvedValue([
+            user('e2e-junk-allowed'),
+            user('U123'),
+            user(`U${'A'.repeat(32)}`),
+          ]),
+      ],
+    ])(
+      '%s → 200 SENT / sentCount 0 / sentAt, committed, no multicast, the exact log line',
+      async (_label, arrange) => {
+        arrange();
+        const dto = await send();
+
+        expect(line.multicast).not.toHaveBeenCalled();
+        expect(tx.announcement.update).toHaveBeenCalledTimes(1);
+        expect(updateArgs()).toEqual({
+          where: { id: ID },
+          data: {
+            status: AnnouncementStatus.SENT,
+            sentAt: expect.any(Date) as Date,
+            sentCount: 0,
+          },
+          select: expect.any(Object) as object,
+        });
+        expect(events).toEqual(['commit']); // the callback RETURNED — the SENT write commits
+
+        expect(dto.status).toBe(AnnouncementStatus.SENT);
+        expect(dto.sentCount).toBe(0);
+        expect(dto.sentAt).toBe(updateArgs().data.sentAt.toISOString());
+
+        expect(logSpy()).toHaveBeenCalledWith(ZERO_LOG);
+        expect(logged()).not.toContain('requests='); // not the normal "sent" line
+        expect(logged()).not.toContain(TITLE);
+        expect(logged()).not.toContain(BODY);
+      },
+    );
+
+    it('FLEX with zero recipients builds no message at all (so no card timestamp) and sends nothing', async () => {
+      const buildCard = jest.spyOn(announcementCard, 'buildAnnouncementCard');
+      const buildText = jest.spyOn(announcementCard, 'buildAnnouncementText');
+      try {
+        tx.announcement.findUniqueOrThrow.mockResolvedValue(
+          content({ format: AnnouncementFormat.FLEX }),
+        );
+        // Control: with a recipient the spy DOES see the card being built.
+        await send();
+        expect(buildCard).toHaveBeenCalledTimes(1);
+        buildCard.mockClear();
+        line.multicast.mockClear();
+        tx.announcement.update.mockClear();
+
+        tx.lineUser.findMany.mockResolvedValue([]);
+        const dto = await send();
+        expect(buildCard).not.toHaveBeenCalled();
+        expect(buildText).not.toHaveBeenCalled();
+        expect(line.multicast).not.toHaveBeenCalled();
+        expect(tx.announcement.update).toHaveBeenCalledTimes(1);
+        expect(dto.sentCount).toBe(0);
+      } finally {
+        buildCard.mockRestore();
+        buildText.mockRestore();
+      }
+    });
+
+    it('LINE NOT CONFIGURED (a real LineService holding a null client): zero recipients still → 200', async () => {
+      const unconfigured = new LineService(
+        { get: () => '' } as unknown as ConfigService,
+        null,
+      );
+      const multicast = jest.spyOn(unconfigured, 'multicast');
+      const svc = new AnnouncementsService(
+        { $transaction } as unknown as PrismaService,
+        unconfigured,
+      );
+
       tx.lineUser.findMany.mockResolvedValue([]);
-      const e = await caught(send());
-      expect(bodyOf(e)).toEqual({
-        statusCode: 400,
-        error: 'Bad Request',
-        message: ANNOUNCEMENT_NO_RECIPIENTS_FOUND,
-        code: 'NO_RECIPIENTS_FOUND',
+      const dto = await svc.send(ID, ACTOR);
+      expect(dto.status).toBe(AnnouncementStatus.SENT);
+      expect(dto.sentCount).toBe(0);
+      expect(multicast).not.toHaveBeenCalled();
+
+      // Control: the SAME service with one recipient does reach LINE, and is refused as unconfigured.
+      tx.lineUser.findMany.mockResolvedValue([user(uid(1))]);
+      const e = await caught(svc.send(ID, ACTOR));
+      expect(bodyOf(e)).toMatchObject({
+        statusCode: 503,
+        code: 'LINE_NOT_CONFIGURED',
       });
+      expect(multicast).toHaveBeenCalledTimes(1);
     });
 
-    it('recipients who ALL opted out or are malformed → 400 NO_RECIPIENTS_FOUND', async () => {
-      tx.lineUser.findMany.mockResolvedValue([
-        user(uid(1), { notifications: { announcements: false } }),
-        user('e2e-junk-allowed'),
-      ]);
-      const e = await caught(send());
-      expect(bodyOf(e)).toMatchObject({ code: 'NO_RECIPIENTS_FOUND' });
-    });
+    it.each<[string, () => void, number, string]>([
+      [
+        'unknown or soft-deleted row',
+        () => lockReturns(null),
+        404,
+        'ANNOUNCEMENT_NOT_FOUND',
+      ],
+      [
+        'already SENT',
+        () => lockReturns(AnnouncementStatus.SENT),
+        409,
+        'ANNOUNCEMENT_ALREADY_SENT',
+      ],
+      [
+        'blank body',
+        () =>
+          tx.announcement.findUniqueOrThrow.mockResolvedValue(
+            content({ body: '  ' }),
+          ),
+        400,
+        'ANNOUNCEMENT_BODY_REQUIRED',
+      ],
+      [
+        'soft-deleted department',
+        () => {
+          tx.announcement.findUniqueOrThrow.mockResolvedValue(
+            content({
+              audience: AnnouncementAudience.DEPARTMENT,
+              departmentId: 7,
+            }),
+          );
+          tx.department.findFirst.mockResolvedValue(null);
+        },
+        400,
+        'ANNOUNCEMENT_DEPARTMENT_INVALID',
+      ],
+    ])(
+      'AC-9 — %s with an empty audience is still %i %s, never a zero-recipient 200',
+      async (_label, arrange, status, code) => {
+        tx.lineUser.findMany.mockResolvedValue([]);
+        arrange();
+        const e = await caught(send());
+        expect(e.getStatus()).toBe(status);
+        expect(bodyOf(e)).toMatchObject({ statusCode: status, code });
+        expect(tx.announcement.update).not.toHaveBeenCalled();
+        expect(line.multicast).not.toHaveBeenCalled();
+        expect(events).toEqual([]); // the callback threw → rollback
+      },
+    );
   });
 
   // ── Recipients (AC-6, D-J, S-5) ───────────────────────────────────────────────────────────────

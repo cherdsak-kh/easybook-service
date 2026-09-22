@@ -7,6 +7,7 @@ import { AnnouncementsModule } from './announcements/announcements.module';
 import { AppController } from './app.controller';
 import { AuthModule } from './auth/auth.module';
 import { BookingsModule } from './bookings/bookings.module';
+import { CannedRepliesModule } from './canned-replies/canned-replies.module';
 import {
   LOGIN_IP_EMAIL_LIMIT,
   LOGIN_IP_LIMIT,
@@ -115,6 +116,9 @@ const throttlerModule: DynamicModule = {
     // `ANNOUNCE-API-1` — ประกาศและข่าวสาร, phase 1 (persistence + admin CRUD; nothing is broadcast).
     // Its routes are `/announcements…`, a first segment no other controller uses.
     AnnouncementsModule,
+    // `ANNOUNCE-API-5` — ข้อความตอบกลับด่วน (canned replies CRUD). Its routes are `/canned-replies…`,
+    // a first segment no other controller uses.
+    CannedRepliesModule,
     SystemModule,
     // Still future tasks: the admin approval + direct-booking surface (`SessionGuard`), the
     // `/client` realtime namespace, and LINE chat notifications.

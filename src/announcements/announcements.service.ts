@@ -27,7 +27,11 @@ import {
 import { classifyLineError } from '../line/line-call-error';
 import { LINE_USER_ID_PATTERN } from '../line/line.constants';
 import { toNotificationPreferences } from '../line/line-user.service';
-import { LineService, type MulticastFailure } from '../line/line.service';
+import {
+  LineService,
+  type MulticastFailure,
+  type MulticastOutcome,
+} from '../line/line.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   ANNOUNCEMENT_ALREADY_SENT,
@@ -39,7 +43,6 @@ import {
   ANNOUNCEMENT_LINE_NOT_CONFIGURED,
   ANNOUNCEMENT_LINE_RATE_LIMITED,
   ANNOUNCEMENT_LINE_SEND_FAILED,
-  ANNOUNCEMENT_NO_RECIPIENTS_FOUND,
   ANNOUNCEMENT_NOT_FOUND,
   ANNOUNCEMENT_PARTIALLY_SENT,
   ANNOUNCEMENT_SEND_DEADLINE_MS,
@@ -163,7 +166,9 @@ function lineSendError(kind: MulticastFailure['kind']): HttpException {
 
 /**
  * `ประกาศและข่าวสาร` — persistence + CRUD (`ANNOUNCE-API-1`) and the LINE send (`ANNOUNCE-API-2`).
- * `send` is the ONLY writer of `SENT` / `sentAt` / `sentCount`.
+ * `send` is the ONLY writer of `SENT` / `sentAt` / `sentCount`; `remove` is the only writer of
+ * `deletedAt` (`ANNOUNCE-API-5` soft delete). A soft-deleted row is invisible to every method here:
+ * each read, write and lock filters `deletedAt IS NULL`, so it answers exactly like an unknown id.
  *
  * 🔴 PDPA: `title` / `body` are staff-authored free text that may name people, and LINE user ids are
  * personal data. None of them is ever logged or interpolated into an exception message — log lines
@@ -215,10 +220,13 @@ export class AnnouncementsService {
     };
   }
 
-  /** `GET /announcements/:id` — cuid only; an unknown and a malformed id are both a 404 (AC-7). */
+  /**
+   * `GET /announcements/:id` — cuid only; an unknown, a malformed and a soft-deleted id are all the
+   * same 404 (AC-7; ANNOUNCE-API-5 D-1).
+   */
   async get(id: string): Promise<AnnouncementDto> {
-    const row = await this.prisma.announcement.findUnique({
-      where: { id },
+    const row = await this.prisma.announcement.findFirst({
+      where: { id, deletedAt: null },
       select: ANNOUNCEMENT_SELECT,
     });
     if (!row) throw new NotFoundException(ANNOUNCEMENT_NOT_FOUND);
@@ -266,13 +274,14 @@ export class AnnouncementsService {
    * `PATCH /announcements/:id` — DRAFT only (D-2), in this order (design S-6):
    *
    *   0. No DB: every field absent → 400 `ANNOUNCEMENT_UPDATE_EMPTY` (S-2).
-   *   1. Read the row → 404 when absent.
+   *   1. Read the LIVE row (`deletedAt IS NULL`) → 404 when absent or soft-deleted.
    *   2. `SENT` → 409 `ANNOUNCEMENT_SENT_IMMUTABLE`, nothing written.
    *   3. The audience/department invariant on the MERGED state → 400 (D-3). This runs on EVERY patch
    *      of a DEPARTMENT draft, a title-only one included, which is what makes "department
    *      soft-deleted after drafting" a 400 on the next save.
-   *   4. A CONDITIONAL write, `WHERE id AND status = DRAFT`: a phase-2 send racing this edit cannot be
-   *      overwritten. `count 0` → 409 (the row was a draft a moment ago; the write did not apply).
+   *   4. A CONDITIONAL write, `WHERE id AND status = DRAFT AND deletedAt IS NULL`: a send or a DELETE
+   *      racing this edit cannot be overwritten. `count 0` → re-read to tell the two apart
+   *      (ANNOUNCE-API-5 D-1): gone or soft-deleted → 404 (a PATCH blocked behind a DELETE), else 409.
    *   5. Re-read and answer 200. A patch whose values equal the stored ones is still a write
    *      (`updatedAt` advances) — there is no "no change" detection.
    */
@@ -291,8 +300,8 @@ export class AnnouncementsService {
       throw new BadRequestException(ANNOUNCEMENT_UPDATE_EMPTY);
     }
 
-    const current = await this.prisma.announcement.findUnique({
-      where: { id },
+    const current = await this.prisma.announcement.findFirst({
+      where: { id, deletedAt: null },
       select: { status: true, audience: true, departmentId: true },
     });
     if (!current) throw new NotFoundException(ANNOUNCEMENT_NOT_FOUND);
@@ -309,7 +318,7 @@ export class AnnouncementsService {
     );
 
     const { count } = await this.prisma.announcement.updateMany({
-      where: { id, status: AnnouncementStatus.DRAFT },
+      where: { id, status: AnnouncementStatus.DRAFT, deletedAt: null },
       data: {
         title: dto.title,
         body: dto.body,
@@ -318,49 +327,104 @@ export class AnnouncementsService {
         departmentId,
       },
     });
-    if (count === 0) throw new ConflictException(ANNOUNCEMENT_SENT_IMMUTABLE);
+    if (count === 0) {
+      // A write blocked behind another transaction's row lock is re-evaluated against the COMMITTED
+      // row, so 0 rows means a send (→ SENT) or a DELETE (→ deletedAt) won the race. Tell them apart.
+      const after = await this.prisma.announcement.findUnique({
+        where: { id },
+        select: { status: true, deletedAt: true },
+      });
+      if (!after || after.deletedAt !== null) {
+        throw new NotFoundException(ANNOUNCEMENT_NOT_FOUND);
+      }
+      throw new ConflictException(ANNOUNCEMENT_SENT_IMMUTABLE);
+    }
 
     this.logger.log(`Announcement updated id=${id} by=${actor.id}`);
     return this.get(id);
   }
 
   /**
-   * `DELETE /announcements/:id` — a HARD delete of a DRAFT (D-2: drafts carry no audit value; there is
-   * no soft delete in phase 1). Same order and the same conditional write as `update`.
+   * `DELETE /announcements/:id` — a SOFT delete of a DRAFT or a SENT row (ANNOUNCE-API-5 D-1): the
+   * row survives for the broadcast audit trail with `deletedAt` set, and disappears from every route.
+   *
+   * One short transaction behind `FOR UPDATE NOWAIT`, the send's own lock: a send can hold the row for
+   * up to 120 s, and a blocking delete would then succeed the instant the broadcast went out, hiding
+   * it from the list without the admin ever seeing it was sent. NOWAIT answers at once instead
+   * (409 `ANNOUNCEMENT_SEND_IN_PROGRESS`, coded); the admin retries after the send completes.
+   *
+   * A soft-deleted row does not match `"deletedAt" IS NULL`, so it is never locked and is always a
+   * coded 404 — even while another transaction holds it. Prisma's 5 s transaction default suffices.
    */
   async remove(id: string, actorId: string): Promise<void> {
-    const current = await this.prisma.announcement.findUnique({
-      where: { id },
-      select: { status: true },
-    });
-    if (!current) throw new NotFoundException(ANNOUNCEMENT_NOT_FOUND);
-    if (current.status === AnnouncementStatus.SENT) {
-      throw new ConflictException(ANNOUNCEMENT_SENT_IMMUTABLE);
-    }
+    const status = await this.prisma
+      .$transaction(async (tx) => {
+        let locked: { status: AnnouncementStatus }[];
+        try {
+          // Parameterised tagged template — `id` is a bound value, never spliced into the SQL.
+          locked = await tx.$queryRaw<{ status: AnnouncementStatus }[]>`
+            SELECT "id", "status" FROM "announcements"
+             WHERE "id" = ${id} AND "deletedAt" IS NULL
+               FOR UPDATE NOWAIT`;
+        } catch (e) {
+          if (isLockNotAvailable(e)) {
+            throw codedError(
+              ConflictException,
+              'ANNOUNCEMENT_SEND_IN_PROGRESS',
+              ANNOUNCEMENT_SEND_IN_PROGRESS,
+            );
+          }
+          throw e;
+        }
+        if (locked.length === 0) {
+          throw codedError(
+            NotFoundException,
+            'ANNOUNCEMENT_NOT_FOUND',
+            ANNOUNCEMENT_NOT_FOUND,
+          );
+        }
 
-    const { count } = await this.prisma.announcement.deleteMany({
-      where: { id, status: AnnouncementStatus.DRAFT },
-    });
-    if (count === 0) throw new ConflictException(ANNOUNCEMENT_SENT_IMMUTABLE);
+        const { count } = await tx.announcement.updateMany({
+          where: { id, deletedAt: null },
+          data: { deletedAt: new Date() },
+        });
+        // Defensive — cannot happen under the row lock.
+        if (count === 0) {
+          throw codedError(
+            NotFoundException,
+            'ANNOUNCEMENT_NOT_FOUND',
+            ANNOUNCEMENT_NOT_FOUND,
+          );
+        }
+        return locked[0].status;
+      })
+      .catch(mapTransactionError);
 
-    this.logger.log(`Announcement deleted id=${id} by=${actorId}`);
+    // After the commit, so a rolled-back write never logs. No title or body (PDPA).
+    this.logger.log(
+      `Announcement soft-deleted id=${id} status=${status} by=${actorId}`,
+    );
   }
 
   /**
    * `POST /announcements/:id/send` — the one DRAFT → SENT transition (`ANNOUNCE-API-2`, D-A…D-E,
    * design §2). One interactive transaction, holding the row lock for the whole LINE call:
    *
-   *   1. `SELECT … FOR UPDATE NOWAIT` — `55P03` (someone else holds the row) → 409 `SEND_IN_PROGRESS`.
-   *   2. No row → 404. 3. Already `SENT` → 409 `ALREADY_SENT` (also the race loser after a commit).
+   *   1. `SELECT … WHERE deletedAt IS NULL FOR UPDATE NOWAIT` — `55P03` (someone else holds the row)
+   *      → 409 `SEND_IN_PROGRESS`.
+   *   2. No row (unknown or soft-deleted) → 404. 3. Already `SENT` → 409 `ALREADY_SENT` (also the race
+   *      loser after a commit).
    *   4. Read the content under the lock. 5. Blank body → 400. 6. DEPARTMENT with a null, missing or
    *      soft-deleted department → 400 (the reserved flag is NOT re-checked: it governs authoring).
-   *   7. Recipients (see {@link resolveRecipients}); none → 400, and no LINE call.
+   *   7. Recipients (see {@link resolveRecipients}); none → SENT with `sentCount` 0 and NO LINE call
+   *      (ANNOUNCE-API-5 D-2). This is before the message build, so a FLEX send builds no card.
    *   8. Multicast. Nothing accepted → throw the mapped 502/503: the rollback leaves the row DRAFT.
    *   9. Something accepted → write SENT, `sentAt`, `sentCount = accepted` and RETURN — a partial send
    *      must COMMIT, so its 502 is raised only after `$transaction` has resolved.
    *
-   * Phase 1's PATCH/DELETE write `WHERE status = DRAFT`, so they block on this lock and then match 0
-   * rows → 409: content cannot change during a send (D-A.6).
+   * PATCH writes `WHERE status = DRAFT`, so it blocks on this lock and then matches 0 rows → 409:
+   * content cannot change during a send (D-A.6). DELETE fails fast on the same lock with 409
+   * `SEND_IN_PROGRESS` (ANNOUNCE-API-5 D-1).
    */
   async send(id: string, actorId: string): Promise<AnnouncementDto> {
     // Captured OUTSIDE the callback so the catch can tell "LINE accepted, then the write failed".
@@ -368,14 +432,20 @@ export class AnnouncementsService {
 
     const { saved, outcome } = await this.prisma
       .$transaction(
-        async (tx) => {
+        async (
+          tx,
+        ): Promise<{
+          saved: AnnouncementRow;
+          outcome: MulticastOutcome | null;
+        }> => {
           const start = Date.now();
 
           let locked: { status: AnnouncementStatus }[];
           try {
             // Parameterised tagged template — `id` is a bound value, never spliced into the SQL.
+            // A soft-deleted row never matches, so it is the coded 404 before any other check.
             locked = await tx.$queryRaw<{ status: AnnouncementStatus }[]>`
-              SELECT "status" FROM "announcements" WHERE "id" = ${id} FOR UPDATE NOWAIT`;
+              SELECT "status" FROM "announcements" WHERE "id" = ${id} AND "deletedAt" IS NULL FOR UPDATE NOWAIT`;
           } catch (e) {
             if (isLockNotAvailable(e)) {
               throw codedError(
@@ -434,11 +504,18 @@ export class AnnouncementsService {
 
           const to = await this.resolveRecipients(tx, id, departmentId);
           if (to.length === 0) {
-            throw codedError(
-              BadRequestException,
-              'NO_RECIPIENTS_FOUND',
-              ANNOUNCEMENT_NO_RECIPIENTS_FOUND,
-            );
+            // D-2: nobody eligible after every filter is a COMPLETED send that reached nobody — no
+            // LINE call, no quota, no LINE dependency at all (it succeeds with LINE unconfigured).
+            const written = await tx.announcement.update({
+              where: { id },
+              data: {
+                status: AnnouncementStatus.SENT,
+                sentAt: new Date(),
+                sentCount: 0,
+              },
+              select: ANNOUNCEMENT_SELECT,
+            });
+            return { saved: written, outcome: null };
           }
 
           // ONE instant: the card's timestamp and `sentAt` are the same Date (design S-8).
@@ -492,6 +569,14 @@ export class AnnouncementsService {
         }
         return mapTransactionError(e);
       });
+
+    if (outcome === null) {
+      // After the commit (design S-8), so a rolled-back write never logs "sent". Byte-exact per D-2.
+      this.logger.log(
+        `Announcement sent id=${id} recipients=0 (skipped LINE call: zero recipients) by=${actorId}`,
+      );
+      return toAnnouncementDto(saved);
+    }
 
     if (outcome.failure !== null) {
       this.logger.warn(
@@ -643,8 +728,9 @@ export class AnnouncementsService {
 }
 
 /**
- * The list `where`: the status filter ANDed with the title search (§5.1). Empty `q` after trimming is
- * no predicate at all, never `contains: ''`.
+ * The list `where`: live rows only (ANNOUNCE-API-5 D-1), the status filter ANDed with the title
+ * search (§5.1). It feeds both `findMany` and `count`, so `meta.total` — the frontend's tab counts —
+ * excludes soft-deleted rows too. Empty `q` after trimming is no predicate at all, never `contains: ''`.
  */
 export function announcementListWhere(
   query: Pick<ListAnnouncementsQueryDto, 'status' | 'q'>,
@@ -652,6 +738,7 @@ export function announcementListWhere(
   const status = STATUS_FILTER[query.status ?? 'all'];
   const term = query.q?.trim() ?? '';
   return {
+    deletedAt: null,
     ...(status ? { status } : {}),
     ...(term
       ? { title: { contains: escapeLike(term), mode: 'insensitive' } }

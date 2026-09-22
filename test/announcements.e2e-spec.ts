@@ -34,7 +34,8 @@ import {
 jest.setTimeout(180_000);
 
 /**
- * `ANNOUNCE-API-1` phase 1 — `/announcements` CRUD (plan AC-1…AC-12, design §7.2).
+ * `ANNOUNCE-API-1` phase 1 — `/announcements` CRUD (plan AC-1…AC-12, design §7.2). `ANNOUNCE-API-5`
+ * turns DELETE into a soft delete: its AC-1 (column + index), AC-2, AC-3, AC-5, AC-6 live here.
  *
  * 🔴 THIS RUNS AGAINST THE SHARED DEV DATABASE, which holds real working data:
  * - every announcement this file creates is tracked in `createdIds` and deleted BY ID in `afterAll`;
@@ -260,6 +261,8 @@ describe('Announcements (e2e)', () => {
 
   afterAll(async () => {
     // Announcements first (by id), THEN our departments (by id), then our staff (by email prefix).
+    // Raw Prisma, so this also HARD-deletes the rows the API soft-deleted (ANNOUNCE-API-5) — a
+    // soft-deleted fixture is still a real row, tracked in `createdIds` like any other.
     if (createdIds.length > 0) {
       await prisma.announcement.deleteMany({
         where: { id: { in: createdIds } },
@@ -301,11 +304,16 @@ describe('Announcements (e2e)', () => {
           'departmentId',
           'sentAt',
           'sentCount',
+          'deletedAt', // ANNOUNCE-API-5
           'createdById',
           'createdAt',
           'updatedAt',
         ].sort(),
       );
+      // ANNOUNCE-API-5 AC-1: nullable, no default — every pre-existing row got NULL.
+      expect(byName.deletedAt.is_nullable).toBe('YES');
+      expect(byName.deletedAt.column_default).toBeNull();
+      expect(byName.deletedAt.udt_name).toBe('timestamp');
       expect(byName.format.udt_name).toBe('AnnouncementFormat');
       expect(byName.status.udt_name).toBe('AnnouncementStatus');
       expect(byName.audience.udt_name).toBe('AnnouncementAudience');
@@ -322,6 +330,15 @@ describe('Announcements (e2e)', () => {
       // Unbounded text — the caps live in the DTO (house rule).
       expect(byName.title.udt_name).toBe('text');
       expect(byName.body.udt_name).toBe('text');
+    });
+
+    it('ANNOUNCE-API-5 AC-1 — the (deletedAt, createdAt) index exists', async () => {
+      const idx = await prisma.$queryRaw<Array<{ indexdef: string }>>`
+        SELECT indexdef FROM pg_indexes
+         WHERE tablename = 'announcements'
+           AND indexname = 'announcements_deletedAt_createdAt_idx'`;
+      expect(idx).toHaveLength(1);
+      expect(idx[0].indexdef).toContain('("deletedAt", "createdAt")');
     });
 
     it('both FKs are ON DELETE SET NULL', async () => {
@@ -970,30 +987,264 @@ describe('Announcements (e2e)', () => {
   // ────────────────────────────────────────────────────────────────────────────────────────────
   // AC-9 — delete
   // ────────────────────────────────────────────────────────────────────────────────────────────
-  describe('AC-9 — DELETE /announcements/:id', () => {
-    it('a DRAFT → 204 with an empty body, the row is gone, and a second DELETE is 404', async () => {
-      const id = await seed({ title: `${ROOT} ac9 draft` });
+  // ANNOUNCE-API-5 (plan D-1) — DELETE is now a SOFT delete for DRAFT and SENT alike. The rows stay
+  // real rows, so they are in `createdIds` and `afterAll` hard-deletes them BY ID like any other.
+  describe('AC-9 / ANNOUNCE-API-5 AC-2 — DELETE /announcements/:id is a soft delete', () => {
+    /** The row after a soft delete: `deletedAt` set, every other column but `updatedAt` untouched. */
+    const expectSoftDeleted = async (
+      id: string,
+      before: NonNullable<Awaited<ReturnType<typeof rawRow>>>,
+      startedAt: number,
+    ) => {
+      const after = await rawRow(id);
+      expect(after).not.toBeNull(); // still a real row — never a hard delete
+      expect(after!.deletedAt).toBeInstanceOf(Date);
+      expect(after!.deletedAt!.getTime()).toBeGreaterThanOrEqual(
+        startedAt - 1_000,
+      );
+      // `toEqual` treats an `undefined` property as absent: compare every OTHER column.
+      const strip = (r: typeof before) => ({
+        ...r,
+        deletedAt: undefined,
+        updatedAt: undefined,
+      });
+      expect(strip(after!)).toEqual(strip(before));
+      expect(Object.keys(after!).sort()).toEqual(Object.keys(before).sort());
+      expect(before.deletedAt).toBeNull();
+    };
+
+    it('a DRAFT → 204 with an empty body; the row survives with deletedAt set; a second DELETE is a coded 404', async () => {
+      const id = await seed({ title: `${ROOT} ac9 draft`, body: 'ร่าง' });
+      const before = (await rawRow(id))!;
+      const startedAt = Date.now();
       const res = await del(ADMIN, id).expect(204);
       expect(res.text).toBe('');
-      expect(await rawRow(id)).toBeNull();
-      await del(ADMIN, id).expect(404);
+      await expectSoftDeleted(id, before, startedAt);
+
+      const again = await del(ADMIN, id).expect(404);
+      expect(again.body).toEqual({
+        statusCode: 404,
+        error: 'Not Found',
+        message: ANNOUNCEMENT_NOT_FOUND,
+        code: 'ANNOUNCEMENT_NOT_FOUND',
+      });
     });
 
-    it('unknown id → 404', async () => {
-      await del(ADMIN, 'cnotarealannouncement000000').expect(404);
-    });
-
-    it('a seeded SENT row → 409 and the row survives unchanged', async () => {
+    it('a seeded SENT row → 204 (no longer 409); the row survives with deletedAt set and sentAt/sentCount intact', async () => {
       const id = await seed({
         title: `${ROOT} ac9 sent`,
         status: AnnouncementStatus.SENT,
       });
-      const before = await rawRow(id);
-      const res = await del(SUPER, id).expect(409);
-      expect((res.body as { message: unknown }).message).toBe(
-        ANNOUNCEMENT_SENT_IMMUTABLE,
+      const before = (await rawRow(id))!;
+      const startedAt = Date.now();
+      await del(SUPER, id).expect(204);
+      await expectSoftDeleted(id, before, startedAt);
+      const after = (await rawRow(id))!;
+      expect(after.status).toBe(AnnouncementStatus.SENT);
+      expect(after.sentCount).toBe(42);
+      expect(after.sentAt).toEqual(at(5));
+    });
+
+    it('AC-6 unknown id → coded 404 ANNOUNCEMENT_NOT_FOUND', async () => {
+      const res = await del(ADMIN, 'cnotarealannouncement000000').expect(404);
+      expect(res.body).toEqual({
+        statusCode: 404,
+        error: 'Not Found',
+        message: ANNOUNCEMENT_NOT_FOUND,
+        code: 'ANNOUNCEMENT_NOT_FOUND',
+      });
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────────────────────
+  // ANNOUNCE-API-5 AC-3 — a soft-deleted row is invisible everywhere
+  // ────────────────────────────────────────────────────────────────────────────────────────────
+  describe('ANNOUNCE-API-5 AC-3 — a soft-deleted row disappears from every read and write', () => {
+    const DEL = `${ROOT}softdel`;
+    const f = { draft: '', sent: '', live: '' };
+
+    type Totals = { all: number; draft: number; sent: number };
+    const totals = async (): Promise<Totals> => ({
+      all: (await list(`?q=${DEL}&status=all`)).meta.total,
+      draft: (await list(`?q=${DEL}&status=draft`)).meta.total,
+      sent: (await list(`?q=${DEL}&status=sent`)).meta.total,
+    });
+    const idsIn = async (status: string) =>
+      (await list(`?q=${DEL}&status=${status}&limit=50`)).data.map((r) => r.id);
+
+    beforeAll(async () => {
+      f.draft = await seed({ title: `${DEL} draft one`, createdAt: at(3) });
+      f.sent = await seed({
+        title: `${DEL} sent one`,
+        status: AnnouncementStatus.SENT,
+        createdAt: at(2),
+      });
+      f.live = await seed({ title: `${DEL} live control`, createdAt: at(1) });
+    });
+
+    it('the list (all / draft / sent, narrowed by q) drops the row and meta.total drops by one — per filter', async () => {
+      const t0 = await totals();
+      expect(t0).toEqual({ all: 3, draft: 2, sent: 1 });
+      expect(
+        (await list(`?q=${encodeURIComponent(`${DEL} draft one`)}`)).meta.total,
+      ).toBe(1);
+
+      await del(ADMIN, f.draft).expect(204);
+      expect(await totals()).toEqual({ all: 2, draft: 1, sent: 1 });
+      for (const status of ['all', 'draft', 'sent']) {
+        expect(await idsIn(status)).not.toContain(f.draft);
+      }
+      // `q` matching its exact title finds nothing any more.
+      const exact = await list(`?q=${encodeURIComponent(`${DEL} draft one`)}`);
+      expect(exact.data).toEqual([]);
+      expect(exact.meta.total).toBe(0);
+
+      await del(ADMIN, f.sent).expect(204);
+      expect(await totals()).toEqual({ all: 1, draft: 1, sent: 0 });
+      for (const status of ['all', 'draft', 'sent']) {
+        expect(await idsIn(status)).not.toContain(f.sent);
+      }
+      // The live control is untouched by either delete.
+      expect(await idsIn('all')).toEqual([f.live]);
+    });
+
+    it('GET /:id → the same 404 as an unknown id, for all three roles', async () => {
+      for (const email of [SUPER, ADMIN, VIEWER]) {
+        for (const id of [f.draft, f.sent]) {
+          const res = await as(email)
+            .agent.get(url(`/announcements/${id}`))
+            .expect(404);
+          expect((res.body as { message: unknown }).message).toBe(
+            ANNOUNCEMENT_NOT_FOUND,
+          );
+        }
+      }
+    });
+
+    it('a second DELETE → coded 404; PATCH → 404; the row is not modified by either', async () => {
+      for (const id of [f.draft, f.sent]) {
+        const before = await rawRow(id);
+        const d = await del(SUPER, id).expect(404);
+        expect((d.body as { code?: string }).code).toBe(
+          'ANNOUNCEMENT_NOT_FOUND',
+        );
+        const p = await patch(ADMIN, id, { title: `${ROOT} resurrect` }).expect(
+          404,
+        );
+        expect((p.body as { message: unknown }).message).toBe(
+          ANNOUNCEMENT_NOT_FOUND,
+        );
+        expect(await rawRow(id)).toEqual(before);
+      }
+      // (`POST /:id/send` → 404 with no LINE call is proven in announcements-send.e2e-spec.ts, where
+      // the fake client and the fetch tripwire live.)
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────────────────────
+  // ANNOUNCE-API-5 AC-5 — PATCH vs a concurrent DELETE
+  // ────────────────────────────────────────────────────────────────────────────────────────────
+  describe('ANNOUNCE-API-5 AC-5 — PATCH racing a DELETE', () => {
+    const waitFor = async (
+      predicate: () => Promise<boolean>,
+      timeoutMs: number,
+    ): Promise<boolean> => {
+      const end = Date.now() + timeoutMs;
+      while (Date.now() < end) {
+        if (await predicate()) return true;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      return false;
+    };
+
+    it('a PATCH blocked behind a DELETE (the row lock + the deletedAt write, then commit) ends as 404, not 409', async () => {
+      const id = await seed({ title: `${ROOT} ac5x race` });
+
+      // Hold the row exactly as `remove` does: FOR UPDATE, then the guarded deletedAt write, then wait.
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let lockedSignal!: () => void;
+      const locked = new Promise<void>((r) => (lockedSignal = r));
+      const holder = prisma.$transaction(
+        async (t) => {
+          await t.$queryRaw`SELECT "id" FROM "announcements" WHERE "id" = ${id} FOR UPDATE`;
+          await t.announcement.updateMany({
+            where: { id, deletedAt: null },
+            data: { deletedAt: new Date() },
+          });
+          lockedSignal();
+          await gate;
+        },
+        { timeout: 20_000 },
       );
-      expect(await rawRow(id)).toEqual(before);
+      await locked;
+
+      // The PATCH's first read is MVCC (not blocked) and sees a live DRAFT; its guarded write blocks.
+      const patchReq = patch(ADMIN, id, { title: `${ROOT} ac5x edited` }).then(
+        (r) => r,
+      );
+      const patchBlocked = await waitFor(async () => {
+        const [{ n }] = await prisma.$queryRaw<[{ n: number }]>`
+          SELECT count(*)::int AS n FROM pg_stat_activity
+           WHERE datname = current_database()
+             AND wait_event_type = 'Lock'
+             AND query ILIKE '%announcements%'`;
+        return n > 0;
+      }, 10_000);
+
+      release();
+      await holder;
+      const res = await patchReq;
+
+      expect(patchBlocked).toBe(true);
+      expect(res.status).toBe(404);
+      expect((res.body as { message: unknown }).message).toBe(
+        ANNOUNCEMENT_NOT_FOUND,
+      );
+      const row = await rawRow(id);
+      expect(row?.deletedAt).not.toBeNull();
+      expect(row?.title).toBe(`${ROOT} ac5x race`); // the blocked PATCH never landed
+    });
+
+    it('a PATCH on a live SENT row is still 409 ANNOUNCEMENT_SENT_IMMUTABLE, with the reworded message', async () => {
+      const id = await seed({
+        title: `${ROOT} ac5x sent`,
+        status: AnnouncementStatus.SENT,
+      });
+      const res = await patch(ADMIN, id, { title: `${ROOT} x` }).expect(409);
+      expect((res.body as { message: unknown }).message).toBe(
+        'A sent announcement cannot be edited.',
+      );
+      expect(ANNOUNCEMENT_SENT_IMMUTABLE).toBe(
+        'A sent announcement cannot be edited.',
+      );
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────────────────────
+  // ANNOUNCE-API-5 AC-6 — DELETE RBAC / session / CSRF leave the row live
+  // ────────────────────────────────────────────────────────────────────────────────────────────
+  describe('ANNOUNCE-API-5 AC-6 — refused DELETEs soft-delete nothing', () => {
+    it('VIEWER (valid CSRF) → 403; no session (minted token) → 401; ADMIN without x-csrf-token → 403 — deletedAt stays null', async () => {
+      const id = await seed({ title: `${ROOT} ac6x target` });
+      const before = await rawRow(id);
+
+      await del(VIEWER, id).expect(403);
+
+      const anon = request.agent(server());
+      const csrf = await anon.get(url('/auth/system/csrf')).expect(200);
+      await anon
+        .delete(url(`/announcements/${id}`))
+        .set('x-csrf-token', (csrf.body as { csrfToken: string }).csrfToken)
+        .expect(401);
+
+      await as(ADMIN)
+        .agent.delete(url(`/announcements/${id}`))
+        .expect(403);
+
+      const after = await rawRow(id);
+      expect(after?.deletedAt).toBeNull();
+      expect(after).toEqual(before);
     });
   });
 
@@ -1165,6 +1416,19 @@ describe('Announcements (e2e)', () => {
         app,
         new DocumentBuilder().build(),
       ) as unknown as Doc;
+    });
+
+    it('ANNOUNCE-API-5 — DELETE documents 204 and CODED 404/409, and describes the soft delete', () => {
+      type Op = Operation & { description?: string; summary?: string };
+      const op = doc.paths[`${API_BASE_PATH}/announcements/{id}`].delete as Op;
+      const ref = (status: string) => JSON.stringify(op.responses[status]);
+      expect(Object.keys(op.responses)).toEqual(
+        expect.arrayContaining(['204', '404', '409']),
+      );
+      expect(ref('404')).toContain('AnnouncementCodedErrorDto');
+      expect(ref('409')).toContain('AnnouncementCodedErrorDto');
+      expect(op.description).toMatch(/soft/i);
+      expect(op.summary).toMatch(/soft/i);
     });
 
     it('documents all five operations with their success and error responses', () => {

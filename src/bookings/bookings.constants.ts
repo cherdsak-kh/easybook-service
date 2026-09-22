@@ -259,6 +259,8 @@ export const BOOKING_EXPIRY_PUBLISH_CHUNK = 500;
  * A fixed namespace so a later feature's advisory lock cannot collide with this one. `hashtext`
  * returns `int4`, so two venue ids can hash together and serialise unnecessarily: that costs
  * throughput on a product with dozens of rooms, and costs no correctness.
+ *
+ * Other namespaces: `CANNED_REPLIES_LOCK_NS` 4220 (`src/canned-replies/canned-replies.constants.ts`).
  */
 export const BOOKING_VENUE_LOCK_NS = 4210;
 

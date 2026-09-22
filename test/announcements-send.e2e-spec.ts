@@ -35,7 +35,9 @@ jest.setTimeout(180_000);
 
 /**
  * `ANNOUNCE-API-2` — `POST /announcements/:id/send` and `GET /announcements/line-bot-info` (plan
- * AC-4…AC-15, design §5.2).
+ * AC-4…AC-15, design §5.2). `ANNOUNCE-API-5` adds: the zero-recipient 200 (its AC-7, rewriting E-6),
+ * DELETE vs a send holding the lock (its AC-4), a soft-deleted row's send → 404 (its AC-3), the
+ * soft-deleted-department ordering (its AC-9) and the 10-value error enum (its AC-10).
  *
  * 🔴 NOTHING HERE MAY REACH LINE. `.env` holds a REAL channel token and the dev database holds REAL
  * `ALLOWED` LINE users. Three layers make a real send impossible, and the suite proves each one:
@@ -152,6 +154,12 @@ describe('Announcements — LINE send + bot info (e2e)', () => {
   const sendAs = (email: string, id: string) =>
     as(email)
       .agent.post(url(`/announcements/${id}/send`))
+      .set('x-csrf-token', as(email).token);
+
+  /** ANNOUNCE-API-5 — the soft DELETE, through the API. */
+  const deleteAs = (email: string, id: string) =>
+    as(email)
+      .agent.delete(url(`/announcements/${id}`))
       .set('x-csrf-token', as(email).token);
 
   const botInfoAs = (email: string) =>
@@ -613,6 +621,41 @@ describe('Announcements — LINE send + bot info (e2e)', () => {
   // ────────────────────────────────────────────────────────────────────────────────────────────
   // E-6 / E-7 — refusals before LINE (AC-7, AC-8)
   // ────────────────────────────────────────────────────────────────────────────────────────────
+  // ANNOUNCE-API-5 D-2 reverses phase-2 AC-7: an empty audience is a COMPLETED send, not a 400.
+  describe('ANNOUNCE-API-5 AC-7 — zero eligible recipients: 200 SENT, sentCount 0, no LINE call', () => {
+    it('E-6 DEPARTMENT(empty) — only PENDING/BLOCKED users → 200 SENT / sentCount 0 / sentAt; the DB agrees; multicast never called; a resend → 409 ALREADY_SENT', async () => {
+      const id = await seedAnnouncement({
+        title: T('e6 empty'),
+        audience: AnnouncementAudience.DEPARTMENT,
+        departmentId: dept.empty,
+      });
+      const before = await rawRow(id);
+      const startedAt = Date.now();
+
+      const res = await sendAs(ADMIN, id).expect(200);
+      const dto = res.body as AnnouncementBody;
+      expect(dto.status).toBe(AnnouncementStatus.SENT);
+      expect(dto.sentCount).toBe(0);
+      expect(dto.sentAt).not.toBeNull();
+      expect(new Date(dto.sentAt!).getTime()).toBeGreaterThanOrEqual(
+        startedAt - 1_000,
+      );
+      expect(fakeLine.multicast).not.toHaveBeenCalled();
+
+      const row = await rawRow(id);
+      expect(row.status).toBe(AnnouncementStatus.SENT);
+      expect(row.sentCount).toBe(0);
+      expect(row.sentAt?.toISOString()).toBe(dto.sentAt);
+      expect(row.deletedAt).toBeNull();
+      expect(row.title).toBe(before.title);
+      expect(row.body).toBe(before.body);
+
+      const again = await sendAs(ADMIN, id).expect(409);
+      expect((again.body as CodedError).code).toBe('ANNOUNCEMENT_ALREADY_SENT');
+      expect(fakeLine.multicast).not.toHaveBeenCalled();
+    });
+  });
+
   describe('AC-7 / AC-8 — refused before LINE, row untouched', () => {
     const expectUnchangedAndSilent = async (
       id: string,
@@ -622,15 +665,23 @@ describe('Announcements — LINE send + bot info (e2e)', () => {
       expect(await rawRow(id)).toEqual(before);
     };
 
-    it('E-6 DEPARTMENT(empty) — only PENDING/BLOCKED users → 400 NO_RECIPIENTS_FOUND', async () => {
+    it('ANNOUNCE-API-5 AC-3 — a draft soft-deleted through the API → send is a coded 404, nothing sent, row untouched', async () => {
       const id = await seedAnnouncement({
-        title: T('e6 empty'),
+        title: T('ac3 soft deleted'),
         audience: AnnouncementAudience.DEPARTMENT,
-        departmentId: dept.empty,
+        departmentId: dept.A, // a sendable audience: only the delete stops it
       });
+      await deleteAs(ADMIN, id).expect(204);
       const before = await rawRow(id);
-      const res = await sendAs(ADMIN, id).expect(400);
-      expect((res.body as CodedError).code).toBe('NO_RECIPIENTS_FOUND');
+      expect(before.deletedAt).not.toBeNull();
+
+      const res = await sendAs(ADMIN, id).expect(404);
+      expect(res.body).toEqual({
+        statusCode: 404,
+        error: 'Not Found',
+        message: 'Announcement not found.',
+        code: 'ANNOUNCEMENT_NOT_FOUND',
+      });
       await expectUnchangedAndSilent(id, before);
     });
 
@@ -664,7 +715,14 @@ describe('Announcements — LINE send + bot info (e2e)', () => {
       },
     );
 
-    it('E-7 DEPARTMENT(soft-deleted) → 400 ANNOUNCEMENT_DEPARTMENT_INVALID', async () => {
+    it('E-7 / ANNOUNCE-API-5 AC-9 DEPARTMENT(soft-deleted, and with zero eligible members) → still 400 ANNOUNCEMENT_DEPARTMENT_INVALID, never a zero-recipient 200', async () => {
+      // The department holds nobody at all, so if the department check were skipped this would be
+      // exactly the zero-recipient 200 above. It must stay the 400.
+      expect(
+        await prisma.lineUserRegistration.count({
+          where: { departmentId: dept.gone },
+        }),
+      ).toBe(0);
       const id = await seedAnnouncement({
         title: T('e7 gone'),
         audience: AnnouncementAudience.DEPARTMENT,
@@ -854,6 +912,59 @@ describe('Announcements — LINE send + bot info (e2e)', () => {
       expect(fakeLine.multicast).toHaveBeenCalledTimes(1);
       expect((await rawRow(id)).status).toBe(AnnouncementStatus.SENT);
     });
+
+    it('ANNOUNCE-API-5 AC-4 — DELETE while a send holds the lock → 409 SEND_IN_PROGRESS AT ONCE; the send then commits SENT and not deleted; a DELETE afterwards → 204', async () => {
+      const id = await seedAnnouncement({
+        title: T('ac4 delete vs send'),
+        audience: AnnouncementAudience.DEPARTMENT,
+        departmentId: dept.A,
+      });
+
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      fakeLine.multicast.mockImplementation(async () => {
+        await gate;
+        return {};
+      });
+
+      const sendA = sendAs(ADMIN, id).then((r) => r);
+      try {
+        const holdsLock = await waitFor(
+          () => fakeLine.multicast.mock.calls.length === 1,
+          15_000,
+        );
+        expect(holdsLock).toBe(true);
+
+        // NOWAIT: answered while the send is still parked inside multicast — not after it.
+        const t0 = Date.now();
+        const d = await deleteAs(SUPER, id);
+        const elapsed = Date.now() - t0;
+        expect(d.status).toBe(409);
+        expect(d.body).toEqual({
+          statusCode: 409,
+          error: 'Conflict',
+          message:
+            'This announcement is being sent or edited right now. Try again in a moment.',
+          code: 'ANNOUNCEMENT_SEND_IN_PROGRESS',
+        });
+        expect(elapsed).toBeLessThan(2_000);
+        expect(fakeLine.multicast).toHaveBeenCalledTimes(1); // the send is STILL in flight
+      } finally {
+        release();
+      }
+
+      const a = await sendA;
+      expect(a.status).toBe(200);
+      const sent = await rawRow(id);
+      expect(sent.status).toBe(AnnouncementStatus.SENT);
+      expect(sent.deletedAt).toBeNull(); // the refused DELETE hid nothing
+
+      await deleteAs(SUPER, id).expect(204);
+      const after = await rawRow(id);
+      expect(after.deletedAt).not.toBeNull();
+      expect(after.status).toBe(AnnouncementStatus.SENT);
+      expect(after.sentCount).toBe(sent.sentCount);
+    });
   });
 
   // ────────────────────────────────────────────────────────────────────────────────────────────
@@ -963,7 +1074,31 @@ describe('Announcements — LINE send + bot info (e2e)', () => {
       expect(ref(send.post, '200')).toContain('AnnouncementDto');
     });
 
-    it('publishes the schemas, the 11-value AnnouncementErrorCode, and the sentCount semantics', () => {
+    it('ANNOUNCE-API-5 — the send description documents the zero-recipient 200; DELETE documents 204 + coded 404/409 and the soft delete', () => {
+      const send = doc.paths[`${API_BASE_PATH}/announcements/{id}/send`].post;
+      expect(send.description).toContain('`sentCount` 0');
+      expect(send.description).toContain('no LINE call');
+      expect(send.description).toContain(
+        'zero eligible recipients after every filter',
+      );
+      expect(JSON.stringify(send.responses['200'])).toContain('sentCount` 0');
+
+      const del = doc.paths[`${API_BASE_PATH}/announcements/{id}`]
+        .delete as Operation & { summary?: string };
+      expect(Object.keys(del.responses)).toEqual(
+        expect.arrayContaining(['204', '404', '409']),
+      );
+      expect(JSON.stringify(del.responses['404'])).toContain(
+        'AnnouncementCodedErrorDto',
+      );
+      expect(JSON.stringify(del.responses['409'])).toContain(
+        'AnnouncementCodedErrorDto',
+      );
+      expect(del.description).toMatch(/soft/i);
+      expect(del.description).toContain('ANNOUNCEMENT_SEND_IN_PROGRESS');
+    });
+
+    it('publishes the schemas, the 10-value AnnouncementErrorCode (AC-10: the zero-recipient code is gone), and the sentCount semantics', () => {
       const s = doc.components.schemas;
       expect(Object.keys(s.LineBotInfoDto.properties ?? {}).sort()).toEqual(
         ['basicId', 'chatMode', 'displayName', 'pictureUrl'].sort(),
@@ -982,7 +1117,25 @@ describe('Announcements — LINE send + bot info (e2e)', () => {
       expect(s.AnnouncementErrorCode?.enum).toEqual([
         ...ANNOUNCEMENT_ERROR_CODES,
       ]);
-      expect(s.AnnouncementErrorCode?.enum).toHaveLength(11);
+      // ANNOUNCE-API-5 AC-10 — this assertion lives in `test/`, because the token must appear nowhere
+      // in `src/`.
+      expect(s.AnnouncementErrorCode?.enum).toEqual([
+        'ANNOUNCEMENT_NOT_FOUND',
+        'ANNOUNCEMENT_ALREADY_SENT',
+        'ANNOUNCEMENT_SEND_IN_PROGRESS',
+        'ANNOUNCEMENT_BODY_REQUIRED',
+        'ANNOUNCEMENT_DEPARTMENT_INVALID',
+        'ANNOUNCEMENT_PARTIALLY_SENT',
+        'LINE_SEND_FAILED',
+        'LINE_NOT_CONFIGURED',
+        'LINE_RATE_LIMITED',
+        'LINE_BOT_INFO_UNAVAILABLE',
+      ]);
+      expect(s.AnnouncementErrorCode?.enum).toHaveLength(10);
+      expect(s.AnnouncementErrorCode?.enum).not.toContain(
+        'NO_RECIPIENTS_FOUND',
+      );
+      expect(JSON.stringify(doc)).not.toContain('NO_RECIPIENTS_FOUND');
       expect(s.AnnouncementDto.properties?.sentCount?.description).toContain(
         'accepted',
       );

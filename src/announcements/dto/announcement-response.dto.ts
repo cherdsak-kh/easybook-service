@@ -66,7 +66,7 @@ export class AnnouncementDto {
     enum: AnnouncementStatus,
     enumName: 'AnnouncementStatus',
     description:
-      'A row is created as `DRAFT`; only `POST /announcements/{id}/send` makes it `SENT`. `SENT` rows are immutable (PATCH/DELETE → 409) and cannot be sent again.',
+      'A row is created as `DRAFT`; only `POST /announcements/{id}/send` makes it `SENT`. `SENT` rows cannot be edited (PATCH → 409) or sent again; DRAFT and SENT rows alike can be soft-deleted (DELETE → 204).',
   })
   status!: AnnouncementStatus;
 
@@ -93,7 +93,7 @@ export class AnnouncementDto {
     example: 0,
     minimum: 0,
     description:
-      'Recipients whose multicast request LINE **accepted** (HTTP 200, or 409 on a repeated retry key). Not a delivered or read count: LINE silently drops users who blocked the OA. On a partial send (502 `ANNOUNCEMENT_PARTIALLY_SENT`) it is less than the targeted count. 0 for a DRAFT.',
+      'Recipients whose multicast request LINE **accepted** (HTTP 200, or 409 on a repeated retry key). Not a delivered or read count: LINE silently drops users who blocked the OA. On a partial send (502 `ANNOUNCEMENT_PARTIALLY_SENT`) it is less than the targeted count. 0 for a DRAFT, and for a SENT row whose send found nobody eligible (no LINE call was made).',
   })
   sentCount!: number;
 
