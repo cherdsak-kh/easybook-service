@@ -46,6 +46,10 @@ jobs:
 
       - name: Unit tests
         run: npm test
+        env:
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?schema=public
+          REDIS_URL: redis://localhost:6379/0
+
 
       - name: npm audit (fails the build — never auto-fixed here)
         # High/critical vulnerabilities fail CI outright. Do NOT change this to `audit fix
