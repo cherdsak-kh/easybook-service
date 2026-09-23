@@ -3,6 +3,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
+import { API_BASE_PATH } from '../common/api.constants';
 import type { LineCredentialsService } from '../line/line-credentials.service';
 import { LineCallError } from '../line/line-call-error';
 import type { LineService } from '../line/line.service';
@@ -22,7 +23,13 @@ const BOT = {
   markAsReadMode: 'auto' as const,
 };
 
-function build(over: { lineConfigured?: boolean } = {}) {
+/** Only the keys `IntegrationsService` reads; `env` overrides/extends them per test. */
+function build(
+  over: {
+    lineConfigured?: boolean;
+    env?: Record<string, string | number | undefined>;
+  } = {},
+) {
   const gate = {
     isEnabled: jest.fn().mockReturnValue(false),
     set: jest.fn((v: boolean) => Promise.resolve(v)),
@@ -49,11 +56,11 @@ function build(over: { lineConfigured?: boolean } = {}) {
     $queryRaw: jest.fn().mockResolvedValue([{ '?column?': 1 }]),
   };
   const redis = { isHealthy: jest.fn().mockResolvedValue(true) };
-  const config = {
-    get: jest.fn((k: string) =>
-      k === 'R2_BUCKET' ? 'easybook-dev' : undefined,
-    ),
+  const env: Record<string, string | number | undefined> = {
+    R2_BUCKET: 'easybook-dev',
+    ...over.env,
   };
+  const config = { get: jest.fn((k: string) => env[k]) };
   const svc = new IntegrationsService(
     gate as unknown as SwaggerGateService,
     line as unknown as LineService,
@@ -71,7 +78,10 @@ describe('IntegrationsService', () => {
     it('returns the documented shape, masked, with markAsReadMode dropped', async () => {
       const { svc } = build();
       const res = await svc.overview();
-      expect(res.swagger).toEqual({ enabled: false });
+      expect(res.swagger).toEqual({
+        enabled: false,
+        docsUrl: 'http://localhost:3300/docs',
+      });
       expect(res.line).toEqual({
         configured: true,
         channelId: '2006••••42',
@@ -82,6 +92,7 @@ describe('IntegrationsService', () => {
           chatMode: 'bot',
         },
         quota: { total: 500, used: 44 },
+        webhookUrl: 'http://localhost:3300/api/v1/line/webhook',
       });
       expect(res.storage).toEqual({
         configured: true,
@@ -104,6 +115,10 @@ describe('IntegrationsService', () => {
       expect(line.getMessageQuota).not.toHaveBeenCalled();
       expect(res.line.botInfo).toBeNull();
       expect(res.line.quota).toBeNull();
+      // The admin registers the webhook BEFORE saving the credentials it produces.
+      expect(res.line.webhookUrl).toBe(
+        'http://localhost:3300/api/v1/line/webhook',
+      );
     });
 
     it('fail-soft: LINE, Postgres and Redis all failing still resolves 200-shaped', async () => {
@@ -134,6 +149,93 @@ describe('IntegrationsService', () => {
       } finally {
         jest.useRealTimers();
       }
+    });
+
+    /**
+     * The canonical public URLs (`docsUrl` / `webhookUrl`). The browser cannot derive these —
+     * `window.location.origin` names the FRONTEND, which LINE cannot call and which does not
+     * serve `/docs`.
+     */
+    describe('canonical URLs', () => {
+      it('falls back to localhost:PORT when API_EXTERNAL_URL is unset', async () => {
+        const res = await build({ env: { PORT: 4100 } }).svc.overview();
+        expect(res.swagger.docsUrl).toBe('http://localhost:4100/docs');
+        expect(res.line.webhookUrl).toBe(
+          'http://localhost:4100/api/v1/line/webhook',
+        );
+      });
+
+      it('falls back to port 3300 when PORT is unset too', async () => {
+        const res = await build().svc.overview();
+        expect(res.swagger.docsUrl).toBe('http://localhost:3300/docs');
+        expect(res.line.webhookUrl).toBe(
+          'http://localhost:3300/api/v1/line/webhook',
+        );
+      });
+
+      it('uses API_EXTERNAL_URL when set', async () => {
+        const res = await build({
+          env: { API_EXTERNAL_URL: 'https://api.example.com' },
+        }).svc.overview();
+        expect(res.swagger.docsUrl).toBe('https://api.example.com/docs');
+        expect(res.line.webhookUrl).toBe(
+          'https://api.example.com/api/v1/line/webhook',
+        );
+      });
+
+      it.each(['https://api.example.com/', 'https://api.example.com///'])(
+        'strips trailing slashes: %s',
+        async (value) => {
+          const res = await build({
+            env: { API_EXTERNAL_URL: value },
+          }).svc.overview();
+          expect(res.swagger.docsUrl).toBe('https://api.example.com/docs');
+          expect(res.line.webhookUrl).toBe(
+            'https://api.example.com/api/v1/line/webhook',
+          );
+          // No doubled slash anywhere after the scheme.
+          for (const url of [res.swagger.docsUrl, res.line.webhookUrl]) {
+            expect(url.replace(/^https?:\/\//, '')).not.toContain('//');
+          }
+        },
+      );
+
+      it('carries a reverse-proxy path prefix through untouched', async () => {
+        const res = await build({
+          env: { API_EXTERNAL_URL: 'https://x.ac.th/eb/' },
+        }).svc.overview();
+        expect(res.swagger.docsUrl).toBe('https://x.ac.th/eb/docs');
+        expect(res.line.webhookUrl).toBe(
+          'https://x.ac.th/eb/api/v1/line/webhook',
+        );
+      });
+
+      it('builds the webhook path from API_BASE_PATH, not a hardcoded string', async () => {
+        const res = await build({
+          env: { API_EXTERNAL_URL: 'https://api.example.com' },
+        }).svc.overview();
+        expect(res.line.webhookUrl).toBe(
+          `https://api.example.com${API_BASE_PATH}/line/webhook`,
+        );
+      });
+
+      it('both fields survive Swagger ON and LINE unconfigured', async () => {
+        const { svc, gate } = build({ lineConfigured: false });
+        gate.isEnabled.mockReturnValue(true);
+        const res = await svc.overview();
+        expect(res.swagger.enabled).toBe(true);
+        expect(res.swagger.docsUrl).toBe('http://localhost:3300/docs');
+        expect(res.line.configured).toBe(false);
+        expect(res.line.webhookUrl).toBe(
+          'http://localhost:3300/api/v1/line/webhook',
+        );
+      });
+
+      // `/docs` is served at the ROOT by `mountSwagger`, never under the global prefix.
+      it('docsUrl does not carry the API prefix', async () => {
+        const res = await build().svc.overview();
+        expect(res.swagger.docsUrl).not.toContain(API_BASE_PATH);
+      });
     });
 
     it('never sends a LINE message', async () => {

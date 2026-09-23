@@ -176,3 +176,60 @@ describe('validateEnv — LINE_LIFF_URL', () => {
     );
   });
 });
+
+/**
+ * `API_EXTERNAL_URL` — the canonical public URL of this backend, which
+ * `GET /system/integrations` turns into the Swagger link and the LINE Webhook URL.
+ *
+ * Optional everywhere (unset falls back to `http://localhost:${PORT}`), format-checked
+ * whenever present: a value that does not parse gets pasted into the LINE Developers console as a
+ * webhook that can never be called, and that only surfaces as "the bot stopped responding".
+ */
+describe('validateEnv — API_EXTERNAL_URL', () => {
+  it('is optional: absent is fine', () => {
+    expect(() => validateEnv({ ...BASE })).not.toThrow();
+  });
+
+  it.each([
+    'https://api.example.com',
+    // http is legitimate here — local dev is http://localhost:3300.
+    'http://localhost:3300',
+    'https://xxxx.ngrok-free.dev',
+    // A reverse-proxy path prefix and a trailing slash are both accepted; the service
+    // normalises the slash away rather than failing a boot over it.
+    'https://x.ac.th/eb/',
+  ])('accepts %s', (value) => {
+    expect(() =>
+      validateEnv({ ...BASE, API_EXTERNAL_URL: value }),
+    ).not.toThrow();
+  });
+
+  it('rejects a value that is not an absolute URL', () => {
+    expectError(
+      { ...BASE, API_EXTERNAL_URL: 'api.example.com' },
+      /API_EXTERNAL_URL must be a valid absolute URL/,
+    );
+  });
+
+  it('rejects a non-http(s) scheme', () => {
+    expectError(
+      { ...BASE, API_EXTERNAL_URL: 'ftp://api.example.com' },
+      /API_EXTERNAL_URL must use http or https/,
+    );
+  });
+
+  it('stays optional in production — a convenience URL must not block a deploy', () => {
+    expect(() =>
+      validateEnv({
+        ...BASE,
+        ...R2_OK,
+        NODE_ENV: 'production',
+        SESSION_SECRET: 'a'.repeat(32),
+        CSRF_SECRET: 'b'.repeat(32),
+        SESSION_COOKIE_SECURE: 'true',
+        CORS_ORIGIN: 'https://app.example.com',
+        LINE_LOGIN_CHANNEL_ID: '2006123442',
+      }),
+    ).not.toThrow();
+  });
+});

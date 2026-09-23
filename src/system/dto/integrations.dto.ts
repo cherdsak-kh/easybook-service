@@ -15,6 +15,17 @@ export class SwaggerStatusDto {
     description: 'Whether /docs and /docs-json are served right now.',
   })
   enabled!: boolean;
+
+  /**
+   * ALWAYS PRESENT, `enabled` or not — it says where the docs WOULD be, which is exactly what an
+   * admin looking at a switched-off integration needs. Whether the UI hangs an `href` on it stays
+   * the page's rule. Not under the global `/api/v1` prefix: Swagger mounts at the root.
+   */
+  @ApiProperty({
+    example: 'http://localhost:3300/docs',
+    description: 'Canonical URL for Swagger UI.',
+  })
+  docsUrl!: string;
 }
 
 export class LineQuotaDto {
@@ -65,6 +76,21 @@ export class LineIntegrationDto {
       'From the two quota reads. null when unconfigured or when LINE did not answer.',
   })
   quota!: LineQuotaDto | null;
+
+  /**
+   * ALWAYS PRESENT, `configured` or not: an admin registers the webhook in the LINE Developers
+   * console BEFORE the credentials that registration produces can be saved here, so the URL has
+   * to be readable at that exact moment.
+   *
+   * The backend owns this string because only the backend knows its own public origin — the
+   * browser's `window.location` names the FRONTEND, and LINE's servers call the webhook directly.
+   */
+  @ApiProperty({
+    example: 'http://localhost:3300/api/v1/line/webhook',
+    description:
+      'Canonical LINE Webhook URL to register in the LINE Developers console.',
+  })
+  webhookUrl!: string;
 }
 
 export class StorageIntegrationDto {

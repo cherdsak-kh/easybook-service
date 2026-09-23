@@ -54,6 +54,19 @@ const TRIPWIRE = 'e2e tripwire: LINE is unreachable from this suite';
 
 const url = (path: string) => `${API_BASE_PATH}${path}`;
 
+/**
+ * The base URL the service must have built `docsUrl` / `webhookUrl` from.
+ *
+ * `test/e2e-app.ts` imports `dotenv/config`, so the app under test and this file read the SAME
+ * environment: `API_EXTERNAL_URL` when set (trailing slashes stripped), else
+ * `http://localhost:${PORT}`. Derived rather than hardcoded to `:3300` so the suite stays green on a
+ * box whose `.env` points at an ngrok tunnel — the assertions below are still exact strings, and
+ * the structural checks next to them do not depend on this helper at all.
+ */
+const expectedBaseUrl = (): string =>
+  (process.env.API_EXTERNAL_URL ?? '').trim().replace(/\/+$/, '') ||
+  `http://localhost:${process.env.PORT ?? 3300}`;
+
 interface Session {
   agent: request.Agent;
   token: string;
@@ -69,12 +82,13 @@ const httpError = (status: number) =>
 
 /** The slice of the GET body these tests read — typed so no assertion reads an `any`. */
 interface OverviewBody {
-  swagger: { enabled: boolean };
+  swagger: { enabled: boolean; docsUrl: string };
   line: {
     configured: boolean;
     channelId: string | null;
     botInfo: Record<string, unknown> | null;
     quota: { total: number | null; used: number } | null;
+    webhookUrl: string;
   };
   storage: Record<string, unknown>;
   infrastructure: {
@@ -320,12 +334,54 @@ describe('System integrations (e2e)', () => {
       expect(JSON.stringify(body)).not.toMatch(/secret|token/i);
     });
 
+    /**
+     * AC-1 / AC-2 — the canonical public URLs, over real HTTP. This is the only place the
+     * wire format is proven: the admin portal renders both values VERBATIM and may not rebuild
+     * them from `window.location`, which names the frontend origin LINE cannot call.
+     */
+    it('publishes canonical docsUrl / webhookUrl, to SUPER_ADMIN and ADMIN alike', async () => {
+      const webhookPath = `${API_BASE_PATH}/line/webhook`;
+      for (const who of [SUPER, ADMIN]) {
+        const body = overviewOf(await get(who).expect(200));
+        const { docsUrl } = body.swagger;
+        const { webhookUrl } = body.line;
+
+        for (const value of [docsUrl, webhookUrl]) {
+          expect(typeof value).toBe('string');
+          expect(value.length).toBeGreaterThan(0);
+          // Absolute http(s) — `new URL` throws on anything else — and no doubled slash
+          // after the scheme (the trailing-slash trap in AC-4).
+          expect(new URL(value).protocol).toMatch(/^https?:$/);
+          expect(value.replace(/^https?:\/\//, '')).not.toContain('//');
+        }
+
+        // `/docs` is served at the ROOT by `mountSwagger`; the webhook sits under the prefix.
+        expect(docsUrl).toMatch(/\/docs$/);
+        expect(docsUrl).not.toContain(API_BASE_PATH);
+        expect(webhookUrl.endsWith(webhookPath)).toBe(true);
+        // One base, shared by both fields.
+        expect(webhookUrl.startsWith(docsUrl.replace(/\/docs$/, ''))).toBe(
+          true,
+        );
+
+        // …and that base is the one this environment implies.
+        expect(docsUrl).toBe(`${expectedBaseUrl()}/docs`);
+        expect(webhookUrl).toBe(`${expectedBaseUrl()}${webhookPath}`);
+      }
+    });
+
     it('stays 200 when LINE fails (fail-soft) — botInfo and quota go null', async () => {
       fakeLine.getBotInfo.mockRejectedValue(httpError(500));
       fakeLine.getMessageQuota.mockRejectedValue(httpError(500));
       const res = await get(SUPER).expect(200);
       expect(overviewOf(res).line.botInfo).toBeNull();
       expect(overviewOf(res).line.quota).toBeNull();
+      // Both URLs are configuration, not a LINE read: they survive LINE being unreachable,
+      // which is exactly when an admin is on this page trying to (re-)register the webhook.
+      expect(overviewOf(res).line.webhookUrl).toBe(
+        `${expectedBaseUrl()}${API_BASE_PATH}/line/webhook`,
+      );
+      expect(overviewOf(res).swagger.docsUrl).toBe(`${expectedBaseUrl()}/docs`);
     });
   });
 
@@ -350,9 +406,10 @@ describe('System integrations (e2e)', () => {
       });
       await request(server()).get('/docs').expect(404);
       await request(server()).get('/docs/swagger-ui.css').expect(404);
-      expect(overviewOf(await get(ADMIN).expect(200)).swagger.enabled).toBe(
-        false,
-      );
+      const whileOff = overviewOf(await get(ADMIN).expect(200)).swagger;
+      expect(whileOff.enabled).toBe(false);
+      // AC-1: `docsUrl` says where the docs WOULD be, so it must survive the gate being off.
+      expect(whileOff.docsUrl).toBe(`${expectedBaseUrl()}/docs`);
 
       await patch(SUPER, 'swagger', { enabled: true }).expect(200);
       const spec = await request(server()).get('/docs-json').expect(200);

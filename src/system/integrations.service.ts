@@ -5,6 +5,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { API_BASE_PATH } from '../common/api.constants';
 import { LineCredentialsService } from '../line/line-credentials.service';
 import { LineCallError } from '../line/line-call-error';
 import { LineService, type LineBotInfo } from '../line/line.service';
@@ -26,6 +27,12 @@ import { SwaggerGateService } from './swagger-gate.service';
 export const DB_DEGRADED_MS = 200;
 /** Cap for each infrastructure check — the page waits on GET, so nothing here may hang it. */
 export const HEALTH_TIMEOUT_MS = 2_000;
+
+/**
+ * Swagger's UI path. NOT under `API_BASE_PATH`: `mountSwagger` serves `SWAGGER_PATHS` at the
+ * root (`src/system/swagger.setup.ts`), so this URL must not carry the `/api/v1` prefix.
+ */
+const SWAGGER_DOCS_PATH = '/docs';
 
 export const LINE_UPDATE_EMPTY_MESSAGE =
   'ต้องระบุค่าที่ต้องการเปลี่ยนอย่างน้อยหนึ่งค่า';
@@ -105,13 +112,18 @@ export class IntegrationsService {
       this.redisHealth(),
     ]);
     const storageConfigured = this.storage.isConfigured();
+    const baseUrl = this.externalBaseUrl();
     return {
-      swagger: { enabled: this.gate.isEnabled() },
+      swagger: {
+        enabled: this.gate.isEnabled(),
+        docsUrl: `${baseUrl}${SWAGGER_DOCS_PATH}`,
+      },
       line: {
         configured,
         channelId: this.credentials.maskedChannelId(),
         botInfo: botInfo ? toBotInfoDto(botInfo) : null,
         quota,
+        webhookUrl: `${baseUrl}${API_BASE_PATH}/line/webhook`,
       },
       storage: {
         configured: storageConfigured,
@@ -179,6 +191,27 @@ export class IntegrationsService {
 
   probeStorage(): Promise<StorageProbeResponseDto> {
     return this.storage.probe();
+  }
+
+  /**
+   * The canonical public origin of THIS backend — the base of both URLs `overview()` publishes.
+   *
+   * 🔴 THE BROWSER CANNOT COMPUTE THIS. `window.location.origin` names the FRONTEND, which LINE's
+   * servers cannot call and which does not serve `/docs`; that was the bug this replaces.
+   *
+   * `API_EXTERNAL_URL` wins, with trailing slashes stripped because a path is concatenated onto
+   * it. Unset falls back to `http://localhost:${PORT}` — correct on a dev box, and a loud enough
+   * wrong answer anywhere else that it reads as "set the var" rather than as a subtle failure.
+   * A path prefix (a backend hosted at `https://x.ac.th/eb`) is carried through untouched.
+   */
+  private externalBaseUrl(): string {
+    const configured = (this.config.get<string>('API_EXTERNAL_URL') || '')
+      .trim()
+      .replace(/\/+$/, '');
+    if (configured) return configured;
+    // 3300 is the documented default, same literal `main.ts` passes to `listen()`.
+    const port = this.config.get<number>('PORT') || 3300;
+    return `http://localhost:${port}`;
   }
 
   private async databaseHealth(): Promise<DatabaseHealthDto> {
