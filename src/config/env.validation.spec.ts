@@ -142,3 +142,94 @@ describe('validateEnv — Cloudflare R2 (AC-B14)', () => {
     }
   });
 });
+
+/**
+ * `LINE_LIFF_URL` — the button on the ALLOWED and REJECTED status cards.
+ *
+ * Optional everywhere, because a missing convenience link is a card with no footer, not a broken
+ * deploy. Checked whenever present, because LINE validates a `uri` action's scheme and rejects the
+ * WHOLE message when it fails — a typo would not produce a dud button, it would silently stop
+ * every approval and return notification from arriving, visible only as a push warning in the log.
+ */
+describe('validateEnv — LINE_LIFF_URL', () => {
+  it('is optional: absent is fine', () => {
+    expect(() => validateEnv({ ...BASE })).not.toThrow();
+  });
+
+  it('accepts an https LIFF URL', () => {
+    expect(() =>
+      validateEnv({ ...BASE, LINE_LIFF_URL: 'https://liff.line.me/123-abc' }),
+    ).not.toThrow();
+  });
+
+  it('rejects a non-https URL at BOOT rather than at push time', () => {
+    expectError(
+      { ...BASE, LINE_LIFF_URL: 'http://liff.line.me/123-abc' },
+      /LINE_LIFF_URL must use https/,
+    );
+  });
+
+  it('rejects a malformed URL', () => {
+    expectError(
+      { ...BASE, LINE_LIFF_URL: 'liff.line.me/123-abc' },
+      /LINE_LIFF_URL must be a valid absolute URL/,
+    );
+  });
+});
+
+/**
+ * `API_EXTERNAL_URL` — the canonical public URL of this backend, which
+ * `GET /system/integrations` turns into the Swagger link and the LINE Webhook URL.
+ *
+ * Optional everywhere (unset falls back to `http://localhost:${PORT}`), format-checked
+ * whenever present: a value that does not parse gets pasted into the LINE Developers console as a
+ * webhook that can never be called, and that only surfaces as "the bot stopped responding".
+ */
+describe('validateEnv — API_EXTERNAL_URL', () => {
+  it('is optional: absent is fine', () => {
+    expect(() => validateEnv({ ...BASE })).not.toThrow();
+  });
+
+  it.each([
+    'https://api.example.com',
+    // http is legitimate here — local dev is http://localhost:3300.
+    'http://localhost:3300',
+    'https://xxxx.ngrok-free.dev',
+    // A reverse-proxy path prefix and a trailing slash are both accepted; the service
+    // normalises the slash away rather than failing a boot over it.
+    'https://x.ac.th/eb/',
+  ])('accepts %s', (value) => {
+    expect(() =>
+      validateEnv({ ...BASE, API_EXTERNAL_URL: value }),
+    ).not.toThrow();
+  });
+
+  it('rejects a value that is not an absolute URL', () => {
+    expectError(
+      { ...BASE, API_EXTERNAL_URL: 'api.example.com' },
+      /API_EXTERNAL_URL must be a valid absolute URL/,
+    );
+  });
+
+  it('rejects a non-http(s) scheme', () => {
+    expectError(
+      { ...BASE, API_EXTERNAL_URL: 'ftp://api.example.com' },
+      /API_EXTERNAL_URL must use http or https/,
+    );
+  });
+
+  it('stays optional in production — a convenience URL must not block a deploy', () => {
+    expect(() =>
+      validateEnv({
+        ...BASE,
+        ...R2_OK,
+        NODE_ENV: 'production',
+        SESSION_SECRET: 'a'.repeat(32),
+        CSRF_SECRET: 'b'.repeat(32),
+        SESSION_COOKIE_SECURE: 'true',
+        CORS_ORIGIN: 'https://app.example.com',
+        LINE_LOGIN_CHANNEL_ID: '2006123442',
+      }),
+    ).not.toThrow();
+  });
+});

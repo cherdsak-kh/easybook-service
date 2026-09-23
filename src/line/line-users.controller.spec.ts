@@ -8,9 +8,22 @@ import { LineUsersController } from './line-users.controller';
 import { LineUserService } from './line-user.service';
 import type { ListLineUsersQueryDto } from './dto/list-line-users-query.dto';
 
-// A minimal authenticated actor — only `role` is read by the handler (forwarded to the service).
+// The handler now reads the NAME as well as the role: the role decides the write, the identity
+// rides along on the realtime event so the screen can say who acted (REALTIME-1).
 const actor = (role: SystemRole): AuthenticatedSystemUser =>
-  ({ id: 'su-1', role }) as AuthenticatedSystemUser;
+  ({
+    id: 'su-1',
+    role,
+    firstName: 'วีระ',
+    lastName: 'ทองดี',
+  }) as AuthenticatedSystemUser;
+
+/** What the handler is expected to hand the service for that actor. */
+const expectedActor = (role: SystemRole) => ({
+  id: 'su-1',
+  name: 'วีระ ทองดี',
+  role,
+});
 
 // Authz is exercised end-to-end in the e2e suite; here the controller-level guards are stubbed so
 // this unit test focuses purely on the delegation from handler → service.
@@ -76,7 +89,7 @@ describe('LineUsersController', () => {
       expect(users.updateAccess).toHaveBeenCalledWith(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.ADMIN,
+        expectedActor(SystemRole.ADMIN),
         undefined,
       );
       expect(result).toBe(updated);
@@ -91,7 +104,7 @@ describe('LineUsersController', () => {
       expect(users.updateAccess).toHaveBeenCalledWith(
         'lu-1',
         AppAccess.REJECTED,
-        SystemRole.ADMIN,
+        expectedActor(SystemRole.ADMIN),
         'phone is wrong',
       );
     });
@@ -106,7 +119,7 @@ describe('LineUsersController', () => {
       expect(users.updateAccess).toHaveBeenCalledWith(
         'lu-1',
         AppAccess.UNREGISTERED,
-        SystemRole.SUPER_ADMIN,
+        expectedActor(SystemRole.SUPER_ADMIN),
         undefined,
       );
     });
@@ -147,7 +160,7 @@ describe('LineUsersController', () => {
       expect(users.updateRegistrationByAdmin).toHaveBeenCalledWith(
         'lu-1',
         dto,
-        SystemRole.ADMIN,
+        expectedActor(SystemRole.ADMIN),
       );
       expect(result).toBe(updated);
     });
@@ -162,7 +175,7 @@ describe('LineUsersController', () => {
       expect(users.updateRegistrationByAdmin).toHaveBeenCalledWith(
         'lu-1',
         dto,
-        SystemRole.SUPER_ADMIN,
+        expectedActor(SystemRole.SUPER_ADMIN),
       );
     });
 

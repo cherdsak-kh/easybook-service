@@ -31,11 +31,11 @@ jest.setTimeout(180_000);
 
 const PREFIX = 'e2e-staff-';
 const OPT_PREFIX = 'e2e-staffopt-';
-const PASSWORD = 'e2e-correct-horse-battery';
+const PASSWORD = 'E2e-correct-horse-battery-1';
 
 const SUPER = `${PREFIX}super@easybook.local`;
 const ADMIN = `${PREFIX}admin@easybook.local`;
-const STAFF = `${PREFIX}staff@easybook.local`;
+const VIEWER = `${PREFIX}staff@easybook.local`;
 const GATED = `${PREFIX}gated@easybook.local`;
 
 const url = (path: string) => `${API_BASE_PATH}${path}`;
@@ -75,7 +75,7 @@ describe('Staff Management (e2e)', () => {
   let personnelRoleId = 0;
 
   // The R2 seam, faked. The e2e suite must NEVER hit real object storage.
-  const putAvatar = jest.fn();
+  const putImage = jest.fn();
   const deleteObject = jest.fn();
   const storageFake = {
     isConfigured: () => true,
@@ -83,7 +83,7 @@ describe('Staff Management (e2e)', () => {
     buildAvatarKey: (userId: string, type: string) =>
       `avatars/${userId}/${'a'.repeat(32)}.${type === 'image/png' ? 'png' : type === 'image/jpeg' ? 'jpg' : 'webp'}`,
     publicUrlFor: (key: string) => `${R2_BASE}/${key}`,
-    putAvatar,
+    putImage,
     deleteObject,
   };
 
@@ -134,8 +134,8 @@ describe('Staff Management (e2e)', () => {
     for (const [email, role, mustChangePassword] of [
       [SUPER, SystemRole.SUPER_ADMIN, false],
       [ADMIN, SystemRole.ADMIN, false],
-      [STAFF, SystemRole.STAFF, false],
-      [GATED, SystemRole.STAFF, true], // holds an outstanding temp password
+      [VIEWER, SystemRole.VIEWER, false],
+      [GATED, SystemRole.VIEWER, true], // holds an outstanding temp password
     ] as Array<[string, SystemRole, boolean]>) {
       const created = await prisma.systemUser.create({
         data: {
@@ -163,7 +163,7 @@ describe('Staff Management (e2e)', () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    putAvatar.mockResolvedValue(undefined);
+    putImage.mockResolvedValue(undefined);
     deleteObject.mockResolvedValue(true);
     await clearThrottleCounters(redis);
     await seed();
@@ -209,7 +209,7 @@ describe('Staff Management (e2e)', () => {
         .set('x-csrf-token', token)
         .send({
           currentPassword: PASSWORD,
-          newPassword: 'a-brand-new-password',
+          newPassword: 'A-brand-new-password-1',
         })
         .expect(200);
     });
@@ -232,12 +232,12 @@ describe('Staff Management (e2e)', () => {
       );
     });
 
-    it('GATED — PATCH /auth/system/me answers 403 (editing your name is not a way out)', async () => {
+    it('GATED — PATCH /auth/system/me answers 403 (editing your profile is not a way out)', async () => {
       const { agent, token } = await login(GATED);
       const res = await agent
         .patch(url('/auth/system/me'))
         .set('x-csrf-token', token)
-        .send({ firstName: 'Nope' })
+        .send({ profilePictureUrl: 'https://cdn.example.com/nope.jpg' })
         .expect(403);
       expect((res.body as { message: string }).message).toBe(
         MUST_CHANGE_PASSWORD,
@@ -254,12 +254,12 @@ describe('Staff Management (e2e)', () => {
       expect((res.body as { message: string }).message).toBe(
         MUST_CHANGE_PASSWORD,
       );
-      expect(putAvatar).not.toHaveBeenCalled();
+      expect(putImage).not.toHaveBeenCalled();
     });
 
     it('GATED — the write routes on /system-users answer 403, not 400/404', async () => {
       const { agent, token } = await login(GATED);
-      const target = ids[STAFF];
+      const target = ids[VIEWER];
       await agent
         .post(url('/system-users'))
         .set('x-csrf-token', token)
@@ -295,22 +295,24 @@ describe('Staff Management (e2e)', () => {
         .set('x-csrf-token', token)
         .send({
           currentPassword: PASSWORD,
-          newPassword: 'a-brand-new-password',
+          newPassword: 'A-brand-new-password-1',
         })
         .expect(200);
 
       // Same agent, same cookie, no re-login: SessionGuard's per-request DB re-read is what makes
       // this work — and is why no session-revocation machinery exists.
-      // STAFF is 403 on /system-users by ROLE, so assert on a route STAFF may reach.
+      // Assert on `/auth/system/me`, which is one of the six routes the gate exempts.
       const me = await agent.get(url('/auth/system/me')).expect(200);
       expect((me.body as UserBody).mustChangePassword).toBe(false);
 
       const patched = await agent
         .patch(url('/auth/system/me'))
         .set('x-csrf-token', token)
-        .send({ firstName: 'Freed' })
+        .send({ profilePictureUrl: 'https://cdn.example.com/freed.jpg' })
         .expect(200);
-      expect((patched.body as UserBody).firstName).toBe('Freed');
+      expect((patched.body as UserBody).profilePictureUrl).toBe(
+        'https://cdn.example.com/freed.jpg',
+      );
     });
 
     it('an UNGATED user is unaffected everywhere', async () => {
@@ -428,7 +430,7 @@ describe('Staff Management (e2e)', () => {
       const { agent, token } = await login(SUPER);
 
       const res = await agent
-        .post(url(`/system-users/${ids[STAFF]}/reset-password`))
+        .post(url(`/system-users/${ids[VIEWER]}/reset-password`))
         .set('x-csrf-token', token)
         .expect(200); // 200, NOT 201 — it creates nothing
 
@@ -442,17 +444,17 @@ describe('Staff Management (e2e)', () => {
       await stale
         .post(url('/auth/system/login'))
         .set('x-csrf-token', (csrf.body as { csrfToken: string }).csrfToken)
-        .send({ email: STAFF, password: PASSWORD })
+        .send({ email: VIEWER, password: PASSWORD })
         .expect(401);
 
       await clearThrottleCounters(redis);
-      await login(STAFF, temporaryPassword);
+      await login(VIEWER, temporaryPassword);
     });
 
     it('reset-password: 403 for a non-SUPER_ADMIN, 403 on self, 404 on a soft-deleted id', async () => {
       const adminSession = await login(ADMIN);
       await adminSession.agent
-        .post(url(`/system-users/${ids[STAFF]}/reset-password`))
+        .post(url(`/system-users/${ids[VIEWER]}/reset-password`))
         .set('x-csrf-token', adminSession.token)
         .expect(403);
 
@@ -466,23 +468,23 @@ describe('Staff Management (e2e)', () => {
       );
 
       await prisma.systemUser.update({
-        where: { id: ids[STAFF] },
+        where: { id: ids[VIEWER] },
         data: { deletedAt: new Date() },
       });
       await agent
-        .post(url(`/system-users/${ids[STAFF]}/reset-password`))
+        .post(url(`/system-users/${ids[VIEWER]}/reset-password`))
         .set('x-csrf-token', token)
         .expect(404);
     });
 
     it('reset-password: a SUSPENDED target is valid (200) — the flags are orthogonal', async () => {
       await prisma.systemUser.update({
-        where: { id: ids[STAFF] },
+        where: { id: ids[VIEWER] },
         data: { isActive: false },
       });
       const { agent, token } = await login(SUPER);
       await agent
-        .post(url(`/system-users/${ids[STAFF]}/reset-password`))
+        .post(url(`/system-users/${ids[VIEWER]}/reset-password`))
         .set('x-csrf-token', token)
         .expect(200);
     });
@@ -490,7 +492,7 @@ describe('Staff Management (e2e)', () => {
     it('reset-password requires the CSRF header', async () => {
       const { agent } = await login(SUPER);
       await agent
-        .post(url(`/system-users/${ids[STAFF]}/reset-password`))
+        .post(url(`/system-users/${ids[VIEWER]}/reset-password`))
         .expect(403);
     });
   });
@@ -499,14 +501,14 @@ describe('Staff Management (e2e)', () => {
 
   describe('POST /auth/system/password', () => {
     it('a WRONG currentPassword is 400, NOT 401 — a 401 would log the user out for a typo', async () => {
-      const { agent, token } = await login(STAFF);
+      const { agent, token } = await login(VIEWER);
 
       const res = await agent
         .post(url('/auth/system/password'))
         .set('x-csrf-token', token)
         .send({
           currentPassword: 'wrong-password',
-          newPassword: 'a-fine-new-password',
+          newPassword: 'A-fine-new-password-1',
         })
         .expect(400);
 
@@ -519,8 +521,8 @@ describe('Staff Management (e2e)', () => {
       await agent.get(url('/auth/system/me')).expect(200);
     });
 
-    it('rejects a new password that is < 12 chars, or identical to the current one', async () => {
-      const { agent, token } = await login(STAFF);
+    it('rejects a new password that is < 8 chars, or identical to the current one', async () => {
+      const { agent, token } = await login(VIEWER);
 
       await agent
         .post(url('/auth/system/password'))
@@ -531,6 +533,9 @@ describe('Staff Management (e2e)', () => {
       const same = await agent
         .post(url('/auth/system/password'))
         .set('x-csrf-token', token)
+        // PASSWORD itself satisfies the composition rules, so this 400 can ONLY be
+        // PASSWORD_UNCHANGED. If it did not, the assertion below would pass on a
+        // validation error and stop testing the rule it names.
         .send({ currentPassword: PASSWORD, newPassword: PASSWORD })
         .expect(400);
       expect((same.body as { message: string }).message).toBe(
@@ -539,20 +544,20 @@ describe('Staff Management (e2e)', () => {
     });
 
     it('rejects an extra key and a missing currentPassword', async () => {
-      const { agent, token } = await login(STAFF);
+      const { agent, token } = await login(VIEWER);
       await agent
         .post(url('/auth/system/password'))
         .set('x-csrf-token', token)
         .send({
           currentPassword: PASSWORD,
-          newPassword: 'a-fine-new-password',
-          confirmPassword: 'a-fine-new-password',
+          newPassword: 'A-fine-new-password-1',
+          confirmPassword: 'A-fine-new-password-1',
         })
         .expect(400);
       await agent
         .post(url('/auth/system/password'))
         .set('x-csrf-token', token)
-        .send({ newPassword: 'a-fine-new-password' })
+        .send({ newPassword: 'A-fine-new-password-1' })
         .expect(400);
     });
 
@@ -563,7 +568,7 @@ describe('Staff Management (e2e)', () => {
         .set('x-csrf-token', token)
         .send({
           currentPassword: PASSWORD,
-          newPassword: 'my-chosen-password-1',
+          newPassword: 'My-chosen-password-1',
         })
         .expect(200);
 
@@ -577,16 +582,19 @@ describe('Staff Management (e2e)', () => {
         .expect(401);
 
       await clearThrottleCounters(redis);
-      const fresh = await login(GATED, 'my-chosen-password-1');
+      const fresh = await login(GATED, 'My-chosen-password-1');
       const me = await fresh.agent.get(url('/auth/system/me')).expect(200);
       expect((me.body as UserBody).mustChangePassword).toBe(false);
     });
 
     it('requires the CSRF header', async () => {
-      const { agent } = await login(STAFF);
+      const { agent } = await login(VIEWER);
       await agent
         .post(url('/auth/system/password'))
-        .send({ currentPassword: PASSWORD, newPassword: 'a-fine-new-password' })
+        .send({
+          currentPassword: PASSWORD,
+          newPassword: 'A-fine-new-password-1',
+        })
         .expect(403);
     });
   });
@@ -626,7 +634,7 @@ describe('Staff Management (e2e)', () => {
     ])('AC-B3 — an UNKNOWN %s is a 400', async (field, value) => {
       const { agent, token } = await login(SUPER);
       await agent
-        .patch(url(`/system-users/${ids[STAFF]}`))
+        .patch(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .send({ [field]: value })
         .expect(400);
@@ -640,7 +648,7 @@ describe('Staff Management (e2e)', () => {
       const { agent, token } = await login(SUPER);
 
       await agent
-        .patch(url(`/system-users/${ids[STAFF]}`))
+        .patch(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .send({ departmentId: dead.id })
         .expect(400);
@@ -657,7 +665,7 @@ describe('Staff Management (e2e)', () => {
 
       // Read still resolves the name — the nested select carries NO deletedAt filter.
       const read = await agent
-        .get(url(`/system-users/${ids[STAFF]}`))
+        .get(url(`/system-users/${ids[VIEWER]}`))
         .expect(200);
       expect((read.body as UserBody).department).toEqual({
         id: departmentId,
@@ -667,7 +675,7 @@ describe('Staff Management (e2e)', () => {
       // ...and the list does too, rather than 500ing on a null relation.
       const list = await agent.get(url('/system-users')).expect(200);
       const row = (list.body as { data: UserBody[] }).data.find(
-        (u) => u.id === ids[STAFF],
+        (u) => u.id === ids[VIEWER],
       );
       expect(row?.department.name).toBe(`${OPT_PREFIX}dept`);
     });
@@ -675,13 +683,13 @@ describe('Staff Management (e2e)', () => {
     it('AC-B3 — a rejected write leaves the existing assignment untouched', async () => {
       const { agent, token } = await login(SUPER);
       await agent
-        .patch(url(`/system-users/${ids[STAFF]}`))
+        .patch(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .send({ departmentId: 999_999_99 })
         .expect(400);
 
       const row = await prisma.systemUser.findUniqueOrThrow({
-        where: { id: ids[STAFF] },
+        where: { id: ids[VIEWER] },
         select: { departmentId: true },
       });
       expect(row.departmentId).toBe(departmentId);
@@ -690,7 +698,7 @@ describe('Staff Management (e2e)', () => {
     it('rejects a string id — no implicit conversion means "3" is not 3', async () => {
       const { agent, token } = await login(SUPER);
       await agent
-        .patch(url(`/system-users/${ids[STAFF]}`))
+        .patch(url(`/system-users/${ids[VIEWER]}`))
         .set('x-csrf-token', token)
         .send({ departmentId: String(departmentId) })
         .expect(400);
@@ -700,28 +708,27 @@ describe('Staff Management (e2e)', () => {
   // ═══════════════ AC-B11 — self-profile ═══════════════
 
   describe('PATCH /auth/system/me', () => {
-    it('updates the four allowed fields', async () => {
-      const { agent, token } = await login(STAFF);
+    it('updates the ONE allowed field', async () => {
+      const { agent, token } = await login(VIEWER);
 
       const res = await agent
         .patch(url('/auth/system/me'))
         .set('x-csrf-token', token)
-        .send({
-          firstName: 'Ada',
-          lastName: 'Lovelace',
-          phoneNumber: '02-123-4567',
-          profilePictureUrl: 'https://cdn.example.com/a.jpg',
-        })
+        .send({ profilePictureUrl: 'https://cdn.example.com/a.jpg' })
         .expect(200);
 
-      const body = res.body as UserBody;
-      expect(body.firstName).toBe('Ada');
-      expect(body.lastName).toBe('Lovelace');
-      expect(body.phoneNumber).toBe('02-123-4567');
-      expect(body.profilePictureUrl).toBe('https://cdn.example.com/a.jpg');
+      expect((res.body as UserBody).profilePictureUrl).toBe(
+        'https://cdn.example.com/a.jpg',
+      );
     });
 
     it.each([
+      // The first three moved from ALLOWED to REJECTED on 2026-08-16: the profile screen shows
+      // them behind a padlock and the staff-management screen owns them. An endpoint that still
+      // accepted them would be the back door that padlock claims does not exist.
+      ['firstName', 'Ada'],
+      ['lastName', 'Lovelace'],
+      ['phoneNumber', '02-123-4567'],
       ['role', SystemRole.SUPER_ADMIN],
       ['isActive', false],
       ['departmentId', 1],
@@ -735,7 +742,7 @@ describe('Staff Management (e2e)', () => {
     ])(
       'AC-B11 — `%s` is absent from the DTO, so forbidNonWhitelisted 400s it',
       async (key, value) => {
-        const { agent, token } = await login(STAFF);
+        const { agent, token } = await login(VIEWER);
         await agent
           .patch(url('/auth/system/me'))
           .set('x-csrf-token', token)
@@ -744,29 +751,42 @@ describe('Staff Management (e2e)', () => {
       },
     );
 
-    it('AC-B11 — a STAFF cannot escalate: role stays STAFF and the row is untouched', async () => {
-      const { agent, token } = await login(STAFF);
+    it('AC-B11 — a VIEWER cannot escalate: role stays VIEWER and the row is untouched', async () => {
+      const { agent, token } = await login(VIEWER);
       await agent
         .patch(url('/auth/system/me'))
         .set('x-csrf-token', token)
-        .send({ firstName: 'Ada', role: SystemRole.SUPER_ADMIN })
+        // The legal field is paired with the illegal one on purpose: if the body were applied
+        // partially, the avatar would land and only `role` would be dropped.
+        .send({
+          profilePictureUrl: 'https://cdn.example.com/esc.jpg',
+          role: SystemRole.SUPER_ADMIN,
+        })
         .expect(400);
 
       const row = await prisma.systemUser.findUniqueOrThrow({
-        where: { id: ids[STAFF] },
-        select: { role: true, firstName: true },
+        where: { id: ids[VIEWER] },
+        select: { role: true, profilePictureUrl: true },
       });
-      expect(row.role).toBe(SystemRole.STAFF);
-      expect(row.firstName).toBe('E2E'); // the whole body was rejected, not partially applied
+      expect(row.role).toBe(SystemRole.VIEWER);
+      // The whole body was rejected, not partially applied.
+      expect(row.profilePictureUrl).not.toBe('https://cdn.example.com/esc.jpg');
     });
 
-    it('an empty body is a 400; `{"firstName": null}` is a 400, not a 500', async () => {
-      const { agent, token } = await login(STAFF);
+    it('an empty body is a 200 no-op; `{"firstName": null}` is still a 400', async () => {
+      const { agent, token } = await login(VIEWER);
+
+      // `{}` used to be a 400, enforced by AtLeastOneDefined. With ONE optional field that rule
+      // was just "this field is required" said indirectly, so it went with the other three: an
+      // empty PATCH now writes `profilePictureUrl: undefined`, which Prisma treats as no change.
       await agent
         .patch(url('/auth/system/me'))
         .set('x-csrf-token', token)
         .send({})
-        .expect(400);
+        .expect(200);
+
+      // Still a 400, but for a DIFFERENT reason than it used to be: not the ValidateIf trap that
+      // stopped a null reaching a NOT NULL column, simply an unknown key.
       await agent
         .patch(url('/auth/system/me'))
         .set('x-csrf-token', token)
@@ -774,23 +794,23 @@ describe('Staff Management (e2e)', () => {
         .expect(400);
     });
 
-    it('`{"phoneNumber": null}` clears the value (200)', async () => {
+    it('`{"profilePictureUrl": null}` clears the avatar (200)', async () => {
       await prisma.systemUser.update({
-        where: { id: ids[STAFF] },
-        data: { phoneNumber: '02-000-0000' },
+        where: { id: ids[VIEWER] },
+        data: { profilePictureUrl: 'https://cdn.example.com/old.jpg' },
       });
-      const { agent, token } = await login(STAFF);
+      const { agent, token } = await login(VIEWER);
 
       const res = await agent
         .patch(url('/auth/system/me'))
         .set('x-csrf-token', token)
-        .send({ phoneNumber: null })
+        .send({ profilePictureUrl: null })
         .expect(200);
-      expect((res.body as UserBody).phoneNumber).toBeNull();
+      expect((res.body as UserBody).profilePictureUrl).toBeNull();
     });
 
     it('rejects a non-https profilePictureUrl', async () => {
-      const { agent, token } = await login(STAFF);
+      const { agent, token } = await login(VIEWER);
       await agent
         .patch(url('/auth/system/me'))
         .set('x-csrf-token', token)
@@ -804,7 +824,7 @@ describe('Staff Management (e2e)', () => {
     });
 
     it('requires the CSRF header, and a session', async () => {
-      const { agent } = await login(STAFF);
+      const { agent } = await login(VIEWER);
       await agent
         .patch(url('/auth/system/me'))
         .send({ firstName: 'X' })
@@ -824,7 +844,7 @@ describe('Staff Management (e2e)', () => {
 
   describe('POST /auth/system/me/avatar', () => {
     it('accepts a valid PNG, stores it under an unguessable key, and returns the new URL', async () => {
-      const { agent, token } = await login(STAFF);
+      const { agent, token } = await login(VIEWER);
 
       const res = await agent
         .post(url('/auth/system/me/avatar'))
@@ -834,10 +854,10 @@ describe('Staff Management (e2e)', () => {
 
       const body = res.body as UserBody;
       expect(body.profilePictureUrl).toMatch(
-        new RegExp(`^${R2_BASE}/avatars/${ids[STAFF]}/[0-9a-f]{32}\\.png$`),
+        new RegExp(`^${R2_BASE}/avatars/${ids[VIEWER]}/[0-9a-f]{32}\\.png$`),
       );
-      expect(putAvatar).toHaveBeenCalledTimes(1);
-      expect(putAvatar).toHaveBeenCalledWith(
+      expect(putImage).toHaveBeenCalledTimes(1);
+      expect(putImage).toHaveBeenCalledWith(
         expect.stringMatching(/^avatars\//),
         expect.any(Buffer),
         'image/png',
@@ -845,7 +865,7 @@ describe('Staff Management (e2e)', () => {
 
       // Persisted, and https (AC-B15).
       const row = await prisma.systemUser.findUniqueOrThrow({
-        where: { id: ids[STAFF] },
+        where: { id: ids[VIEWER] },
         select: { profilePictureUrl: true },
       });
       expect(row.profilePictureUrl).toBe(body.profilePictureUrl);
@@ -853,7 +873,7 @@ describe('Staff Management (e2e)', () => {
     });
 
     it('AC-B13 — an EXE renamed .png with Content-Type image/png is a 400 (magic-byte control)', async () => {
-      const { agent, token } = await login(STAFF);
+      const { agent, token } = await login(VIEWER);
       const exe = Buffer.concat([Buffer.from('MZ'), Buffer.alloc(128, 0x90)]);
 
       const res = await agent
@@ -865,11 +885,11 @@ describe('Staff Management (e2e)', () => {
       expect((res.body as { message: string }).message).toBe(
         AVATAR_TYPE_UNSUPPORTED,
       );
-      expect(putAvatar).not.toHaveBeenCalled();
+      expect(putImage).not.toHaveBeenCalled();
     });
 
     it('AC-B13 — 2 MiB + 1 byte is a 400, NOT a 413 (the MulterError mapping)', async () => {
-      const { agent, token } = await login(STAFF);
+      const { agent, token } = await login(VIEWER);
       const tooBig = pngBytes(2 * 1024 * 1024 + 1);
 
       const res = await agent
@@ -882,11 +902,11 @@ describe('Staff Management (e2e)', () => {
 
       expect(res.status).toBe(400); // 413 here is an AC-B13 FAIL
       expect((res.body as { message: string }).message).toBe(AVATAR_TOO_LARGE);
-      expect(putAvatar).not.toHaveBeenCalled();
+      expect(putImage).not.toHaveBeenCalled();
     });
 
     it('accepts a file exactly AT the 2 MiB limit', async () => {
-      const { agent, token } = await login(STAFF);
+      const { agent, token } = await login(VIEWER);
       await agent
         .post(url('/auth/system/me/avatar'))
         .set('x-csrf-token', token)
@@ -898,7 +918,7 @@ describe('Staff Management (e2e)', () => {
     });
 
     it('rejects a declared MIME outside the allowlist, and a wrong field name', async () => {
-      const { agent, token } = await login(STAFF);
+      const { agent, token } = await login(VIEWER);
 
       await agent
         .post(url('/auth/system/me/avatar'))
@@ -917,7 +937,7 @@ describe('Staff Management (e2e)', () => {
     });
 
     it('no file part at all is a 400', async () => {
-      const { agent, token } = await login(STAFF);
+      const { agent, token } = await login(VIEWER);
       await agent
         .post(url('/auth/system/me/avatar'))
         .set('x-csrf-token', token)
@@ -926,8 +946,8 @@ describe('Staff Management (e2e)', () => {
     });
 
     it('a storage failure is a 502 and leaves profilePictureUrl UNCHANGED', async () => {
-      putAvatar.mockRejectedValue(new BadGatewayException('upstream'));
-      const { agent, token } = await login(STAFF);
+      putImage.mockRejectedValue(new BadGatewayException('upstream'));
+      const { agent, token } = await login(VIEWER);
 
       await agent
         .post(url('/auth/system/me/avatar'))
@@ -936,7 +956,7 @@ describe('Staff Management (e2e)', () => {
         .expect(502);
 
       const row = await prisma.systemUser.findUniqueOrThrow({
-        where: { id: ids[STAFF] },
+        where: { id: ids[VIEWER] },
         select: { profilePictureUrl: true },
       });
       expect(row.profilePictureUrl).toBeNull();
@@ -944,10 +964,12 @@ describe('Staff Management (e2e)', () => {
 
     it('re-uploading deletes the OLD object and returns the new URL', async () => {
       await prisma.systemUser.update({
-        where: { id: ids[STAFF] },
-        data: { profilePictureUrl: `${R2_BASE}/avatars/${ids[STAFF]}/old.png` },
+        where: { id: ids[VIEWER] },
+        data: {
+          profilePictureUrl: `${R2_BASE}/avatars/${ids[VIEWER]}/old.png`,
+        },
       });
-      const { agent, token } = await login(STAFF);
+      const { agent, token } = await login(VIEWER);
 
       await agent
         .post(url('/auth/system/me/avatar'))
@@ -956,16 +978,16 @@ describe('Staff Management (e2e)', () => {
         .expect(200);
 
       expect(deleteObject).toHaveBeenCalledWith(
-        `avatars/${ids[STAFF]}/old.png`,
+        `avatars/${ids[VIEWER]}/old.png`,
       );
     });
 
     it('an old URL OUTSIDE our bucket is never deleted', async () => {
       await prisma.systemUser.update({
-        where: { id: ids[STAFF] },
+        where: { id: ids[VIEWER] },
         data: { profilePictureUrl: 'https://cdn.elsewhere.com/avatars/x.png' },
       });
-      const { agent, token } = await login(STAFF);
+      const { agent, token } = await login(VIEWER);
 
       await agent
         .post(url('/auth/system/me/avatar'))
@@ -977,7 +999,7 @@ describe('Staff Management (e2e)', () => {
     });
 
     it('requires the CSRF header (a multipart body cannot smuggle the token)', async () => {
-      const { agent } = await login(STAFF);
+      const { agent } = await login(VIEWER);
       await agent
         .post(url('/auth/system/me/avatar'))
         .attach('file', pngBytes(), 'me.png')

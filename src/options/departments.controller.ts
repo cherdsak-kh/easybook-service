@@ -48,12 +48,15 @@ import { OptionsService } from './options.service';
 const actorOf = (user: AuthenticatedSystemUser): Actor => ({
   id: user.id,
   role: user.role,
+  // `createdBy` is the resolved object; the policy wants the id. It is selected WITHOUT any filter
+  // (DD-4), so a soft-deleted creator still resolves and STAFF-CREATOR-1 still fires for them.
+  createdById: user.createdBy?.id ?? null,
 });
 
 /**
  * Admin CRUD for the `Department` registration options. Route prefix: `/api/v1/departments`.
  *
- * Session-guarded (`SUPER_ADMIN`/`ADMIN`; `STAFF` denied), keyed on the auto-increment integer
+ * Session-guarded (`SUPER_ADMIN`/`ADMIN`; `VIEWER` denied), keyed on the auto-increment integer
  * `Department.id`. Same guard stack as `/system-users` — NOT the LINE ID-token guard. Mutations
  * require `x-csrf-token` (enforced by the global CSRF middleware; documented per-route with
  * `@ApiHeader`). `DELETE` is a soft delete. `:id` is parsed with `ParseIntPipe`, so a non-numeric id
@@ -79,7 +82,7 @@ export class DepartmentsController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF has no access.',
+    description: 'VIEWER has no access.',
     type: ErrorResponseDto,
   })
   @ApiServiceUnavailableResponse({
@@ -108,7 +111,7 @@ export class DepartmentsController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF, or CSRF failure.',
+    description: 'VIEWER, or CSRF failure.',
     type: ErrorResponseDto,
   })
   @ApiConflictResponse({
@@ -137,7 +140,7 @@ export class DepartmentsController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF, or CSRF failure.',
+    description: 'VIEWER, or CSRF failure.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
@@ -175,7 +178,7 @@ export class DepartmentsController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF, or CSRF failure.',
+    description: 'VIEWER, or CSRF failure.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({

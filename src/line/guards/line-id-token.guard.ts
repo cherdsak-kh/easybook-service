@@ -8,7 +8,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { RequestWithLineUserId } from '../line.types';
+import type { LineProfileClaims, RequestWithLineUserId } from '../line.types';
 
 const LINE_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
 const LINE_ISSUER = 'https://access.line.me';
@@ -24,6 +24,126 @@ interface LineIdTokenPayload {
   sub?: unknown;
   aud?: unknown;
   exp?: unknown;
+  /** Present only when the token was minted with the `profile` scope. Display data, not identity. */
+  name?: unknown;
+  picture?: unknown;
+}
+
+/**
+ * The display half of the payload, kept apart from the identity half on purpose.
+ *
+ * ⚠️ ONLY NON-EMPTY STRINGS SURVIVE, and every other shape becomes absent rather than `null`. The
+ * consumer treats absent as "no news" and would treat `null` as "the user cleared it" — so letting
+ * a missing claim through as `null` would wipe a follower's stored name the first time a LIFF app
+ * without the `profile` scope called us. `''` is folded into absent for the same reason: a blank
+ * display name is not something LINE lets anyone actually have.
+ *
+ * These claims are NOT re-validated against anything, and do not need to be: they arrive on the
+ * same LINE-signed payload the `sub` does, and they are written to display fields that no
+ * authorization decision reads.
+ */
+function profileClaimsOf(payload: LineIdTokenPayload): LineProfileClaims {
+  const str = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.length > 0 ? v : undefined;
+  return { displayName: str(payload.name), pictureUrl: str(payload.picture) };
+}
+
+/** What a successfully verified LINE ID token yields. */
+export interface VerifiedLineIdentity {
+  /**
+   * ⚠️ THE LINE-SIDE `U…` SUBJECT (`LineUser.lineUserId`), never the cuid `LineUser.id`. Callers
+   * that need a row must look it up; see the footgun note in the service's `CLAUDE.md`.
+   */
+  sub: string;
+  profile: LineProfileClaims;
+}
+
+/** Returns the bearer token, or `null` for a missing/malformed `Authorization` header. */
+export function extractBearerToken(header: string | undefined): string | null {
+  if (typeof header !== 'string') return null;
+  const [scheme, value] = header.split(' ');
+  if (scheme?.toLowerCase() !== 'bearer' || !value) return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+const verifierLogger = new Logger('LineIdTokenVerifier');
+
+/**
+ * Calls LINE's verify endpoint. Uses POST form-encoding (design §2.1) to keep the token out of
+ * any URL/access log. A network/timeout/5xx/non-JSON fault is a retryable 502; a 4xx is a 401.
+ */
+async function callLineVerify(
+  token: string,
+  channelId: string,
+): Promise<LineIdTokenPayload> {
+  let response: Response;
+  try {
+    response = await fetch(LINE_VERIFY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ id_token: token, client_id: channelId }),
+      signal: AbortSignal.timeout(VERIFY_TIMEOUT_MS),
+    });
+  } catch (error) {
+    // A network failure to LINE is NOT proof the token is invalid — 502 lets the client retry.
+    verifierLogger.warn(
+      `LINE verify unreachable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    throw new BadGatewayException(LINE_VERIFICATION_UNAVAILABLE);
+  }
+
+  if (response.status >= 500) {
+    verifierLogger.warn(`LINE verify returned ${response.status}.`);
+    throw new BadGatewayException(LINE_VERIFICATION_UNAVAILABLE);
+  }
+
+  if (!response.ok) {
+    // 4xx: LINE rejected the token (invalid / expired / wrong-aud).
+    throw new UnauthorizedException(INVALID_LINE_CREDENTIALS);
+  }
+
+  try {
+    return (await response.json()) as LineIdTokenPayload;
+  } catch {
+    // 200 with a non-JSON body is an upstream fault — retryable, not a client error.
+    throw new BadGatewayException(LINE_VERIFICATION_UNAVAILABLE);
+  }
+}
+
+/**
+ * 🔴 THE ONE AND ONLY LINE ID-TOKEN VERIFIER IN THIS CODEBASE.
+ *
+ * It is a free function rather than a method on {@link LineIdTokenGuard} because a SECOND transport
+ * now needs it: `ClientRealtimeGateway` authenticates the `/client` Socket.IO handshake with the
+ * very same token, and a socket has no `ExecutionContext` to hand a `CanActivate`. Two verifiers
+ * would be two chances for the `aud`/`iss`/`exp` re-checks to drift apart, and a drifting copy of a
+ * token check is a security defect, not a duplication nit — so the guard below is a thin HTTP
+ * adapter over this, and the gateway is a thin socket adapter over the same call.
+ *
+ * ⚠️ IT THROWS HTTP EXCEPTIONS AND THAT IS DELIBERATE: they are the outcome vocabulary
+ * (`401 invalid` vs `502 upstream unavailable`), and each transport maps them at its own edge. The
+ * socket edge collapses both to `UNAUTHENTICATED` — see `ClientRealtimeGateway`.
+ */
+export async function verifyLineIdToken(
+  token: string,
+  channelId: string,
+): Promise<VerifiedLineIdentity> {
+  const payload = await callLineVerify(token, channelId);
+
+  // Defence-in-depth re-checks on the returned payload (LINE already validated signature + expiry).
+  if (
+    payload.iss !== LINE_ISSUER ||
+    payload.aud !== channelId ||
+    typeof payload.sub !== 'string' ||
+    payload.sub.length === 0 ||
+    typeof payload.exp !== 'number' ||
+    payload.exp * 1000 <= Date.now()
+  ) {
+    throw new UnauthorizedException(INVALID_LINE_CREDENTIALS);
+  }
+
+  return { sub: payload.sub, profile: profileClaimsOf(payload) };
 }
 
 /**
@@ -48,7 +168,7 @@ export class LineIdTokenGuard implements CanActivate {
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const req = context.switchToHttp().getRequest<RequestWithLineUserId>();
 
-    const token = this.extractBearerToken(req.headers.authorization);
+    const token = extractBearerToken(req.headers.authorization);
     if (!token) {
       throw new UnauthorizedException(INVALID_LINE_CREDENTIALS);
     }
@@ -64,73 +184,11 @@ export class LineIdTokenGuard implements CanActivate {
       );
     }
 
-    const payload = await this.verify(token, channelId);
-
-    // Defence-in-depth re-checks on the returned payload (LINE already validated signature + expiry).
-    if (
-      payload.iss !== LINE_ISSUER ||
-      payload.aud !== channelId ||
-      typeof payload.sub !== 'string' ||
-      payload.sub.length === 0 ||
-      typeof payload.exp !== 'number' ||
-      payload.exp * 1000 <= Date.now()
-    ) {
-      throw new UnauthorizedException(INVALID_LINE_CREDENTIALS);
-    }
+    const identity = await verifyLineIdToken(token, channelId);
 
     // Identity comes ONLY from the verified `sub`.
-    req.lineUserId = payload.sub;
+    req.lineUserId = identity.sub;
+    req.lineProfile = identity.profile;
     return true;
-  }
-
-  /** Returns the bearer token, or `null` for a missing/malformed `Authorization` header. */
-  private extractBearerToken(header: string | undefined): string | null {
-    if (typeof header !== 'string') return null;
-    const [scheme, value] = header.split(' ');
-    if (scheme?.toLowerCase() !== 'bearer' || !value) return null;
-    const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : null;
-  }
-
-  /**
-   * Calls LINE's verify endpoint. Uses POST form-encoding (design §2.1) to keep the token out of
-   * any URL/access log. A network/timeout/5xx/non-JSON fault is a retryable 502; a 4xx is a 401.
-   */
-  private async verify(
-    token: string,
-    channelId: string,
-  ): Promise<LineIdTokenPayload> {
-    let response: Response;
-    try {
-      response = await fetch(LINE_VERIFY_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ id_token: token, client_id: channelId }),
-        signal: AbortSignal.timeout(VERIFY_TIMEOUT_MS),
-      });
-    } catch (error) {
-      // A network failure to LINE is NOT proof the token is invalid — 502 lets the client retry.
-      this.logger.warn(
-        `LINE verify unreachable: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      throw new BadGatewayException(LINE_VERIFICATION_UNAVAILABLE);
-    }
-
-    if (response.status >= 500) {
-      this.logger.warn(`LINE verify returned ${response.status}.`);
-      throw new BadGatewayException(LINE_VERIFICATION_UNAVAILABLE);
-    }
-
-    if (!response.ok) {
-      // 4xx: LINE rejected the token (invalid / expired / wrong-aud).
-      throw new UnauthorizedException(INVALID_LINE_CREDENTIALS);
-    }
-
-    try {
-      return (await response.json()) as LineIdTokenPayload;
-    } catch {
-      // 200 with a non-JSON body is an upstream fault — retryable, not a client error.
-      throw new BadGatewayException(LINE_VERIFICATION_UNAVAILABLE);
-    }
   }
 }

@@ -7,8 +7,14 @@ import {
   Matches,
   MaxLength,
 } from 'class-validator';
+import { sanitizeThaiText } from '../../common/sanitize-thai.util';
 
-/** Trims a string value, leaving non-strings untouched (mirrors the system-users DTOs). */
+/**
+ * ⚠️ STILL HERE ON PURPOSE — `phone` keeps it. `sanitizeThaiText` replaced it on `firstName` and
+ * `lastName` only: the phone grammar below is digits, separators and the literal marker `ต่อ`, and
+ * running a Thai mark reorderer over a number is a way to make a phone number that no longer
+ * matches the `@Matches` grammar it just passed.
+ */
 const trim = ({ value }: { value: unknown }): unknown =>
   typeof value === 'string' ? value.trim() : value;
 
@@ -31,14 +37,14 @@ const trim = ({ value }: { value: unknown }): unknown =>
  */
 export class CreateLineUserRegistrationDto {
   @ApiProperty({ example: 'Somchai', maxLength: 100 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(100)
   firstName!: string;
 
   @ApiProperty({ example: 'Jaidee', maxLength: 100 })
-  @Transform(trim)
+  @Transform(sanitizeThaiText)
   @IsString()
   @IsNotEmpty()
   @MaxLength(100)
@@ -46,12 +52,21 @@ export class CreateLineUserRegistrationDto {
 
   // Deliberately loose (Thai-friendly), mirroring SystemUser.phoneNumber: libphonenumber would
   // reject the local/office formats real users type. Display/notification only — not a lookup key.
-  @ApiProperty({ example: '081-234-5678', maxLength: 20 })
+  @ApiProperty({ example: '081-234-5678', maxLength: 30 })
   @Transform(trim)
   @IsString()
   @IsNotEmpty()
-  @Matches(/^[0-9+\-() ]{6,20}$/, {
-    message: 'phone contains unsupported characters.',
+  // ⚠️ THE EXTENSION SUFFIX IS THAI, and that is the whole point of this shape (STAFF-PHONE-1).
+  // "02-123-4567 ต่อ 101" is how a Thai office number is written, and the old charset-only regex
+  // answered 400 for it with a message naming no character. A person then retypes the number
+  // without the extension — the data is lost at the keyboard, quietly.
+  //
+  // A GRAMMAR, not a widened charset: a phone-shaped prefix, then OPTIONALLY a marker and digits.
+  // Adding Thai letters to the character class would accept "โทรหาผมสิ" as a phone number. It is
+  // this grammar that lets `toPhoneDigits` split on the marker and trust what is on each side.
+  @Matches(/^[0-9+\-() ]{6,20}(?:\s*(?:ต่อ|ext\.?)\s*\d{1,6})?$/, {
+    message:
+      'phone must be digits and separators, optionally followed by ต่อ or ext and an extension.',
   })
   phone!: string;
 

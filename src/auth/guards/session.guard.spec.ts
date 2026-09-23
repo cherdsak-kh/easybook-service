@@ -8,6 +8,8 @@ import { SystemRole } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { PUBLIC_FIELDS } from '../../system-users/system-users.fields';
 import {
+  ACCOUNT_UNAVAILABLE,
+  AUTHENTICATION_REQUIRED,
   MUST_CHANGE_PASSWORD,
   SESSION_ABSOLUTE_MAX_AGE_MS,
 } from '../auth.constants';
@@ -148,6 +150,46 @@ describe('SessionGuard', () => {
     expect(destroy).toHaveBeenCalledTimes(1);
     expect(req.systemUser).toBeUndefined();
   });
+
+  /*
+   * AUTH-401-REASON — the message, not just the status.
+   *
+   * A session that ENDED and an account that is GONE are the same 401 with the same remedy on the
+   * server and OPPOSITE remedies for the person: sign in again, versus ask an admin. The frontend
+   * matches on these exact strings, so they are an interface between two repositories — which is
+   * why they are asserted here rather than left to whatever the guard happens to throw.
+   */
+  it.each([
+    ['the user vanished', null],
+    ['the user is soft-deleted', { ...dbRow, deletedAt: new Date() }],
+    ['the user was deactivated', { ...dbRow, isActive: false }],
+  ])('says the ACCOUNT is unavailable when %s', async (_label, row) => {
+    findUnique.mockResolvedValue(row);
+    const req = makeRequest({ systemUserId: 'user-1', createdAt: Date.now() });
+
+    await expect(guard.canActivate(contextFor(req))).rejects.toThrow(
+      ACCOUNT_UNAVAILABLE,
+    );
+  });
+
+  it.each([
+    ['there is no session at all', undefined],
+    ['the session carries no systemUserId', {}],
+    [
+      'the session is past the absolute cap',
+      { systemUserId: 'user-1', createdAt: 0 },
+    ],
+  ])(
+    'says only AUTHENTICATION_REQUIRED when %s — never a word about any account',
+    async (_label, session) => {
+      findUnique.mockResolvedValue(dbRow);
+      const req = makeRequest(session);
+
+      await expect(guard.canActivate(contextFor(req))).rejects.toThrow(
+        AUTHENTICATION_REQUIRED,
+      );
+    },
+  );
 
   it('still returns 401 when destroying the rejected session itself fails', async () => {
     findUnique.mockResolvedValue({ ...dbRow, isActive: false });

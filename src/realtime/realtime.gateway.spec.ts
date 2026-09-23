@@ -1,9 +1,10 @@
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { SystemRole } from '@prisma/client';
+import { BookingStatus, SystemRole } from '@prisma/client';
 import type { Redis } from 'ioredis';
 import type { Namespace } from 'socket.io';
 import { SESSION_ABSOLUTE_MAX_AGE_MS } from '../auth/auth.constants';
+import type { AdminBookingRequestListItemDto } from '../bookings/dto/admin-booking-response.dto';
 import type { LineUserResponseDto } from '../line/dto/line-user-response.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import {
@@ -44,7 +45,13 @@ const dto: LineUserResponseDto = {
   statusMessage: null,
   richMenuType: 'TYPE_1',
   access: 'PENDING',
+  // A PENDING row carries neither note — they are invariant-bound to REJECTED and BLOCKED.
+  rejectionReason: null,
+  blockReason: null,
   followedAt: '2026-07-07T10:00:00.000Z',
+  // Deliberately a DIFFERENT day from followedAt: the payload carries the day the form was
+  // submitted, not the day they followed the OA.
+  registeredAt: '2026-07-09T04:30:00.000Z',
   registration: {
     firstName: 'Somchai',
     lastName: 'Jaidee',
@@ -54,6 +61,40 @@ const dto: LineUserResponseDto = {
     personnelRoleId: 2,
     personnelRole: 'Teacher',
   },
+};
+
+/**
+ * A queue row as `ADMIN-REALTIME-BOOKINGS-1` puts it on the wire. Its requester fields are PII and
+ * are asserted against every log line below, exactly as the LINE user's are.
+ */
+const booking: AdminBookingRequestListItemDto = {
+  id: 'br-1',
+  code: 'BR-25690903-001',
+  status: BookingStatus.PENDING,
+  origin: 'LINE',
+  requester: {
+    name: 'สมชาย ใจดี',
+    phone: '081-234-5678',
+    departmentName: 'คณะวิทยาศาสตร์',
+  },
+  venue: { id: 'venue-1', name: 'หอประชุมวารณ', location: null },
+  purpose: 'ประชุมเตรียมงานกีฬาสี',
+  attendees: 25,
+  firstStartAt: new Date('2026-09-10T02:00:00.000Z'),
+  lastEndAt: new Date('2026-09-10T04:00:00.000Z'),
+  slots: [
+    {
+      id: 'slot-1',
+      startAt: new Date('2026-09-10T02:00:00.000Z'),
+      endAt: new Date('2026-09-10T04:00:00.000Z'),
+      isCancelled: false,
+      cancelledAt: null,
+      cancelReason: null,
+      cancelledByRole: null,
+    },
+  ],
+  rejectReason: null,
+  createdAt: new Date('2026-09-04T09:00:00.000Z'),
 };
 
 interface FakeSocket {
@@ -156,29 +197,55 @@ describe('RealtimeGateway', () => {
     expect(namespace.use).toHaveBeenCalledTimes(3);
   });
 
+  /** REALTIME-1: who did it. `null` is the other legal value — a LINE-side or self-service change. */
+  const ACTOR = { id: 'op-1', name: 'วีระ ทองดี' };
+
   // ───────────────────────────── emit surface ─────────────────────────────
 
   it('emits the three domain events on the namespace (no rooms — membership IS the boundary)', () => {
     const namespace = boot();
 
-    gateway.emitLineUserCreated(dto);
-    gateway.emitLineUserUpdated(dto);
-    gateway.emitLineUserDeleted('lu-9');
+    gateway.emitLineUserCreated(dto, ACTOR);
+    gateway.emitLineUserUpdated(dto, ACTOR);
+    gateway.emitLineUserDeleted('lu-9', ACTOR);
 
     expect(namespace.emit).toHaveBeenNthCalledWith(
       1,
       REALTIME_EVENTS.lineUserCreated,
-      dto,
+      { user: dto, actor: ACTOR },
     );
     expect(namespace.emit).toHaveBeenNthCalledWith(
       2,
       REALTIME_EVENTS.lineUserUpdated,
-      dto,
+      { user: dto, actor: ACTOR },
     );
     expect(namespace.emit).toHaveBeenNthCalledWith(
       3,
       REALTIME_EVENTS.lineUserDeleted,
-      { id: 'lu-9' },
+      { id: 'lu-9', actor: ACTOR },
+    );
+  });
+
+  /**
+   * `ADMIN-REALTIME-BOOKINGS-1`. Same namespace, same absence of rooms, same `{ payload, actor }`
+   * shape — the booking queue is a second vocabulary on the transport, not a second transport.
+   */
+  it('emits the two booking events on the namespace, keyed `booking` (not `user`)', () => {
+    const namespace = boot();
+
+    gateway.emitBookingRequestCreated(booking, null);
+    gateway.emitBookingRequestUpdated(booking, ACTOR);
+
+    expect(namespace.emit).toHaveBeenNthCalledWith(
+      1,
+      REALTIME_EVENTS.bookingRequestCreated,
+      // `null` is a real answer here: a LINE user submitted the request through LIFF.
+      { booking, actor: null },
+    );
+    expect(namespace.emit).toHaveBeenNthCalledWith(
+      2,
+      REALTIME_EVENTS.bookingRequestUpdated,
+      { booking, actor: ACTOR },
     );
   });
 
@@ -187,10 +254,60 @@ describe('RealtimeGateway', () => {
       .spyOn(Logger.prototype, 'warn')
       .mockImplementation(() => undefined);
 
-    expect(() => gateway.emitLineUserCreated(dto)).not.toThrow();
-    expect(() => gateway.emitLineUserUpdated(dto)).not.toThrow();
-    expect(() => gateway.emitLineUserDeleted('lu-9')).not.toThrow();
-    expect(warn).toHaveBeenCalledTimes(3);
+    expect(() => gateway.emitLineUserCreated(dto, ACTOR)).not.toThrow();
+    expect(() => gateway.emitLineUserUpdated(dto, ACTOR)).not.toThrow();
+    expect(() => gateway.emitLineUserDeleted('lu-9', ACTOR)).not.toThrow();
+    expect(() =>
+      gateway.emitBookingRequestCreated(booking, null),
+    ).not.toThrow();
+    expect(() =>
+      gateway.emitBookingRequestUpdated(booking, ACTOR),
+    ).not.toThrow();
+    expect(warn).toHaveBeenCalledTimes(5);
+
+    warn.mockRestore();
+  });
+
+  it('AC B15 — a throwing transport is swallowed on the booking events too', () => {
+    const warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    const namespace = boot();
+    namespace.emit.mockImplementation(() => {
+      throw new Error('transport down');
+    });
+
+    expect(() =>
+      gateway.emitBookingRequestCreated(booking, ACTOR),
+    ).not.toThrow();
+    expect(() =>
+      gateway.emitBookingRequestUpdated(booking, ACTOR),
+    ).not.toThrow();
+    expect(warn).toHaveBeenCalledTimes(2);
+
+    warn.mockRestore();
+  });
+
+  /** AC B17 again, for the booking payload: `requesterName`/`contactPhone`/`purpose` are PII. */
+  it('AC B17 — no booking emit log line carries a requester, a phone or a purpose', () => {
+    const warn = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+    const namespace = boot();
+    namespace.emit.mockImplementation(() => {
+      throw new Error('transport down');
+    });
+
+    gateway.emitBookingRequestUpdated(booking, ACTOR);
+
+    for (const [message] of warn.mock.calls) {
+      const text = String(message);
+      expect(text).not.toContain('สมชาย');
+      expect(text).not.toContain('081-234-5678');
+      expect(text).not.toContain('ประชุมเตรียมงานกีฬาสี');
+    }
+    // The id IS carried — it is what makes the warning actionable.
+    expect(String(warn.mock.calls[0][0])).toContain('id=br-1');
 
     warn.mockRestore();
   });
@@ -204,7 +321,7 @@ describe('RealtimeGateway', () => {
       throw new Error('transport down');
     });
 
-    expect(() => gateway.emitLineUserUpdated(dto)).not.toThrow();
+    expect(() => gateway.emitLineUserUpdated(dto, ACTOR)).not.toThrow();
     expect(warn).toHaveBeenCalled();
 
     warn.mockRestore();
@@ -219,8 +336,8 @@ describe('RealtimeGateway', () => {
       throw new Error('transport down');
     });
 
-    gateway.emitLineUserUpdated(dto);
-    gateway.emitLineUserDeleted('lu-9');
+    gateway.emitLineUserUpdated(dto, ACTOR);
+    gateway.emitLineUserDeleted('lu-9', ACTOR);
 
     for (const [message] of warn.mock.calls) {
       const text = String(message);
@@ -322,7 +439,7 @@ describe('RealtimeGateway', () => {
     ['the user was hard-deleted / vanished', null],
     ['soft-deleted', { ...liveRow, deletedAt: new Date() }],
     ['suspended', { ...liveRow, isActive: false }],
-    ['demoted to STAFF', { ...liveRow, role: SystemRole.STAFF }],
+    ['demoted to VIEWER', { ...liveRow, role: SystemRole.VIEWER }],
     [
       'forced to change their password',
       { ...liveRow, mustChangePassword: true },

@@ -7,11 +7,18 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
+  CopyObjectCommand,
   DeleteObjectCommand,
+  DeleteObjectsCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
-import { AVATAR_UPLOAD_FAILED, R2_NOT_CONFIGURED } from './storage.errors';
+import {
+  IMAGE_UPLOAD_FAILED,
+  STORAGE_NOT_CONFIGURED,
+  STORAGE_SWEEP_FAILED,
+} from './storage.errors';
 import type { AvatarImageType } from './image-sniff';
 
 /**
@@ -19,6 +26,65 @@ import type { AvatarImageType } from './image-sniff';
  * constant is a misconfiguration vector, not a knob.
  */
 const R2_REGION = 'auto';
+
+/** Where the การเชื่อมต่อระบบ write probe puts (and immediately deletes) its two-byte object. */
+const HEALTHCHECK_PREFIX = '_healthcheck/';
+/** Per-step cap for {@link R2StorageService.probe} — the page waits on it, so it must not hang. */
+const PROBE_STEP_TIMEOUT_MS = 5_000;
+
+/**
+ * Where a venue photo lands before a venue owns it. Trailing slash included so callers never have to
+ * remember it.
+ *
+ * ⚠️ IT LIVES HERE, NOT IN `venues.constants.ts`. This module is the only thing in the repo that
+ * knows what an object key looks like — putting half a key shape in a feature module is how the two
+ * halves drift and a `startsWith` check quietly stops matching.
+ */
+export const VENUE_PHOTO_STAGING_PREFIX = 'venues/_new/';
+
+/**
+ * Where a feedback photo lands and STAYS (`CLIENT-ISSUE-1`). Trailing slash included, for the same
+ * reason as the constant above, and it is also the prefix `FeedbackService` checks a submitted URL
+ * against before storing it.
+ *
+ * 🔴 DELIBERATELY OUTSIDE {@link R2StorageService.sweepStagedPhotos}, AND IT MUST STAY OUTSIDE. That
+ * sweep's rule is "delete anything older than 24 h", which is sound only for a STAGING prefix where
+ * age genuinely implies abandonment. Objects here are LIVE at their upload key forever — a sweep
+ * over this prefix would delete the photos of every submission older than a day and leave live rows
+ * pointing at dead URLs. The sweeper a feedback orphan actually needs is a different one (one
+ * `SELECT unnest(photos) FROM feedbacks` diffed against one listing), and it is not this cycle's
+ * work.
+ */
+export const FEEDBACK_PHOTO_PREFIX = 'feedback/';
+
+/**
+ * How old a staged object must be before the sweeper will touch it, by default.
+ *
+ * ⚠️ LOAD-BEARING, NOT A TUNING KNOB. A staged object is not proof of abandonment — it is also what a
+ * CREATE dialog that is open RIGHT NOW in another tab is holding. The minimum age is the only thing
+ * that tells those two apart, because the bucket carries no "still being edited" signal. Lower it and
+ * the sweep deletes photos out from under an operator who has not pressed บันทึก yet.
+ */
+export const STAGED_PHOTO_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Keys per `DeleteObjectsCommand`. THE API'S HARD LIMIT (S3 and R2 both reject 1001), not a style
+ * choice — a sweep of a long-unswept bucket has to chunk or it fails outright.
+ */
+const DELETE_BATCH_LIMIT = 1000;
+
+/** What one sweep did. Counts and bytes only — never keys (see `sweepStagedPhotos`). */
+export interface StagedPhotoSweepResult {
+  /** Objects seen under the staging prefix, across every page. */
+  scannedCount: number;
+  /** Of those, the ones older than the cutoff. */
+  eligibleCount: number;
+  /** What R2 CONFIRMED it deleted. Always 0 on a dry run. */
+  deletedCount: number;
+  /** Bytes freed — see the doc comment for which set this sums on a dry run. */
+  freedBytes: number;
+  dryRun: boolean;
+}
 
 /** The extension stored in the object key, derived from the SNIFFED type — never `originalname`. */
 const EXTENSION: Record<AvatarImageType, string> = {
@@ -63,9 +129,9 @@ export class R2StorageService {
   private s3(): S3Client {
     if (!this.isConfigured()) {
       this.logger.error(
-        'R2 is not configured — set the five R2_* vars. Avatar upload is unavailable.',
+        'R2 is not configured — set the five R2_* vars. Avatar and venue-photo upload are unavailable.',
       );
-      throw new InternalServerErrorException(R2_NOT_CONFIGURED);
+      throw new InternalServerErrorException(STORAGE_NOT_CONFIGURED);
     }
     if (!this.client) {
       const accountId = this.config.getOrThrow<string>('R2_ACCOUNT_ID');
@@ -102,6 +168,173 @@ export class R2StorageService {
     return `avatars/${systemUserId}/${randomBytes(16).toString('hex')}.${EXTENSION[type]}`;
   }
 
+  /**
+   * `venues/_new/<32 lowercase hex>.<ext>` — where an upload LANDS, before any venue owns it.
+   *
+   * ⚠️ IT IS NOT WHERE THE PHOTO ENDS UP. `VenuesService` re-homes it to
+   * `venues/<venueId>/<same filename>` once the venue is written (PO, 25 ส.ค. 2569: *"เพิ่มโฟลเดอร์
+   * ของสถานที่นั้นมาอีกชั้น รูปจะได้ไม่ปนกัน"*). The staging step exists because the operator picks
+   * photos inside the CREATE dialog, where no venue exists and therefore no id does — upload-then-bind
+   * (`D-VN10`) is what the form requires, and this is the price of also getting a per-venue folder.
+   *
+   * `_new` cannot collide with a real folder: a cuid never starts with an underscore. It also sorts
+   * ahead of every venue id in a console listing, so "what has not been claimed yet" is visible at a
+   * glance — which is what the orphan sweep will want.
+   *
+   * 128 bits of `randomBytes(16)` — UNGUESSABLE, for the same reason as the avatar key: the bucket is
+   * public-read, so enumerability is the whole threat. The filename carries all of that entropy, so
+   * the folder never has to be secret.
+   */
+  buildVenuePhotoKey(type: AvatarImageType): string {
+    return `${VENUE_PHOTO_STAGING_PREFIX}${randomBytes(16).toString('hex')}.${EXTENSION[type]}`;
+  }
+
+  /**
+   * The same object, under the venue that now owns it. Filename is preserved — it is the part that
+   * carries the entropy, and keeping it makes a staging key and its final key obviously the same
+   * photo when both turn up in a listing.
+   */
+  venuePhotoKeyFor(venueId: string, stagingKey: string): string {
+    return `venues/${venueId}/${stagingKey.slice(VENUE_PHOTO_STAGING_PREFIX.length)}`;
+  }
+
+  /** Is this key still sitting in the staging folder, i.e. does it need re-homing? */
+  isStagedVenuePhotoKey(key: string): boolean {
+    return key.startsWith(VENUE_PHOTO_STAGING_PREFIX);
+  }
+
+  /**
+   * `feedback/<32 lowercase hex>.<ext>` — where a feedback photo lands and STAYS.
+   *
+   * ⚠️ FLAT, AND NEVER RE-HOMED, unlike {@link buildVenuePhotoKey}. Venue photos stage under
+   * `venues/_new/` and move to `venues/<venueId>/` because the PO asked for a per-venue folder;
+   * nobody has asked for a per-submission folder here, and `rehomePhotos`' best-effort
+   * copy/delete/re-read is real machinery for no stated benefit. It also makes the eventual orphan
+   * sweep SIMPLER rather than harder — see {@link FEEDBACK_PHOTO_PREFIX}, which also records that
+   * this prefix is deliberately outside the nightly staged-photo sweep and why.
+   *
+   * 128 bits of `randomBytes(16)` — UNGUESSABLE, which is the whole control for a public-read
+   * bucket with no listing (plan §8: keys must not be guessable-sequential).
+   *
+   * 🔴 NO USER ID IN THE PATH, unlike `avatars/<userId>/…`. Avatars carry one BECAUSE
+   * `AUTH-ERASURE` needs a one-prefix purge of a person's own face. A feedback photo is content
+   * about a PLACE, and putting the reporter's cuid into a public-read URL would attach their
+   * identity to bytes that may be shared or pasted.
+   */
+  buildFeedbackPhotoKey(type: AvatarImageType): string {
+    return `${FEEDBACK_PHOTO_PREFIX}${randomBytes(16).toString('hex')}.${EXTENSION[type]}`;
+  }
+
+  /**
+   * Server-side copy. `MetadataDirective` defaults to COPY, so the sniffed `ContentType` set at
+   * upload survives — re-declaring it here would be a second place for it to drift.
+   *
+   * Returns whether it worked rather than throwing, because the caller runs this AFTER the database
+   * write has already committed. A failed copy leaves the row pointing at the staging object, which
+   * still resolves; a thrown error would turn "the photo is in the wrong folder" into "the save
+   * failed", which is a far worse answer to the same event.
+   */
+  async copyObject(fromKey: string, toKey: string): Promise<boolean> {
+    try {
+      await this.s3().send(
+        new CopyObjectCommand({
+          Bucket: this.config.getOrThrow<string>('R2_BUCKET'),
+          // ⚠️ `CopySource` IS BUCKET-QUALIFIED AND URI-ENCODED, unlike `Key`. Passing a bare key
+          // here is the classic mistake and surfaces as a NoSuchKey for an object that plainly
+          // exists.
+          CopySource: encodeURI(
+            `${this.config.getOrThrow<string>('R2_BUCKET')}/${fromKey}`,
+          ),
+          Key: toKey,
+        }),
+      );
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        `R2 copyObject failed (ignored). from=${fromKey} to=${toKey} reason=${error instanceof Error ? error.message : String(error)}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * การเชื่อมต่อระบบ's storage probe (`INTEGRATIONS-API-1`). NEVER THROWS — a probe that answers
+   * "no" is a result, not a server error.
+   *
+   *  · read  — `ListObjectsV2` for ONE key under the probe prefix. Proves the endpoint, the
+   *            credentials and the bucket name in one round trip.
+   *  · write — `PutObject` of two bytes to `_healthcheck/probe-<16 hex>.txt`, then `DeleteObject`.
+   *            The avatar and venue-photo uploads depend on exactly this permission, and reading
+   *            proves nothing about it. The key is random, so concurrent probes cannot collide.
+   *            `_healthcheck/` is outside every prefix the orphan sweep reads, and the object is
+   *            deleted at once; a failed delete leaves two bytes behind, logged.
+   *
+   * `latencyMs` covers the whole probe. Each step is capped at {@link PROBE_STEP_TIMEOUT_MS}.
+   * Unconfigured → all false with latency 0, and no S3 client is built.
+   */
+  async probe(): Promise<{
+    ok: boolean;
+    latencyMs: number;
+    read: boolean;
+    write: boolean;
+  }> {
+    if (!this.isConfigured()) {
+      return { ok: false, latencyMs: 0, read: false, write: false };
+    }
+    const bucket = this.config.getOrThrow<string>('R2_BUCKET');
+    const started = Date.now();
+    const step = async (run: () => Promise<unknown>): Promise<boolean> => {
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          run(),
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('probe step timed out')),
+              PROBE_STEP_TIMEOUT_MS,
+            );
+          }),
+        ]);
+        return true;
+      } catch (error) {
+        this.logger.warn(
+          `R2 probe step failed. reason=${error instanceof Error ? error.name : 'unknown'}`,
+        );
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    const read = await step(() =>
+      this.s3().send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: HEALTHCHECK_PREFIX,
+          MaxKeys: 1,
+        }),
+      ),
+    );
+    const key = `${HEALTHCHECK_PREFIX}probe-${randomBytes(8).toString('hex')}.txt`;
+    const put = await step(() =>
+      this.s3().send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          Body: 'ok',
+          ContentType: 'text/plain',
+        }),
+      ),
+    );
+    const removed = put
+      ? await step(() =>
+          this.s3().send(new DeleteObjectCommand({ Bucket: bucket, Key: key })),
+        )
+      : false;
+    const write = put && removed;
+    return { ok: read && write, latencyMs: Date.now() - started, read, write };
+  }
+
   /** The durable, public https URL for a key. */
   publicUrlFor(key: string): string {
     return `${this.config.getOrThrow<string>('R2_PUBLIC_BASE_URL')}/${key}`;
@@ -113,8 +346,13 @@ export class R2StorageService {
    *
    * An upload failure is a `502`: R2 is an upstream, and the condition is retryable. Mirrors the
    * module-wide "upstream failed → BadGateway" convention.
+   *
+   * ⚠️ RENAMED FROM `putAvatar` WITH VENUE-1. It never had anything avatar-specific in it — the key
+   * and the content type both arrive as arguments — and a venue photo going through a method called
+   * `putAvatar` is the kind of name that survives long enough to mislead somebody reading a stack
+   * trace. The two CALLERS stay distinct; only this seam is shared.
    */
-  async putAvatar(
+  async putImage(
     key: string,
     body: Buffer,
     contentType: AvatarImageType,
@@ -133,7 +371,7 @@ export class R2StorageService {
       this.logger.error(
         `R2 putObject failed. key=${key} reason=${error instanceof Error ? error.message : String(error)}`,
       );
-      throw new BadGatewayException(AVATAR_UPLOAD_FAILED);
+      throw new BadGatewayException(IMAGE_UPLOAD_FAILED);
     }
   }
 
@@ -156,5 +394,152 @@ export class R2StorageService {
       );
       return false;
     }
+  }
+
+  /**
+   * Delete abandoned venue photos out of `venues/_new/`. Driven by `scripts/sweep-orphan-photos.ts`
+   * (`npm run venues:sweep-photos`); nothing in the request path calls it.
+   *
+   * ── WHY THIS NEEDS NO DATABASE CROSS-CHECK ──────────────────────────────────────────────────────
+   * `D-VN10` made venue photo upload UPLOAD-THEN-BIND: bytes land at `venues/_new/<hex>.<ext>`, and
+   * `VenuesService` MOVES the object to `venues/<venueId>/` only after the row is written. So **no
+   * `Venue` or `VenuePhoto` row can ever hold a URL pointing into `venues/_new/`** — by construction,
+   * not by convention. An object still sitting there long after upload is therefore an orphan on its
+   * own evidence: a staff member closed the tab or abandoned the dialog.
+   *
+   * That is the entire reason this method is a listing and a delete with no `prisma` anywhere near it.
+   * It is NOT a forgotten diff. Back when keys were flat, an orphan sweep had to reconcile the bucket
+   * against the table; the per-venue folder is what removed that requirement.
+   *
+   * ── THE AGE FILTER IS THE SAFETY PROPERTY ───────────────────────────────────────────────────────
+   * See `STAGED_PHOTO_MIN_AGE_MS`. Objects with no `LastModified` are SKIPPED rather than assumed
+   * old: without a timestamp there is no proof of abandonment, and the next sweep will see them again.
+   *
+   * `LastModified` is R2'S clock, compared against THIS machine's — measured 2026-09-06 against the
+   * real bucket, an object uploaded milliseconds earlier was still not eligible at `olderThanMs: 0`,
+   * because its stamp lands slightly in this host's future. Harmless at 24h, and another reason the
+   * floor is not something to shave down to minutes.
+   *
+   * ── `freedBytes`, unambiguously ─────────────────────────────────────────────────────────────────
+   * Real run: the `Size` of the objects **R2 reported as deleted** — not the ones we asked it to
+   * delete. Dry run: the `Size` of every **eligible** object, i.e. what a real run would free at most.
+   *
+   * Errors follow the module's split: a missing configuration keeps its own `STORAGE_NOT_CONFIGURED`
+   * 500, and an SDK failure is a `502` like `putImage` — a sweep is a batch job whose failure must be
+   * loud enough to become a non-zero exit code, so it throws rather than returning a half-truth.
+   * Individual keys R2 refuses are NOT a throw: they are counted out of `deletedCount` and logged.
+   *
+   * ⚠️ LOGS CARRY COUNTS AND BYTES ONLY — never object keys, never bucket credentials. Keys are opaque
+   * hex, but they are still bucket contents, and an operator needs neither to act on this output.
+   */
+  async sweepStagedPhotos(options?: {
+    olderThanMs?: number;
+    dryRun?: boolean;
+  }): Promise<StagedPhotoSweepResult> {
+    const dryRun = options?.dryRun === true;
+    const olderThanMs = options?.olderThanMs ?? STAGED_PHOTO_MIN_AGE_MS;
+    const cutoff = Date.now() - olderThanMs;
+
+    // Resolved BEFORE the try so an unconfigured box keeps `STORAGE_NOT_CONFIGURED` instead of being
+    // reported as an upstream failure it never reached.
+    const client = this.s3();
+    const bucket = this.config.getOrThrow<string>('R2_BUCKET');
+
+    let scannedCount = 0;
+    /** key → `Size`, holding ONLY eligible objects — the recent ones are counted and dropped. */
+    const eligible = new Map<string, number>();
+
+    try {
+      let continuationToken: string | undefined;
+      do {
+        const page = await client.send(
+          new ListObjectsV2Command({
+            Bucket: bucket,
+            Prefix: VENUE_PHOTO_STAGING_PREFIX,
+            ContinuationToken: continuationToken,
+          }),
+        );
+
+        for (const object of page.Contents ?? []) {
+          scannedCount += 1;
+          if (!object.Key || !object.LastModified) continue;
+          if (object.LastModified.getTime() >= cutoff) continue;
+          eligible.set(object.Key, object.Size ?? 0);
+        }
+
+        // ⚠️ PAGINATION IS NOT OPTIONAL. One page is 1,000 keys; a bucket left unswept for months has
+        // more, and a single-page sweeper would under-delete forever while reporting success.
+        continuationToken = page.IsTruncated
+          ? page.NextContinuationToken
+          : undefined;
+      } while (continuationToken);
+
+      let deletedCount = 0;
+      let freedBytes = 0;
+      let failedCount = 0;
+
+      if (dryRun) {
+        for (const size of eligible.values()) freedBytes += size;
+      } else {
+        const keys = [...eligible.keys()];
+        for (let i = 0; i < keys.length; i += DELETE_BATCH_LIMIT) {
+          const batch = keys.slice(i, i + DELETE_BATCH_LIMIT);
+          const response = await client.send(
+            new DeleteObjectsCommand({
+              Bucket: bucket,
+              Delete: {
+                Objects: batch.map((Key) => ({ Key })),
+                // Explicit: `Quiet: true` would empty `Deleted`, and this method would then report 0
+                // deletions on a sweep that worked perfectly.
+                Quiet: false,
+              },
+            }),
+          );
+
+          // COUNT WHAT THE RESPONSE SAYS, NOT WHAT WE ASKED FOR. `DeleteObjects` answers 200 while
+          // failing individual keys, so `batch.length` here would be a comfortable lie.
+          for (const deleted of response.Deleted ?? []) {
+            if (!deleted.Key) continue;
+            deletedCount += 1;
+            freedBytes += eligible.get(deleted.Key) ?? 0;
+          }
+          failedCount += response.Errors?.length ?? 0;
+        }
+      }
+
+      if (failedCount > 0) {
+        this.logger.warn(
+          `R2 staged-photo sweep: ${failedCount} object(s) were refused and are NOT counted as deleted. They stay eligible for the next sweep.`,
+        );
+      }
+      this.logger.log(
+        `R2 staged-photo sweep finished${dryRun ? ' (dry run — nothing deleted)' : ''}. olderThanMs=${olderThanMs} scanned=${scannedCount} eligible=${eligible.size} deleted=${deletedCount} freedBytes=${freedBytes}`,
+      );
+
+      return {
+        scannedCount,
+        eligibleCount: eligible.size,
+        deletedCount,
+        freedBytes,
+        dryRun,
+      };
+    } catch (error) {
+      this.logger.error(
+        `R2 staged-photo sweep failed after scanning ${scannedCount} object(s). reason=${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw new BadGatewayException(STORAGE_SWEEP_FAILED);
+    }
+  }
+
+  /**
+   * Release the SDK client's sockets.
+   *
+   * FOR SCRIPTS, NOT FOR THE SERVER. The AWS SDK keeps its HTTP agent's connections alive, which is
+   * what a long-running app wants and exactly what makes a one-shot CLI (or a cron run) sit there
+   * after its work is done instead of exiting. Nothing in the request path should call this.
+   */
+  destroy(): void {
+    this.client?.destroy();
+    this.client = undefined;
   }
 }

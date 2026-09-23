@@ -52,21 +52,11 @@ jobs:
         # --force` in this workflow — that silently pulls in breaking major-version bumps.
         # A real finding here is a devops/backend-dev decision, not something CI auto-resolves.
         #
-        # `--omit=dev` scopes the gate to the dependencies that actually SHIP. The Dockerfile's
-        # `runtime` target runs `npm prune --omit=dev` and copies only the pruned node_modules,
-        # so a devDependency-only advisory is not present in any deployed artifact — it can only
-        # ever affect a CI runner or a developer's machine at build/test time.
-        #
-        # Added 2026-07-26 for GHSA-mh99-v99m-4gvg (brace-expansion DoS). That advisory covers
-        # `<=5.0.7`; the only patched release, 5.0.8, changed its CommonJS export from a bare
-        # function to `{ expand, ... }`, which breaks `minimatch@3.x` (`var expand =
-        # require('brace-expansion')` → `TypeError: expand is not a function`). minimatch@3 is
-        # required by eslint, @eslint/eslintrc, @eslint/config-array, @nestjs/cli and glob@7, and
-        # forcing minimatch to 10.x breaks glob@7 the same way. So NO override can resolve it —
-        # verified with `npm ls brace-expansion --omit=dev --all` returning empty (zero
-        # production exposure). Revisit once eslint/glob move off the vulnerable line, and drop
-        # this flag if the toolchain ever pulls a fixed brace-expansion on its own.
-        run: npm audit --audit-level=high --omit=dev
+        # Runs through audit-ci rather than bare `npm audit` so that documented, non-applicable
+        # transitive advisories can be allowlisted by id in .audit-ci.json without lowering the
+        # severity threshold for everything else. Matches easybook-app's audit gate convention.
+        run: npx audit-ci --config .audit-ci.json
+
 
   build-and-push:
     name: Build & push image to GHCR (SHA tag)
@@ -88,12 +78,35 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # What the running container will answer at GET /api/v1/system/version. Computed here rather
+      # than read from the environment inside the image: the container has no `.git`, and
+      # `npm_package_version` is unset because it starts `node dist/main.js`, not an npm script.
+      #
+      # `${GITHUB_SHA::7}` matches the width easybook-app stamps into its own bundle, so the two
+      # halves of the version screen are comparable by eye — which is the whole point of showing
+      # them side by side. `released_at` is the build moment in UTC; the endpoint hands it back
+      # untouched, and only the frontend decides how to render it.
+      - name: Derive the build stamp
+        id: stamp
+        run: |
+          {
+            echo "version=$(node -p "require('./package.json').version")"
+            echo "build=${GITHUB_SHA::7}"
+            echo "released_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build & push runtime image (app)
         uses: docker/build-push-action@v5
         with:
           context: .
           target: runtime
           push: true
+          # ⚠️ The app image only. The migrator is a one-shot `prisma migrate deploy` that serves
+          # no HTTP and answers no version endpoint — stamping it would only cost a cache miss.
+          build-args: |
+            APP_VERSION=${{ steps.stamp.outputs.version }}
+            APP_BUILD=${{ steps.stamp.outputs.build }}
+            APP_RELEASED_AT=${{ steps.stamp.outputs.released_at }}
           # Immutable commit-SHA tag only — never `latest`. The CD workflow deploys this exact
           # tag, so a redeploy is always reproducible and traceable to a commit.
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }}

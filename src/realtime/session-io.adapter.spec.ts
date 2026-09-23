@@ -4,6 +4,7 @@ import type { Server, Socket } from 'socket.io';
 import { DEFAULT_CORS_ORIGIN, resolveCorsOrigin } from '../config/cors';
 import {
   REALTIME_ADMIN_NAMESPACE,
+  REALTIME_CLIENT_NAMESPACE,
   REALTIME_ERRORS,
   REALTIME_NAMESPACE_ALLOWLIST,
 } from './realtime.constants';
@@ -232,7 +233,22 @@ describe('sealNamespaces (the fail-closed namespace allowlist)', () => {
     expect(admin.fns).toHaveLength(0);
   });
 
-  it('REALTIME_NAMESPACE_ALLOWLIST is exactly ["/admin"] — widening it must be a reviewed diff', () => {
-    expect(REALTIME_NAMESPACE_ALLOWLIST).toEqual([REALTIME_ADMIN_NAMESPACE]);
+  it('is a strict NO-OP for /client too — its own handshake is the gate, not this seal', () => {
+    const { io, of } = fakeIo();
+    sealNamespaces(io);
+
+    const client = of(REALTIME_CLIENT_NAMESPACE);
+
+    expect(client.fns).toHaveLength(0);
+  });
+
+  it('REALTIME_NAMESPACE_ALLOWLIST is exactly ["/admin", "/client"] — widening it must be a reviewed diff', () => {
+    // 🔴 THIS ASSERTION IS THE REVIEW GATE. `/client` was added by CLIENT-REALTIME-1 together with
+    // `ClientRealtimeGateway` and its LINE ID-token handshake; a name appearing here WITHOUT a
+    // gateway that installs its own handshake is an open, anonymous namespace.
+    expect(REALTIME_NAMESPACE_ALLOWLIST).toEqual([
+      REALTIME_ADMIN_NAMESPACE,
+      REALTIME_CLIENT_NAMESPACE,
+    ]);
   });
 });

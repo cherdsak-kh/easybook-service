@@ -44,14 +44,17 @@ import type { Actor } from './system-users.policy';
 const actorOf = (user: AuthenticatedSystemUser): Actor => ({
   id: user.id,
   role: user.role,
+  // `createdBy` is the resolved object; the policy wants the id. It is selected WITHOUT any filter
+  // (DD-4), so a soft-deleted creator still resolves and STAFF-CREATOR-1 still fires for them.
+  createdById: user.createdBy?.id ?? null,
 });
 
 /**
  * Back-office user management. Route prefix: `/api/v1/system-users`.
  *
  * `@Roles(...)` is the **coarse** gate. Target-dependent authorization ("an ADMIN may only patch
- * a STAFF", the three self-mutation rules) lives in `system-users.policy.ts` and runs inside the
- * service's write transaction. Guards run before pipes, so a STAFF caller sending a malformed body
+ * a VIEWER", the three self-mutation rules) lives in `system-users.policy.ts` and runs inside the
+ * service's write transaction. Guards run before pipes, so a VIEWER caller sending a malformed body
  * gets `403`, not `400` — that ordering is correct: authorization must never be decided after a
  * validation error has already told the caller something about the schema.
  *
@@ -107,12 +110,33 @@ export class SystemUsersController {
     return this.systemUsers.create(actorOf(actor), dto);
   }
 
+  /*
+   * ⚠️ VIEWER READS, AND THAT RETIRES HALF OF AC-45 (PO, 19 ส.ค. 2569).
+   *
+   * AC-45 read "VIEWER gets 403 on every /system-users route". The prototype's own role table for
+   * เจ้าหน้าที่ระบบ says the opposite for the two READ routes — เห็นรายชื่อ + รายละเอียด is ✅ for all
+   * three roles — and `use-acl.ts` in the app keeps that destination out of `VIEWER_DENY` on purpose
+   * ("a supervisor may see who holds an account"). With the guard as it was, that page answered 403
+   * for the one role it was designed to be readable by.
+   *
+   * The WRITE half of AC-45 is untouched and still tested: create, delete, restore and
+   * reset-password stay SUPER_ADMIN, PATCH stays SUPER_ADMIN|ADMIN, and `system-users.policy.ts`
+   * still decides per target inside the transaction.
+   *
+   * ⚠️ `status=deleted` DOES NOT WIDEN WITH THIS. It is gated separately in the service by
+   * `actorRole !== SUPER_ADMIN` (`findManyPaginated`), because `RolesGuard` runs before the pipe and
+   * cannot see the query — so a VIEWER asking for deleted rows is still a 403.
+   *
+   * ⚠️ WHAT IT COSTS: `GET /system-users/:id` no longer hides existence from a VIEWER — a real id
+   * answers 200 where an invented one answers 404. That is inherent in letting them read the
+   * directory, and the directory is the thing that lists those ids anyway.
+   */
   @Get()
-  @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN)
+  @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN, SystemRole.VIEWER)
   @ApiOperation({
     summary: 'List back-office users, paginated.',
     description:
-      'Soft-deleted rows are excluded from `data` and from `meta.total`. Ordered `createdAt DESC, id DESC`. A page beyond the last one is a 200 with an empty `data`, not a 404.',
+      'Search matches the first name, last name, email or phone number, case-insensitively. The phone match is on the number as stored and is therefore format-sensitive (`0812345678` does not match a stored `081-234-5678`). `role` and `status` narrow further; `status` is derived (`deleted` > `suspended` > `pending` > `active`), matching the badge the screen shows. Soft-deleted rows are excluded from `data` and from `meta.total` unless `status=deleted`, which is SUPER_ADMIN-only and is the only way to obtain the id a restore needs. Ordered `createdAt DESC, id DESC`. A page beyond the last one is a 200 with an empty `data`, not a 404.',
   })
   @ApiOkResponse({
     description: 'A page of users.',
@@ -123,7 +147,8 @@ export class SystemUsersController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF has no access to this collection.',
+    description:
+      '`status=deleted` asked by a non-SUPER_ADMIN. Every role may read the collection itself.',
     type: ErrorResponseDto,
   })
   @ApiServiceUnavailableResponse({
@@ -131,13 +156,17 @@ export class SystemUsersController {
     type: ErrorResponseDto,
   })
   list(
+    @CurrentUser() actor: AuthenticatedSystemUser,
     @Query() query: ListSystemUsersQueryDto,
   ): Promise<PaginatedSystemUsersResponseDto> {
-    return this.systemUsers.findManyPaginated(query);
+    // The role reaches the service because `status=deleted` is SUPER_ADMIN-only and `RolesGuard`
+    // runs before the pipe — it cannot see the query it would need to judge.
+    return this.systemUsers.findManyPaginated(query, actor.role);
   }
 
   @Get(':id')
-  @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN)
+  // Same widening as the collection above — see the note there.
+  @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN, SystemRole.VIEWER)
   @ApiOperation({
     summary: 'Read one back-office user.',
     description:
@@ -149,7 +178,7 @@ export class SystemUsersController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF has no access to this collection.',
+    description: 'VIEWER has no access to this collection.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
@@ -179,7 +208,7 @@ export class SystemUsersController {
   })
   @ApiForbiddenResponse({
     description:
-      'STAFF; CSRF failure; a self-mutation rule; or a policy denial.',
+      'VIEWER; CSRF failure; a self-mutation rule; or a policy denial.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({

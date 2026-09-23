@@ -7,9 +7,11 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { AppAccess, Prisma, SystemRole } from '@prisma/client';
+import { ConfigService } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import { RedisService } from '../redis/redis.service';
 import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
@@ -17,6 +19,7 @@ import { LineService } from './line.service';
 // Asserted against the shared constant, not a restated literal: these fixtures
 // silently went stale when the TYPE_1 artwork changed from 2500x843 to 2500x1686.
 import { RICH_MENU_SPECS } from './rich-menu.constants';
+import type { AdminActor } from './line-user.service';
 import {
   ACCESS_NOTIFICATION_MESSAGES,
   accessToRichMenuType,
@@ -76,6 +79,38 @@ const OWNER_REGISTRATION_ROW = {
   updatedAt: new Date('2026-07-14T10:00:00.000Z'),
 };
 
+/**
+ * The acting operator for the two admin write paths. The identity half is fixed and only the role
+ * varies, because every existing assertion in this file is about the ROLE — the id and name exist
+ * so the realtime event can name who acted (REALTIME-1).
+ */
+const ADMIN_ACTOR: AdminActor = {
+  id: 'op-1',
+  name: 'วีระ ทองดี',
+  role: SystemRole.ADMIN,
+};
+
+const LIFF_URL = 'https://liff.line.me/1234567890-abcdefgh';
+
+/**
+ * What a status push looks like now: ONE Flex card whose `altText` is the sentence the plain-text
+ * push used to be.
+ *
+ * ⚠️ THE ASSERTIONS BELOW MATCH ON `altText`, NOT ON THE BUBBLE. Those existing tests are about
+ * ROUTING — which copy goes out for which transition — and pinning the bubble's layout in every
+ * one of them would turn a padding change into thirty red tests while testing the routing no
+ * better. The bubble's own shape is covered once, in `access-card.spec.ts`.
+ */
+const cardWithAlt = (altText: string) => [
+  expect.objectContaining({ type: 'flex', altText }) as unknown,
+];
+
+const actorOf = (role: SystemRole): AdminActor => ({
+  id: 'op-1',
+  name: 'วีระ ทองดี',
+  role,
+});
+
 describe('LineUserService', () => {
   let service: LineUserService;
   const lineUser = {
@@ -99,6 +134,7 @@ describe('LineUserService', () => {
     findRichMenuId: jest.fn(),
     linkRichMenuToUser: jest.fn(),
     push: jest.fn(),
+    getProfile: jest.fn(),
   };
   // The gateway is a three-method mock, the same shape `LineService` already has. Its methods are
   // synchronous and `void` in production, so nothing here needs to resolve.
@@ -107,6 +143,9 @@ describe('LineUserService', () => {
     emitLineUserUpdated: jest.fn(),
     emitLineUserDeleted: jest.fn(),
   };
+  // Hoisted so the profile-sync tests can assert on the cooldown marker. `getJson` is re-armed as
+  // a permanent miss in `beforeEach` — see the note at the provider below.
+  const redis = { getJson: jest.fn(), setJson: jest.fn(), del: jest.fn() };
 
   // The push copy per target access, read from the service's own source of truth so these
   // assertions test ROUTING (which copy goes out for which transition), not the copy's spelling.
@@ -127,11 +166,15 @@ describe('LineUserService', () => {
     richMenuType: 'TYPE_1',
     access: AppAccess.PENDING,
     followedAt: new Date('2026-07-07T10:00:00.000Z'),
+    // No registration on this fixture, so no submission date — which is exactly the row the
+    // screen renders with a dash, and the row that must sort LAST in both date directions.
+    registeredAt: null,
     registration: null,
   };
 
   beforeEach(async () => {
     jest.clearAllMocks();
+    redis.getJson.mockResolvedValue(null);
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         LineUserService,
@@ -147,6 +190,15 @@ describe('LineUserService', () => {
         },
         { provide: LineService, useValue: line },
         { provide: RealtimeGateway, useValue: realtime },
+        // Permanent cache miss — see the note in `options.service.spec.ts`. A hit would let
+        // `getRegistrationOptions` skip Prisma and silently hollow out its assertions.
+        { provide: RedisService, useValue: redis },
+        // `LINE_LIFF_URL` — a real value so the status cards carry their footer button and the
+        // assertions below exercise the branch a configured deploy actually renders.
+        {
+          provide: ConfigService,
+          useValue: { get: jest.fn().mockReturnValue(LIFF_URL) },
+        },
       ],
     }).compile();
     service = module.get<LineUserService>(LineUserService);
@@ -207,7 +259,8 @@ describe('LineUserService', () => {
     await service.softDeleteByLineUserId('U123');
 
     expect(realtime.emitLineUserDeleted).toHaveBeenCalledTimes(1);
-    expect(realtime.emitLineUserDeleted).toHaveBeenCalledWith('lu-1');
+    // An unfollow has no operator — the person did it themselves, on LINE.
+    expect(realtime.emitLineUserDeleted).toHaveBeenCalledWith('lu-1', null);
   });
 
   it('unfollow of an absent/already-deleted row writes nothing and emits nothing', async () => {
@@ -367,12 +420,23 @@ describe('LineUserService', () => {
 
       expect(tx.lineUserRegistration.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: { lineUserId: 'lu-1', ...VALID_DTO },
+          // `phoneDigits` is NOT in the DTO — it is derived on write, so it is the one field
+          // a spread of the caller's payload can never account for. Asserted by value.
+          data: {
+            lineUserId: 'lu-1',
+            ...VALID_DTO,
+            phoneDigits: '0812345678',
+          },
         }),
       );
       expect(tx.lineUser.update).toHaveBeenCalledWith({
         where: { id: 'lu-1' },
-        data: { access: AppAccess.PENDING },
+        // The submission date is stamped in the SAME transaction as the registration row, from the
+        // row's own createdAt — so "has a registration" and "has a date" cannot disagree.
+        data: {
+          access: AppAccess.PENDING,
+          registeredAt: OWNER_REGISTRATION_ROW.createdAt,
+        },
         select: { access: true },
       });
       expect(result.access).toBe(AppAccess.PENDING);
@@ -387,9 +451,7 @@ describe('LineUserService', () => {
       });
       // Best-effort "registration received" push (PENDING copy) to the caller's U… id (the arg),
       // not the cuid. Reuses the single PENDING source, so it can't drift from updateAccess.
-      expect(line.push).toHaveBeenCalledWith('U123', [
-        { type: 'text', text: PENDING_MSG },
-      ]);
+      expect(line.push).toHaveBeenCalledWith('U123', cardWithAlt(PENDING_MSG));
     });
 
     it('rejects a deleted/unknown departmentId with 400 (SC-B6), writing nothing', async () => {
@@ -565,6 +627,7 @@ describe('LineUserService', () => {
             firstName: 'Somchai',
             lastName: 'Jaidee',
             phone: '081-234-5678',
+            phoneDigits: '0812345678',
             departmentId: 1,
             personnelRoleId: 2,
           },
@@ -608,9 +671,7 @@ describe('LineUserService', () => {
       expect(result.access).toBe(AppAccess.PENDING);
       expect(result.rejectionReason).toBeNull();
       // The existing PENDING ack is pushed to the caller's verified U… id (not the cuid).
-      expect(line.push).toHaveBeenCalledWith('U123', [
-        { type: 'text', text: PENDING_MSG },
-      ]);
+      expect(line.push).toHaveBeenCalledWith('U123', cardWithAlt(PENDING_MSG));
     });
 
     it('a REJECTED resubmit is fail-soft: still 200/PENDING when the PENDING ack push rejects (AC-7/AC-6)', async () => {
@@ -798,7 +859,13 @@ describe('LineUserService', () => {
       expect(lineUser.findMany).toHaveBeenCalledWith({
         where: { deletedAt: null },
         select: LINE_USER_PUBLIC_FIELDS,
-        orderBy: [{ followedAt: 'desc' }, { id: 'desc' }],
+        // Default sort = newest registration first, with the registration-less rows LAST.
+        // `nulls: 'last'` is the whole reason `registeredAt` is a scalar here: Postgres would
+        // otherwise put NULLs FIRST on DESC and float every unregistered follower above the queue.
+        orderBy: [
+          { registeredAt: { sort: 'desc', nulls: 'last' } },
+          { id: 'desc' },
+        ],
         skip: 20,
         take: 20,
       });
@@ -814,6 +881,7 @@ describe('LineUserService', () => {
         richMenuType: 'TYPE_1',
         access: AppAccess.PENDING,
         followedAt: '2026-07-07T10:00:00.000Z',
+        registeredAt: null,
         registration: null,
       });
       expect(result.meta).toEqual({
@@ -838,6 +906,7 @@ describe('LineUserService', () => {
               personnelRoleId: 2,
               department: { name: 'Computer Science' },
               personnelRole: { name: 'Teacher' },
+              createdAt: new Date('2026-07-09T04:30:00.000Z'),
             },
           },
         ],
@@ -867,17 +936,92 @@ describe('LineUserService', () => {
       });
     });
 
-    it('adds a case-insensitive displayName contains when search is a non-empty trimmed string (AC-B4)', async () => {
+    it('searches ALL five screen fields, case-insensitively, on a trimmed term (AC-B4/LU-SEARCH-1)', async () => {
       $transaction.mockResolvedValue([[], 0]);
 
       await service.findManyPaginated({ page: 1, limit: 20, search: '  ali ' });
 
+      const like = { contains: 'ali', mode: 'insensitive' };
       expect(lineUser.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: {
             deletedAt: null,
-            displayName: { contains: 'ali', mode: 'insensitive' },
+            // The screen's placeholder names five fields; a box that reads fewer answers
+            // "not found" for a record the operator can see.
+            OR: [
+              { displayName: like },
+              { registration: { firstName: like } },
+              { registration: { lastName: like } },
+              { registration: { phone: like } },
+              { registration: { personnelRole: { name: like } } },
+              { registration: { department: { name: like } } },
+            ],
           },
+        }),
+      );
+    });
+
+    it('a term of >= 3 digits ALSO matches the separator-free phone (LU-SEARCH-1)', async () => {
+      $transaction.mockResolvedValue([[], 0]);
+
+      await service.findManyPaginated({
+        page: 1,
+        limit: 20,
+        search: '081-234',
+      });
+
+      const [[args]] = lineUser.findMany.mock.calls as [
+        [{ where: { OR: Record<string, any>[] } }],
+      ];
+      expect(args.where.OR).toContainEqual({
+        registration: { phoneDigits: { contains: '081234' } },
+      });
+    });
+
+    it('a term of < 3 digits does NOT add the phoneDigits clause', async () => {
+      $transaction.mockResolvedValue([[], 0]);
+
+      // "08" matches nearly every Thai mobile number and would bury the fields the operator meant.
+      await service.findManyPaginated({ page: 1, limit: 20, search: '08' });
+
+      const [[args]] = lineUser.findMany.mock.calls as [
+        [{ where: { OR: Record<string, any>[] } }],
+      ];
+      expect(JSON.stringify(args.where.OR)).not.toContain('phoneDigits');
+    });
+
+    it.each([
+      ['old', { registeredAt: { sort: 'asc', nulls: 'last' } }],
+      ['new', { registeredAt: { sort: 'desc', nulls: 'last' } }],
+    ])(
+      'sort=%s orders by the registration date with the dateless rows LAST',
+      async (sort, first) => {
+        $transaction.mockResolvedValue([[], 0]);
+
+        await service.findManyPaginated({
+          page: 1,
+          limit: 20,
+          sort: sort as 'new' | 'old',
+        });
+
+        expect(lineUser.findMany).toHaveBeenCalledWith(
+          expect.objectContaining({ orderBy: [first, { id: 'desc' }] }),
+        );
+      },
+    );
+
+    it('sort=name orders by the REGISTERED name, not the LINE display name', async () => {
+      $transaction.mockResolvedValue([[], 0]);
+
+      await service.findManyPaginated({ page: 1, limit: 20, sort: 'name' });
+
+      expect(lineUser.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: [
+            { registration: { lastName: 'asc' } },
+            { registration: { firstName: 'asc' } },
+            { id: 'asc' },
+          ],
         }),
       );
     });
@@ -952,7 +1096,7 @@ describe('LineUserService', () => {
       const result = await service.updateAccess(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
       );
 
       expect(lineUser.findUnique).toHaveBeenCalledWith({
@@ -966,6 +1110,7 @@ describe('LineUserService', () => {
           access: AppAccess.ALLOWED,
           richMenuType: 'TYPE_2',
           rejectionReason: null,
+          blockReason: null,
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
@@ -974,9 +1119,7 @@ describe('LineUserService', () => {
       expect(result.access).toBe(AppAccess.ALLOWED);
       expect(result.richMenuType).toBe('TYPE_2');
       // Pushes the exact ALLOWED copy to the LINE-side U… id (not the cuid).
-      expect(line.push).toHaveBeenCalledWith('U123', [
-        { type: 'text', text: ALLOWED_MSG },
-      ]);
+      expect(line.push).toHaveBeenCalledWith('U123', cardWithAlt(ALLOWED_MSG));
     });
 
     it('Block writes richMenuType TYPE_1 and applies the TYPE_1 menu on LINE (AC-B8)', async () => {
@@ -988,7 +1131,11 @@ describe('LineUserService', () => {
       });
       line.findRichMenuId.mockResolvedValue('rm-type1');
 
-      await service.updateAccess('lu-1', AppAccess.BLOCKED, SystemRole.ADMIN);
+      await service.updateAccess(
+        'lu-1',
+        AppAccess.BLOCKED,
+        actorOf(SystemRole.ADMIN),
+      );
 
       expect(lineUser.update).toHaveBeenCalledWith({
         where: { id: 'lu-1' },
@@ -996,15 +1143,14 @@ describe('LineUserService', () => {
           access: AppAccess.BLOCKED,
           richMenuType: 'TYPE_1',
           rejectionReason: null,
+          blockReason: null,
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
       expect(line.findRichMenuId).toHaveBeenCalledWith(RICH_MENU_SPECS.TYPE_1);
       expect(line.linkRichMenuToUser).toHaveBeenCalledWith('U123', 'rm-type1');
       // Pushes the exact BLOCKED copy to the LINE-side U… id.
-      expect(line.push).toHaveBeenCalledWith('U123', [
-        { type: 'text', text: BLOCKED_MSG },
-      ]);
+      expect(line.push).toHaveBeenCalledWith('U123', cardWithAlt(BLOCKED_MSG));
     });
 
     it('PENDING pushes the exact PENDING copy to the LINE-side U… id (SUPER_ADMIN forcing PENDING)', async () => {
@@ -1019,12 +1165,10 @@ describe('LineUserService', () => {
       await service.updateAccess(
         'lu-1',
         AppAccess.PENDING,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
 
-      expect(line.push).toHaveBeenCalledWith('U123', [
-        { type: 'text', text: PENDING_MSG },
-      ]);
+      expect(line.push).toHaveBeenCalledWith('U123', cardWithAlt(PENDING_MSG));
     });
 
     it('UNREGISTERED sends NO push (SUPER_ADMIN forcing UNREGISTERED)', async () => {
@@ -1039,7 +1183,7 @@ describe('LineUserService', () => {
       await service.updateAccess(
         'lu-1',
         AppAccess.UNREGISTERED,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
 
       expect(line.push).not.toHaveBeenCalled();
@@ -1063,7 +1207,7 @@ describe('LineUserService', () => {
       const result = await service.updateAccess(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
       );
 
       expect(result.access).toBe(AppAccess.ALLOWED);
@@ -1085,7 +1229,11 @@ describe('LineUserService', () => {
       line.linkRichMenuToUser.mockRejectedValue(new Error('LINE 500'));
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.ALLOWED,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).rejects.toBeInstanceOf(BadGatewayException);
       // The DB write happened BEFORE the failing LINE call — source of truth is correct.
       expect(lineUser.update).toHaveBeenCalledWith({
@@ -1094,6 +1242,7 @@ describe('LineUserService', () => {
           access: AppAccess.ALLOWED,
           richMenuType: 'TYPE_2',
           rejectionReason: null,
+          blockReason: null,
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
@@ -1114,12 +1263,16 @@ describe('LineUserService', () => {
         .mockResolvedValueOnce(undefined);
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.ALLOWED,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).rejects.toBeInstanceOf(BadGatewayException);
       const retry = await service.updateAccess(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
       );
       expect(retry.access).toBe(AppAccess.ALLOWED);
       expect(retry.richMenuType).toBe('TYPE_2');
@@ -1130,7 +1283,7 @@ describe('LineUserService', () => {
 
       for (const role of [SystemRole.ADMIN, SystemRole.SUPER_ADMIN]) {
         await expect(
-          service.updateAccess('gone', AppAccess.ALLOWED, role),
+          service.updateAccess('gone', AppAccess.ALLOWED, actorOf(role)),
         ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
       }
       expect(lineUser.update).not.toHaveBeenCalled();
@@ -1160,7 +1313,11 @@ describe('LineUserService', () => {
         });
         line.findRichMenuId.mockResolvedValue('rm-x');
 
-        const result = await service.updateAccess('lu-1', to, SystemRole.ADMIN);
+        const result = await service.updateAccess(
+          'lu-1',
+          to,
+          actorOf(SystemRole.ADMIN),
+        );
 
         expect(result.access).toBe(to);
         expect(lineUser.update).toHaveBeenCalledWith({
@@ -1169,6 +1326,7 @@ describe('LineUserService', () => {
             access: to,
             richMenuType: accessToRichMenuType(to),
             rejectionReason: null,
+            blockReason: null,
           },
           select: LINE_USER_PUBLIC_FIELDS,
         });
@@ -1196,7 +1354,7 @@ describe('LineUserService', () => {
         primeRead(from);
 
         await expect(
-          service.updateAccess('lu-1', to, SystemRole.ADMIN),
+          service.updateAccess('lu-1', to, actorOf(SystemRole.ADMIN)),
         ).rejects.toBeInstanceOf(ForbiddenException);
         expect(lineUser.update).not.toHaveBeenCalled();
         expect(line.findRichMenuId).not.toHaveBeenCalled();
@@ -1208,7 +1366,11 @@ describe('LineUserService', () => {
     it('AC-3.2 — the 403 carries the forbidden-transition message', async () => {
       primeRead(AppAccess.ALLOWED);
       await expect(
-        service.updateAccess('lu-1', AppAccess.PENDING, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.PENDING,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).rejects.toThrow(
         new ForbiddenException(LINE_USER_ACCESS_TRANSITION_FORBIDDEN),
       );
@@ -1237,7 +1399,7 @@ describe('LineUserService', () => {
         const result = await service.updateAccess(
           'lu-1',
           to,
-          SystemRole.SUPER_ADMIN,
+          actorOf(SystemRole.SUPER_ADMIN),
         );
 
         expect(result.access).toBe(to);
@@ -1253,7 +1415,11 @@ describe('LineUserService', () => {
       primeRead(AppAccess.PENDING, new Date());
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.PENDING, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.PENDING,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
       expect(lineUser.update).not.toHaveBeenCalled();
       expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
@@ -1263,7 +1429,11 @@ describe('LineUserService', () => {
       primeRead(AppAccess.PENDING, new Date());
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.ALLOWED,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
       expect(lineUser.update).not.toHaveBeenCalled();
     });
@@ -1281,7 +1451,7 @@ describe('LineUserService', () => {
       const result = await service.updateAccess(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
 
       // DB persisted with the derived rich menu (source of truth), no LINE side-effects, no 502/500.
@@ -1291,6 +1461,7 @@ describe('LineUserService', () => {
           access: AppAccess.ALLOWED,
           richMenuType: 'TYPE_2',
           rejectionReason: null,
+          blockReason: null,
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
@@ -1312,12 +1483,12 @@ describe('LineUserService', () => {
       const first = await service.updateAccess(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
       const second = await service.updateAccess(
         'lu-1',
         AppAccess.ALLOWED,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
 
       expect(first.access).toBe(AppAccess.ALLOWED);
@@ -1325,6 +1496,110 @@ describe('LineUserService', () => {
       expect(line.linkRichMenuToUser).not.toHaveBeenCalled();
       expect(line.push).not.toHaveBeenCalled();
     });
+
+    // ───────── Block note (→BLOCKED, OPTIONAL reason → `blockReason`), 19 ส.ค. 2569 ─────────
+    //
+    // The mirror of the reject reason in storage and its opposite in enforcement: optional, never
+    // pushed, back-office only. These four cases pin exactly that asymmetry, because the cheap
+    // mistake here is to "tidy" the two branches into one guarded field and start 400-ing a block.
+
+    it('a Block carrying a reason persists it as blockReason and leaves rejectionReason null', async () => {
+      primeRead(AppAccess.ALLOWED);
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.BLOCKED,
+        richMenuType: 'TYPE_1',
+        blockReason: 'ใช้บัญชีผิดคน',
+      });
+      line.findRichMenuId.mockResolvedValue('rm-type1');
+
+      const result = await service.updateAccess(
+        'lu-1',
+        AppAccess.BLOCKED,
+        actorOf(SystemRole.ADMIN),
+        'ใช้บัญชีผิดคน',
+      );
+
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        data: {
+          access: AppAccess.BLOCKED,
+          richMenuType: 'TYPE_1',
+          rejectionReason: null,
+          blockReason: 'ใช้บัญชีผิดคน',
+        },
+        select: LINE_USER_PUBLIC_FIELDS,
+      });
+      expect(result.blockReason).toBe('ใช้บัญชีผิดคน');
+      // ⚠️ The note is INTERNAL. The blocked user gets the ordinary BLOCKED copy and never the text.
+      expect(line.push).toHaveBeenCalledTimes(1);
+      const pushed = (
+        line.push.mock.calls[0] as [string, { altText: string }[]]
+      )[1][0].altText;
+      expect(pushed).toBe(BLOCKED_MSG);
+      expect(pushed).not.toContain('ใช้บัญชีผิดคน');
+    });
+
+    it('a Block with NO reason still succeeds — unlike a Reject, it is not required', async () => {
+      primeRead(AppAccess.ALLOWED);
+      lineUser.update.mockResolvedValue({
+        ...publicRow,
+        access: AppAccess.BLOCKED,
+        richMenuType: 'TYPE_1',
+      });
+      line.findRichMenuId.mockResolvedValue('rm-type1');
+
+      const result = await service.updateAccess(
+        'lu-1',
+        AppAccess.BLOCKED,
+        actorOf(SystemRole.ADMIN),
+      );
+
+      expect(result.access).toBe(AppAccess.BLOCKED);
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        data: {
+          access: AppAccess.BLOCKED,
+          richMenuType: 'TYPE_1',
+          rejectionReason: null,
+          blockReason: null,
+        },
+        select: LINE_USER_PUBLIC_FIELDS,
+      });
+    });
+
+    it.each([AppAccess.ALLOWED, AppAccess.REJECTED])(
+      'leaving BLOCKED (→%s) clears blockReason — the note describes the block in force, not a history',
+      async (to) => {
+        primeRead(AppAccess.BLOCKED);
+        lineUser.update.mockResolvedValue({
+          ...publicRow,
+          access: to,
+          richMenuType: accessToRichMenuType(to),
+        });
+        line.findRichMenuId.mockResolvedValue('rm-x');
+
+        await service.updateAccess(
+          'lu-1',
+          to,
+          actorOf(SystemRole.ADMIN),
+          // A →REJECTED needs one; a →ALLOWED ignores it. Either way `blockReason` must go to null.
+          'ทบทวนแล้ว',
+        );
+
+        expect(lineUser.update).toHaveBeenCalledWith({
+          where: { id: 'lu-1' },
+          data: {
+            access: to,
+            richMenuType: accessToRichMenuType(to),
+            // The same string lands in the OTHER column on a →REJECTED, and nowhere on a →ALLOWED.
+            rejectionReason: to === AppAccess.REJECTED ? 'ทบทวนแล้ว' : null,
+            blockReason: null,
+          },
+          select: LINE_USER_PUBLIC_FIELDS,
+        });
+      },
+    );
 
     // ───────── Reject (→REJECTED, mandatory reason) — design §4, AC4/AC5/AC6 ─────────
 
@@ -1340,7 +1615,7 @@ describe('LineUserService', () => {
       const result = await service.updateAccess(
         'lu-1',
         AppAccess.REJECTED,
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
         'phone is wrong',
       );
 
@@ -1351,18 +1626,20 @@ describe('LineUserService', () => {
           access: AppAccess.REJECTED,
           richMenuType: 'TYPE_1',
           rejectionReason: 'phone is wrong',
+          blockReason: null,
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
       expect(result.access).toBe(AppAccess.REJECTED);
       // Exactly ONE push, using the reject template — NOT the PENDING copy.
       expect(line.push).toHaveBeenCalledTimes(1);
-      expect(line.push).toHaveBeenCalledWith('U123', [
-        { type: 'text', text: rejectMsg('phone is wrong') },
-      ]);
+      expect(line.push).toHaveBeenCalledWith(
+        'U123',
+        cardWithAlt(rejectMsg('phone is wrong')),
+      );
       const pushed = (
-        line.push.mock.calls[0] as [string, { text: string }[]]
-      )[1][0].text;
+        line.push.mock.calls[0] as [string, { altText: string }[]]
+      )[1][0].altText;
       // Copy-agnostic on purpose: assert the admin's REASON is interpolated into whatever the
       // template currently says, rather than pinning a Thai fragment of the template itself. The
       // service still has to run to produce `pushed`, so this keeps asserting that a Reject routes
@@ -1384,7 +1661,7 @@ describe('LineUserService', () => {
           service.updateAccess(
             'lu-1',
             AppAccess.REJECTED,
-            SystemRole.ADMIN,
+            actorOf(SystemRole.ADMIN),
             reason,
           ),
         ).rejects.toThrow(new BadRequestException(REJECTION_REASON_REQUIRED));
@@ -1400,7 +1677,7 @@ describe('LineUserService', () => {
         service.updateAccess(
           'lu-1',
           AppAccess.REJECTED,
-          SystemRole.ADMIN,
+          actorOf(SystemRole.ADMIN),
           'whatever',
         ),
       ).rejects.toThrow(
@@ -1417,7 +1694,7 @@ describe('LineUserService', () => {
         service.updateAccess(
           'lu-1',
           AppAccess.REJECTED,
-          SystemRole.SUPER_ADMIN,
+          actorOf(SystemRole.SUPER_ADMIN),
           'whatever',
         ),
       ).rejects.toThrow(new BadRequestException(CANNOT_REJECT_UNREGISTERED));
@@ -1437,7 +1714,7 @@ describe('LineUserService', () => {
         });
         line.findRichMenuId.mockResolvedValue('rm-x');
 
-        await service.updateAccess('lu-1', to, SystemRole.ADMIN);
+        await service.updateAccess('lu-1', to, actorOf(SystemRole.ADMIN));
 
         // The write clears the prior rejection — the invariant's non-REJECTED branch.
         expect(lineUser.update).toHaveBeenCalledWith({
@@ -1446,14 +1723,13 @@ describe('LineUserService', () => {
             access: to,
             richMenuType: accessToRichMenuType(to),
             rejectionReason: null,
+            blockReason: null,
           },
           select: LINE_USER_PUBLIC_FIELDS,
         });
         // The existing ALLOWED/BLOCKED copy is used (NOT the reject copy).
         const expected = to === AppAccess.ALLOWED ? ALLOWED_MSG : BLOCKED_MSG;
-        expect(line.push).toHaveBeenCalledWith('U123', [
-          { type: 'text', text: expected },
-        ]);
+        expect(line.push).toHaveBeenCalledWith('U123', cardWithAlt(expected));
       },
     );
 
@@ -1473,7 +1749,7 @@ describe('LineUserService', () => {
       const result = await service.updateAccess(
         'lu-1',
         AppAccess.REJECTED,
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
         'incomplete documents',
       );
 
@@ -1493,7 +1769,7 @@ describe('LineUserService', () => {
       const result = await service.updateAccess(
         'lu-1',
         AppAccess.REJECTED,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
         'account under review',
       );
 
@@ -1504,6 +1780,7 @@ describe('LineUserService', () => {
           access: AppAccess.REJECTED,
           richMenuType: 'TYPE_1',
           rejectionReason: 'account under review',
+          blockReason: null,
         },
         select: LINE_USER_PUBLIC_FIELDS,
       });
@@ -1555,6 +1832,7 @@ describe('LineUserService', () => {
         personnelRoleId: 4,
         department: { name: 'New Dept' },
         personnelRole: { name: 'New Role' },
+        createdAt: new Date('2026-07-09T04:30:00.000Z'),
       },
     };
 
@@ -1588,7 +1866,7 @@ describe('LineUserService', () => {
         const result = await service.updateRegistrationByAdmin(
           'lu-1',
           ADMIN_EDIT_DTO,
-          role,
+          actorOf(role),
         );
 
         // `access` is NOT selected on the existence read — the edit is not PENDING-gated (AC-B10).
@@ -1603,6 +1881,7 @@ describe('LineUserService', () => {
             firstName: 'Edited',
             lastName: 'Name',
             phone: '099-999-9999',
+            phoneDigits: '0999999999',
             departmentId: 3,
             personnelRoleId: 4,
           },
@@ -1624,7 +1903,7 @@ describe('LineUserService', () => {
       await service.updateRegistrationByAdmin(
         'lu-1',
         ADMIN_EDIT_DTO,
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
       );
 
       // Orthogonal to Item 3: `access`/`richMenuType` are never written and no LINE call fires.
@@ -1639,7 +1918,7 @@ describe('LineUserService', () => {
       await service.updateRegistrationByAdmin(
         'lu-1',
         ADMIN_EDIT_DTO,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
       const firstSelect = (
         lineUser.findUnique.mock.calls[0] as [
@@ -1668,7 +1947,11 @@ describe('LineUserService', () => {
         );
 
         await expect(
-          service.updateRegistrationByAdmin('lu-1', ADMIN_EDIT_DTO, role),
+          service.updateRegistrationByAdmin(
+            'lu-1',
+            ADMIN_EDIT_DTO,
+            actorOf(role),
+          ),
         ).rejects.toThrow(new BadRequestException(INVALID_DEPARTMENT));
         // The role-blind guard hardcodes isSystemReserved: false — SUPER_ADMIN gets no carve-out here.
         expect(tx.department.findFirst).toHaveBeenCalledWith({
@@ -1697,7 +1980,11 @@ describe('LineUserService', () => {
         );
 
         await expect(
-          service.updateRegistrationByAdmin('lu-1', ADMIN_EDIT_DTO, role),
+          service.updateRegistrationByAdmin(
+            'lu-1',
+            ADMIN_EDIT_DTO,
+            actorOf(role),
+          ),
         ).rejects.toThrow(new BadRequestException(INVALID_PERSONNEL_ROLE));
         expect(tx.personnelRole.findFirst).toHaveBeenCalledWith({
           where: { id: 4, deletedAt: null, isSystemReserved: false },
@@ -1726,7 +2013,7 @@ describe('LineUserService', () => {
         service.updateRegistrationByAdmin(
           'lu-1',
           ADMIN_EDIT_DTO,
-          SystemRole.ADMIN,
+          actorOf(SystemRole.ADMIN),
         ),
       ).rejects.toThrow(new BadRequestException(INVALID_DEPARTMENT));
       expect(tx.lineUserRegistration.update).not.toHaveBeenCalled();
@@ -1743,7 +2030,7 @@ describe('LineUserService', () => {
         service.updateRegistrationByAdmin(
           'lu-1',
           ADMIN_EDIT_DTO,
-          SystemRole.ADMIN,
+          actorOf(SystemRole.ADMIN),
         ),
       ).rejects.toThrow(
         new NotFoundException(LINE_USER_REGISTRATION_NOT_FOUND),
@@ -1756,7 +2043,11 @@ describe('LineUserService', () => {
         jest.clearAllMocks();
         lineUser.findUnique.mockResolvedValueOnce(null);
         await expect(
-          service.updateRegistrationByAdmin('gone', ADMIN_EDIT_DTO, role),
+          service.updateRegistrationByAdmin(
+            'gone',
+            ADMIN_EDIT_DTO,
+            actorOf(role),
+          ),
         ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
         expect(lineUserRegistration.findFirst).not.toHaveBeenCalled();
       }
@@ -1772,7 +2063,7 @@ describe('LineUserService', () => {
         service.updateRegistrationByAdmin(
           'lu-1',
           ADMIN_EDIT_DTO,
-          SystemRole.ADMIN,
+          actorOf(SystemRole.ADMIN),
         ),
       ).rejects.toThrow(new NotFoundException(LINE_USER_NOT_FOUND));
       // 404 wins before the registration gate — never leaks that the row exists but is deleted.
@@ -1786,7 +2077,7 @@ describe('LineUserService', () => {
       const result = await service.updateRegistrationByAdmin(
         'lu-1',
         ADMIN_EDIT_DTO,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
 
       expect(tx.lineUserRegistration.update).toHaveBeenCalled();
@@ -1810,6 +2101,7 @@ describe('LineUserService', () => {
       richMenuType: 'TYPE_1',
       access: AppAccess.PENDING,
       followedAt: '2026-07-07T10:00:00.000Z',
+      registeredAt: null,
       registration: null,
     };
 
@@ -1827,7 +2119,11 @@ describe('LineUserService', () => {
       line.findRichMenuId.mockResolvedValue('rm-type2');
       lineUser.findFirst.mockResolvedValue(publicRow);
 
-      await service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN);
+      await service.updateAccess(
+        'lu-1',
+        AppAccess.ALLOWED,
+        actorOf(SystemRole.ADMIN),
+      );
 
       expect(lineUser.findFirst).toHaveBeenCalledWith({
         where: { id: 'lu-1', deletedAt: null },
@@ -1849,10 +2145,20 @@ describe('LineUserService', () => {
       line.findRichMenuId.mockResolvedValue('rm-type2');
       lineUser.findFirst.mockResolvedValue(publicRow);
 
-      await service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN);
+      await service.updateAccess(
+        'lu-1',
+        AppAccess.ALLOWED,
+        actorOf(SystemRole.ADMIN),
+      );
 
       expect(realtime.emitLineUserUpdated).toHaveBeenCalledTimes(1);
-      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(expectedDto);
+      // The operator who approved, so the screen can name them instead of saying "someone" —
+      // and ONLY id + name. `AdminActor` also carries `role`, which a structural type does not
+      // strip at runtime; this exact assertion is what keeps it off the wire.
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(expectedDto, {
+        id: ADMIN_ACTOR.id,
+        name: ADMIN_ACTOR.name,
+      });
       expect(realtime.emitLineUserCreated).not.toHaveBeenCalled();
       // Ordering: rich menu -> emit -> push. Broadcasting before the menu applied would advertise a
       // state we might still 502 on; emitting after the push would put LINE's latency on the socket.
@@ -1877,7 +2183,11 @@ describe('LineUserService', () => {
       line.findRichMenuId.mockResolvedValue(null); // menu missing on LINE -> 502
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.ALLOWED,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).rejects.toThrow(BadGatewayException);
 
       expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
@@ -1918,7 +2228,7 @@ describe('LineUserService', () => {
         prime();
 
         await expect(
-          service.updateAccess('lu-1', target, role),
+          service.updateAccess('lu-1', target, actorOf(role)),
         ).rejects.toThrow();
 
         expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
@@ -1943,7 +2253,7 @@ describe('LineUserService', () => {
       await service.updateAccess(
         'lu-1',
         AppAccess.BLOCKED,
-        SystemRole.SUPER_ADMIN,
+        actorOf(SystemRole.SUPER_ADMIN),
       );
 
       expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
@@ -1957,7 +2267,11 @@ describe('LineUserService', () => {
       await service.upsertOnFollow({ lineUserId: 'U123' });
 
       expect(realtime.emitLineUserCreated).toHaveBeenCalledTimes(1);
-      expect(realtime.emitLineUserCreated).toHaveBeenCalledWith(expectedDto);
+      // A follow has no operator.
+      expect(realtime.emitLineUserCreated).toHaveBeenCalledWith(
+        expectedDto,
+        null,
+      );
     });
 
     it('B11 — register() emits CREATED when the transaction created the LineUser row', async () => {
@@ -2018,7 +2332,11 @@ describe('LineUserService', () => {
       await service.updateRegistration('U123', { ...VALID_DTO });
 
       expect(realtime.emitLineUserUpdated).toHaveBeenCalledTimes(1);
-      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(expectedDto);
+      // The LINE user edited their own registration — no operator.
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(
+        expectedDto,
+        null,
+      );
     });
 
     it('B9 — the admin registration edit emits ONE lineUser.updated', async () => {
@@ -2046,7 +2364,7 @@ describe('LineUserService', () => {
           departmentId: 3,
           personnelRoleId: 4,
         },
-        SystemRole.ADMIN,
+        actorOf(SystemRole.ADMIN),
       );
 
       expect(realtime.emitLineUserUpdated).toHaveBeenCalledTimes(1);
@@ -2071,7 +2389,11 @@ describe('LineUserService', () => {
 
       // The write already committed — the mutation must still succeed.
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.ALLOWED,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).resolves.toMatchObject({ id: 'lu-1' });
 
       expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
@@ -2104,8 +2426,145 @@ describe('LineUserService', () => {
       lineUser.findFirst.mockResolvedValue(publicRow);
 
       await expect(
-        service.updateAccess('lu-1', AppAccess.ALLOWED, SystemRole.ADMIN),
+        service.updateAccess(
+          'lu-1',
+          AppAccess.ALLOWED,
+          actorOf(SystemRole.ADMIN),
+        ),
       ).resolves.toMatchObject({ id: 'lu-1' });
+    });
+  });
+
+  /**
+   * LINE fires no event when somebody renames themselves or changes their photo, so the two places
+   * we can notice are (a) their ID token on a LIFF call and (b) a `getProfile` while they are
+   * chatting. These cover both, and the three ways the sync must NOT fire.
+   */
+  describe('profile sync', () => {
+    const stored = {
+      id: 'lu-1',
+      lineUserId: 'U123',
+      displayName: 'Alice',
+      pictureUrl: 'https://line/old.jpg',
+    } as unknown as Parameters<LineUserService['syncProfile']>[0];
+
+    it('writes only the fields that actually changed, and emits `updated`', async () => {
+      lineUser.update.mockResolvedValue({ ...stored, displayName: 'Alicia' });
+      lineUser.findFirst.mockResolvedValue(publicRow);
+
+      await service.syncProfile(stored, {
+        displayName: 'Alicia',
+        pictureUrl: 'https://line/old.jpg', // unchanged — must not appear in `data`
+      });
+
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        data: { displayName: 'Alicia' },
+      });
+      // No operator: the LINE user did this to themselves.
+      expect(realtime.emitLineUserUpdated).toHaveBeenCalledWith(
+        expect.anything(),
+        null,
+      );
+    });
+
+    it('does nothing at all when the profile is identical', async () => {
+      const same = await service.syncProfile(stored, {
+        displayName: 'Alice',
+        pictureUrl: 'https://line/old.jpg',
+      });
+
+      // ⚠️ The whole reason the comparison exists: without it every LIFF open would write a row
+      // and push a `lineUser.updated` down the admin socket for a rename that never happened.
+      expect(lineUser.update).not.toHaveBeenCalled();
+      expect(realtime.emitLineUserUpdated).not.toHaveBeenCalled();
+      expect(same).toBe(stored);
+    });
+
+    it('treats a missing claim as "no news", never as "cleared"', async () => {
+      // A LIFF app without the `profile` scope verifies fine and carries neither claim. Writing
+      // `null` here would silently wipe a good display name with no event to trace it to.
+      await service.syncProfile(stored, {});
+      await service.syncProfile(stored, { displayName: '' });
+
+      expect(lineUser.update).not.toHaveBeenCalled();
+    });
+
+    it('backfills a row that was created bare by a LIFF-first user', async () => {
+      const bare = {
+        id: 'lu-2',
+        lineUserId: 'U999',
+        displayName: null,
+        pictureUrl: null,
+      } as unknown as Parameters<LineUserService['syncProfile']>[0];
+      lineUser.update.mockResolvedValue({ ...bare, displayName: 'Bob' });
+      lineUser.findFirst.mockResolvedValue(publicRow);
+
+      await service.syncProfile(bare, {
+        displayName: 'Bob',
+        pictureUrl: 'https://line/bob.jpg',
+      });
+
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-2' },
+        data: { displayName: 'Bob', pictureUrl: 'https://line/bob.jpg' },
+      });
+    });
+
+    it('refreshes from LINE on a webhook, marking the cooldown BEFORE the fetch', async () => {
+      lineUser.findFirst.mockResolvedValueOnce(stored);
+      line.getProfile.mockResolvedValue({
+        displayName: 'Alicia',
+        pictureUrl: 'https://line/new.jpg',
+      });
+      lineUser.update.mockResolvedValue({ ...stored, displayName: 'Alicia' });
+      lineUser.findFirst.mockResolvedValue(publicRow); // the publish() re-read
+
+      await service.refreshProfileFromLine('U123');
+
+      expect(redis.setJson).toHaveBeenCalledWith(
+        'line:profile-sync:U123',
+        1,
+        6 * 60 * 60,
+      );
+      expect(line.getProfile).toHaveBeenCalledWith('U123');
+      expect(lineUser.update).toHaveBeenCalledWith({
+        where: { id: 'lu-1' },
+        data: {
+          displayName: 'Alicia',
+          pictureUrl: 'https://line/new.jpg',
+        },
+      });
+    });
+
+    it('skips the LINE call entirely while the cooldown marker is set', async () => {
+      redis.getJson.mockResolvedValue(1);
+
+      await service.refreshProfileFromLine('U123');
+
+      expect(line.getProfile).not.toHaveBeenCalled();
+      // Not even the row read — a follower who chats all day must cost nothing.
+      expect(lineUser.findFirst).not.toHaveBeenCalled();
+    });
+
+    it('does not refresh someone we have never seen or who unfollowed', async () => {
+      lineUser.findFirst.mockResolvedValue(null);
+
+      await service.refreshProfileFromLine('U404');
+
+      expect(redis.setJson).not.toHaveBeenCalled();
+      expect(line.getProfile).not.toHaveBeenCalled();
+    });
+
+    it('swallows a getProfile failure — a webhook must not fail over a rename', async () => {
+      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      lineUser.findFirst.mockResolvedValue(stored);
+      line.getProfile.mockRejectedValue(new Error('LINE 500'));
+
+      await expect(
+        service.refreshProfileFromLine('U123'),
+      ).resolves.toBeUndefined();
+      expect(lineUser.update).not.toHaveBeenCalled();
     });
   });
 });

@@ -7,21 +7,42 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { AppAccess, Prisma, SystemRole } from '@prisma/client';
 import type { LineUser, RichMenuType } from '@prisma/client';
+import { resolveAppVersion } from '../common/app-version';
 import { PrismaService } from '../prisma/prisma.service';
+import type { RealtimeActor } from '../realtime/realtime.constants';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
+import {
+  LIFF_OPTIONS_KEY,
+  LINE_PROFILE_SYNC_TTL_SECONDS,
+  OPTION_LIST_KEYS,
+  lineProfileSyncKey,
+  lineStatusKey,
+} from '../redis/cache-keys';
+import { RedisService } from '../redis/redis.service';
+import { buildAccessCard, type CardAccess } from './access-card';
 import { canAdminSetAccess } from './line-access.policy';
 import { AdminUpdateLineUserRegistrationDto } from './dto/admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './dto/create-line-user-registration.dto';
 import { LineUserRegistrationResponseDto } from './dto/line-user-registration-response.dto';
 import { LineUserResponseDto } from './dto/line-user-response.dto';
+import {
+  DEFAULT_LINE_USER_THEME,
+  LineUserSettingsResponseDto,
+  LineUserVersionResponseDto,
+  NotificationPreferencesDto,
+  UpdateLineUserSettingsDto,
+  UpdateNotificationPreferencesDto,
+} from './dto/line-user-settings.dto';
 import { LineUserStatusResponseDto } from './dto/line-user-status-response.dto';
 import { ListLineUsersQueryDto } from './dto/list-line-users-query.dto';
 import { PaginatedLineUsersResponseDto } from './dto/paginated-line-users-response.dto';
 import { RegistrationOptionsResponseDto } from './dto/registration-options-response.dto';
 import { UpdateLineUserRegistrationDto } from './dto/update-line-user-registration.dto';
 import { LineService } from './line.service';
+import type { LineProfileClaims } from './line.types';
 import {
   ALREADY_REGISTERED,
   CANNOT_REJECT_UNREGISTERED,
@@ -35,6 +56,21 @@ import {
   REJECTION_REASON_REQUIRED,
 } from './line-users.errors';
 import { RICH_MENU_SPECS } from './rich-menu.constants';
+
+/**
+ * Who is performing an admin write. Replaces the bare `role` parameter the two admin methods used
+ * to take.
+ *
+ * ⚠️ It is a REPLACEMENT and not an extra argument, deliberately. An added optional parameter is
+ * one a future route forgets, and the failure is silent: the write succeeds, the event fans out,
+ * and it simply says nobody did it. Widening the existing parameter makes the type checker name
+ * every call site instead.
+ *
+ * `role` is still the only thing `canAdminSetAccess` reads — the identity half is for the event.
+ */
+export interface AdminActor extends RealtimeActor {
+  role: SystemRole;
+}
 
 /** Profile fields captured when a user follows the OA (all best-effort). */
 export interface LineProfileInput {
@@ -81,6 +117,97 @@ export const ACCESS_NOTIFICATION_MESSAGES: Record<AppAccess, string | null> = {
 export const buildRejectionMessage = (reason: string): string =>
   `ขออภัย การลงทะเบียนของคุณไม่ผ่านการอนุมัติ เนื่องจาก: ${reason} กรุณาเปิดแอปพลิเคชันเพื่อแก้ไขข้อมูลใหม่อีกครั้ง`;
 
+/** Where a phone number stops being a phone number and starts being an extension. */
+const EXTENSION_MARKER = /\s*(?:ต่อ|ext\.?|#)\s*/i;
+
+/**
+ * `LineUserRegistration.phone` -> `phoneDigits`. THE only writer of that column: call it wherever
+ * `phone` is written, in the same `data` object, so the two can never drift apart.
+ *
+ * Two rules, both of which exist because an operator typing into the registration search box is
+ * reading a number off a form and not off the screen:
+ *   1. Every non-digit is dropped, so "081-234-5678" and "0812345678" are the same query.
+ *   2. Anything after an extension marker is dropped ENTIRELY rather than concatenated.
+ *      "02-123-4567 ต่อ 101" is `021234567`; keeping the extension would make it `021234567101`,
+ *      and then searching "101" returns every number whose extension is 101 — which is never what
+ *      someone searching a phone number meant.
+ *
+ * ⚠️ A leading "+66" normalises to "66…", so an international-format row will not match a query
+ * typed in local "08…" form. Left alone deliberately: the registration form is filled in by Thai
+ * staff in local format, and a rewrite rule that guesses country codes fails in a much quieter way.
+ */
+export const toPhoneDigits = (phone: string): string =>
+  phone.split(EXTENSION_MARKER)[0].replace(/\D/g, '');
+
+/** Digits only, for comparing a typed query against `phoneDigits`. */
+const digitsOnly = (s: string): string => s.replace(/\D/g, '');
+
+/**
+ * The back-office list's search filter: ONE box, six fields (LU-SEARCH-1).
+ *
+ * The screen's placeholder names ชื่อ–สกุล, ชื่อไลน์, ตำแหน่ง, กลุ่ม/ฝ่าย and เบอร์โทรศัพท์, so all
+ * five are read here. A box that quietly ignores the field someone typed answers "not found" and
+ * sends them hunting for a record that is on the screen in front of them.
+ *
+ * The sixth is `phoneDigits`, and it is gated at THREE digits rather than one. An operator typing
+ * a name types letters, but "0" or "08" as a phone fragment matches almost every row and would
+ * bury the fields they actually meant. Three digits is the shortest query that carries intent.
+ */
+function buildSearchFilter(search?: string): Prisma.LineUserWhereInput {
+  const q = search?.trim();
+  if (!q) return {};
+
+  const like = { contains: q, mode: 'insensitive' } as const;
+  const OR: Prisma.LineUserWhereInput[] = [
+    { displayName: like },
+    { registration: { firstName: like } },
+    { registration: { lastName: like } },
+    { registration: { phone: like } },
+    { registration: { personnelRole: { name: like } } },
+    { registration: { department: { name: like } } },
+  ];
+
+  const digits = digitsOnly(q);
+  if (digits.length >= 3) {
+    OR.push({ registration: { phoneDigits: { contains: digits } } });
+  }
+  return { OR };
+}
+
+/**
+ * The three orderings the screen offers, plus the rule that makes them honest.
+ *
+ * ⚠️ ROWS WITH NO REGISTRATION SORT LAST IN BOTH DIRECTIONS. "Has no date" is not "is the oldest",
+ * and this is why `registeredAt` is a scalar on `LineUser` rather than a reach through the
+ * relation: Prisma accepts `nulls` only on a nullable scalar of the model being ordered. Ordering
+ * through the relation instead would leave Postgres's defaults in charge — NULLs FIRST on DESC —
+ * and `new` is the DEFAULT sort, so every follower who never registered would sit ABOVE the
+ * pending approval queue on the screen's opening view.
+ *
+ * The `id` tiebreak is MANDATORY on every branch: none of these keys is unique, and without it
+ * rows can repeat or vanish between pages.
+ */
+function buildOrderBy(
+  sort: 'new' | 'old' | 'name',
+): Prisma.LineUserOrderByWithRelationInput[] {
+  if (sort === 'name') {
+    // Ordered by the REGISTERED name, which is the name the screen shows — not `displayName`,
+    // which is whatever the person set on LINE. ⚠️ Thai collation is the database's to apply: a
+    // non-Thai collation files เชิดศักดิ์ under เ rather than ช, because leading vowels are
+    // written before the consonant they follow. ASC through the relation already puts the
+    // registration-less rows last, which is the rule above.
+    return [
+      { registration: { lastName: 'asc' } },
+      { registration: { firstName: 'asc' } },
+      { id: 'asc' },
+    ];
+  }
+  return [
+    { registeredAt: { sort: sort === 'old' ? 'asc' : 'desc', nulls: 'last' } },
+    { id: 'desc' },
+  ];
+}
+
 /**
  * THE one definition of "a publicly visible LineUser" — exactly the `LineUserResponseDto` fields.
  * Kept explicit so the DTO stays the response boundary (never `deletedAt`/`language`/audit columns),
@@ -96,7 +223,12 @@ export const LINE_USER_PUBLIC_FIELDS = {
   statusMessage: true,
   richMenuType: true,
   access: true,
+  // The two operator-authored notes. Selected because the back-office SHOWS them — see
+  // `LineUserResponseDto`. They are invariant-bound to `access`, so a row can never carry both.
+  rejectionReason: true,
+  blockReason: true,
   followedAt: true,
+  registeredAt: true,
   registration: {
     select: {
       firstName: true,
@@ -138,15 +270,93 @@ type OwnerRegistration = Prisma.LineUserRegistrationGetPayload<{
   select: typeof REGISTRATION_OWNER_SELECT;
 }>;
 
+/** The `status` the consumer version endpoint answers whenever the request reached the handler. */
+export const LINE_CLIENT_VERSION_STATUS = 'ok';
+
+/**
+ * THE defaults a LINE user with no `LineUserSettings` row sees (`Q-C9`: all three `true`).
+ *
+ * ⚠️ A FACTORY, NOT A SHARED CONSTANT. The object is handed straight into a response DTO, and one
+ * shared literal is one accidental mutation away from changing every future caller's defaults.
+ */
+export const defaultNotificationPreferences =
+  (): NotificationPreferencesDto => ({
+    announcements: true,
+    decisions: true,
+    reminders: true,
+  });
+
+/**
+ * Read the three documented booleans out of a JSONB value, defaulting anything else.
+ *
+ * 🔴 THIS IS WHERE JSONB'S MISSING SHAPE CHECK IS PAID FOR ON THE READ SIDE. The DTO guards writes,
+ * but the column already exists, `preferences`/`privacy` are explicitly reserved for future keys,
+ * and Postgres would happily hand back `{"decisions":"yes"}` or `null` from a row written by
+ * anything other than this service. A non-boolean is treated as *not set* and falls back to the
+ * documented default, so a malformed row degrades to "notifications on" rather than to a response
+ * whose declared type is a lie.
+ */
+export const toNotificationPreferences = (
+  stored: Prisma.JsonValue | null | undefined,
+): NotificationPreferencesDto => {
+  const defaults = defaultNotificationPreferences();
+  if (typeof stored !== 'object' || stored === null || Array.isArray(stored)) {
+    return defaults;
+  }
+  const row = stored as Record<string, unknown>;
+  const read = (key: keyof NotificationPreferencesDto): boolean =>
+    typeof row[key] === 'boolean' ? row[key] : defaults[key];
+  return {
+    announcements: read('announcements'),
+    decisions: read('decisions'),
+    reminders: read('reminders'),
+  };
+};
+
+/**
+ * The keys a `PATCH` actually supplied — the merge's other half.
+ *
+ * 🔴 A PLAIN SPREAD OF THE DTO WOULD RESET THE OTHER TOGGLES, which is the exact failure `Q-C9`
+ * forbids. `useDefineForClassFields` is in effect (target ES2022), so a validated DTO instance
+ * carries ALL THREE properties whether or not the client sent them — the absent ones simply hold
+ * `undefined`. `{ ...stored, ...dto.notifications }` therefore writes `announcements: undefined`
+ * over a stored `true`, and JSON.stringify drops the key entirely. Absence must mean UNCHANGED, so
+ * the keys are copied one at a time behind an explicit `!== undefined` test.
+ */
+const definedPreferences = (
+  patch: UpdateNotificationPreferencesDto | undefined,
+): Partial<NotificationPreferencesDto> => {
+  const out: Partial<NotificationPreferencesDto> = {};
+  if (!patch) return out;
+  if (patch.announcements !== undefined)
+    out.announcements = patch.announcements;
+  if (patch.decisions !== undefined) out.decisions = patch.decisions;
+  if (patch.reminders !== undefined) out.reminders = patch.reminders;
+  return out;
+};
+
 @Injectable()
 export class LineUserService {
   private readonly logger = new Logger(LineUserService.name);
+
+  /**
+   * `LINE_LIFF_URL` — where a status card's button sends the user, or `null` when unset.
+   *
+   * ⚠️ READ ONCE, AT CONSTRUCTION, and never required. It is a convenience link on two of the four
+   * cards (see `access-card.ts`); a box that has not configured it gets cards with no footer, which
+   * is the correct degradation. Failing the boot over it would be treating a button like a secret.
+   */
+  private readonly liffUrl: string | null;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly line: LineService,
     private readonly realtime: RealtimeGateway,
-  ) {}
+    private readonly redis: RedisService,
+    config: ConfigService,
+  ) {
+    this.liffUrl = config.get<string>('LINE_LIFF_URL') ?? null;
+  }
 
   /**
    * Fail-soft realtime publish. NEVER throws — it mirrors `notifyAccessChange`'s discipline: the
@@ -167,6 +377,7 @@ export class LineUserService {
   private async publish(
     kind: 'created' | 'updated',
     id: string,
+    actor: RealtimeActor | null,
   ): Promise<void> {
     try {
       const row = await this.prisma.lineUser.findFirst({
@@ -176,8 +387,14 @@ export class LineUserService {
       // Soft-deleted or gone → no event, by design.
       if (!row) return;
       const dto = this.toDto(row);
-      if (kind === 'created') this.realtime.emitLineUserCreated(dto);
-      else this.realtime.emitLineUserUpdated(dto);
+      // ⚠️ NARROWED EXPLICITLY, and it has to be. `AdminActor` extends `RealtimeActor` with
+      // `role`, and a structural type does not strip the extra property at runtime — passing the
+      // actor straight through put the operator's ROLE on the wire, which is exactly what this
+      // payload's doc comment says it does not carry. Caught by the e2e socket assertion, which
+      // reads the real JSON rather than the declared type.
+      const who = actor ? { id: actor.id, name: actor.name } : null;
+      if (kind === 'created') this.realtime.emitLineUserCreated(dto, who);
+      else this.realtime.emitLineUserUpdated(dto, who);
     } catch (error) {
       // PII discipline: id + kind only. Never the DTO, never a name or phone.
       this.logger.warn(
@@ -209,7 +426,13 @@ export class LineUserService {
     // Emit site 1. A re-follow after an unfollow re-surfaces the row, so `created` is correct; the
     // client's `created` handler is an upsert, so a plain profile refresh is harmless.
     // `LineWebhookService` stays unchanged — the emit belongs to the service that owns the model.
-    await this.publish('created', user.id);
+    // No operator: a LINE user added the Official Account themselves.
+    await this.publish('created', user.id, null);
+
+    // A re-follow clears `deletedAt`, resurrecting the account the unfollow hid — the mirror of
+    // the drop in `softDeleteByLineUserId`, and the reason a plain profile refresh drops it too:
+    // `displayName` does not reach this payload today, but the row this key describes just moved.
+    await this.redis.del(lineStatusKey(profile.lineUserId));
     return user;
   }
 
@@ -234,7 +457,13 @@ export class LineUserService {
     });
 
     // Emit site 6. "Deleted" means "left the list you are looking at" — the physical row survives.
-    this.realtime.emitLineUserDeleted(row.id);
+    // No operator: the user unfollowed.
+    this.realtime.emitLineUserDeleted(row.id, null);
+
+    // The row is now invisible to `getOrCreateByLineUserId`, so the next status read builds a
+    // FRESH UNREGISTERED row. A surviving key would keep serving the old account's registration —
+    // including its name and phone — to whoever re-opens the LIFF under that sub.
+    await this.redis.del(lineStatusKey(lineUserId));
     return { count: 1 };
   }
 
@@ -255,6 +484,104 @@ export class LineUserService {
     const existing = await this.findActiveByLineUserId(lineUserId);
     if (existing) return existing;
     return this.prisma.lineUser.create({ data: { lineUserId } });
+  }
+
+  /**
+   * Bring our copy of a follower's LINE profile up to date.
+   *
+   * ── Why this exists at all ──
+   * LINE has **no "profile changed" webhook event** — the event list is message / unfollow /
+   * follow / postback and friends, and none of them fires when somebody renames themselves or
+   * swaps their photo. Before this, `upsertOnFollow` was the ONLY writer of `displayName` and
+   * `pictureUrl`, so a follower's name was frozen at the moment they added the OA, possibly years
+   * earlier, and the back-office's registration list showed that frozen name to an operator
+   * deciding whether to approve them.
+   *
+   * Since no event announces the change, the only thing left is to notice it whenever the user
+   * turns up carrying fresh data. Two moments do:
+   *
+   *   LIFF   every `GET /line-users/status` on a cache miss, from the ID token's own claims —
+   *          FREE, because `LineIdTokenGuard` has already paid for that round trip
+   *   chat   a webhook `message`/`postback`, via `getProfile` behind a 6h cooldown — a real API
+   *          call, so it is the fallback for followers who never open the app
+   *
+   * ⚠️ IT WRITES ONLY WHAT ACTUALLY CHANGED, and returning early is not a micro-optimisation. Every
+   * write here would otherwise bump `updatedAt` and fire a `lineUser.updated` down the admin
+   * socket — on every LIFF open, for every user, forever. The registration page would redraw
+   * itself and show its "มีรายการใหม่" bar for a rename that never happened.
+   *
+   * ⚠️ ABSENT IS "NO NEWS", NEVER "CLEARED". A caller with no claim for a field passes `undefined`
+   * and the stored value survives. Only an actual, different, non-empty value replaces it. The
+   * opposite reading would blank a good name the first time a LIFF app without the `profile` scope
+   * called us — a silent data loss with no event to trace it back to.
+   *
+   * ⚠️ SOFT-DELETED ROWS ARE NOT REFRESHED. `null` in, `null` out: an unfollowed user is gone, and
+   * `upsertOnFollow` is what resurrects them if they come back.
+   */
+  async syncProfile(
+    user: LineUser,
+    next: { displayName?: string; pictureUrl?: string },
+  ): Promise<LineUser> {
+    const data: { displayName?: string; pictureUrl?: string } = {};
+    if (next.displayName && next.displayName !== user.displayName) {
+      data.displayName = next.displayName;
+    }
+    if (next.pictureUrl && next.pictureUrl !== user.pictureUrl) {
+      data.pictureUrl = next.pictureUrl;
+    }
+    if (Object.keys(data).length === 0) return user;
+
+    const updated = await this.prisma.lineUser.update({
+      where: { id: user.id },
+      data,
+    });
+
+    // No operator: the LINE user renamed themselves, and an `actor` here would put somebody's name
+    // on a change they did not make. Same `null` the follow path passes, for the same reason.
+    await this.publish('updated', updated.id, null);
+
+    // ⚠️ NOT dropping `lineStatusKey`. `LineUserStatusResponseDto` carries `access` and the
+    // registration the USER typed — never their LINE display fields — so nothing in that payload
+    // just went stale. Dropping it anyway would evict the hottest key on the LINE surface on every
+    // rename for no reader's benefit.
+    return updated;
+  }
+
+  /**
+   * The chat-only fallback: re-fetch a follower's profile from LINE, at most once per cooldown.
+   *
+   * Best-effort in every direction — this runs inside webhook handling, where a thrown error would
+   * be logged and swallowed anyway, and where failing a delivery makes LINE retry the whole batch.
+   * A user we have never seen, a soft-deleted one, an unreachable Messaging API and a Redis that is
+   * down all resolve to "do nothing this time".
+   *
+   * ⚠️ THE MARKER IS SET BEFORE THE FETCH, not after. Setting it afterwards means a LINE outage
+   * retries `getProfile` on every single inbound message for as long as it lasts — precisely when
+   * the API is least able to answer. Paying for it with one skipped refresh window is the cheaper
+   * mistake.
+   */
+  async refreshProfileFromLine(lineUserId: string): Promise<void> {
+    const key = lineProfileSyncKey(lineUserId);
+    if (await this.redis.getJson<number>(key)) return;
+
+    const user = await this.findActiveByLineUserId(lineUserId);
+    if (!user) return;
+
+    await this.redis.setJson(key, 1, LINE_PROFILE_SYNC_TTL_SECONDS);
+    try {
+      const profile = await this.line.getProfile(lineUserId);
+      await this.syncProfile(user, {
+        displayName: profile.displayName,
+        pictureUrl: profile.pictureUrl,
+      });
+    } catch (error) {
+      // PII discipline, as everywhere in this file: the LINE id and nothing else.
+      this.logger.warn(
+        `Profile refresh failed for ${lineUserId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /** Set the user's rich-menu type in the DB. Returns null if no active user. */
@@ -304,7 +631,15 @@ export class LineUserService {
     const text = ACCESS_NOTIFICATION_MESSAGES[access];
     if (!text) return;
     try {
-      await this.line.push(lineUserId, [{ type: 'text', text }]);
+      // The card carries the news; `text` becomes its `altText`, which is the notification banner
+      // and the fallback on a client that cannot render Flex — so the redesign added a bubble and
+      // took nothing away. `access` is narrowed by the `!text` guard above: the two states with no
+      // copy (`UNREGISTERED`, and `REJECTED` which uses `notifyRejection`) have already returned.
+      await this.line.push(lineUserId, [
+        buildAccessCard(access as CardAccess, text, {
+          liffUrl: this.liffUrl,
+        }),
+      ]);
     } catch (error) {
       // Best-effort: log the LINE id + target access (never PII) and continue.
       this.logger.warn(
@@ -332,7 +667,16 @@ export class LineUserService {
   ): Promise<void> {
     const text = buildRejectionMessage(reason);
     try {
-      await this.line.push(lineUserId, [{ type: 'text', text }]);
+      // ⚠️ The reason travels TWICE and that is not duplication: inside `altText` (the one-line
+      // copy `buildRejectionMessage` has always produced, which is what the phone's notification
+      // shows) and again as its own block in the card, where it is the thing being read rather
+      // than a clause after a colon.
+      await this.line.push(lineUserId, [
+        buildAccessCard(AppAccess.REJECTED, text, {
+          reason,
+          liffUrl: this.liffUrl,
+        }),
+      ]);
     } catch (error) {
       // PII discipline: never log the reason — only the LINE id + target access.
       this.logger.warn(
@@ -353,6 +697,19 @@ export class LineUserService {
    * LINE caller can never see a reserved option under any circumstance.
    */
   async getRegistrationOptions(): Promise<RegistrationOptionsResponseDto> {
+    // Cache-aside (R1). Two queries per registration-form open, on the surface with the most
+    // users and the least predictable traffic — and this payload is the one that genuinely
+    // "changes rarely": no `holderCount`, no reserved rows, so only an option write disturbs it.
+    //
+    // This route is also session-EXEMPT (bearer LINE ID token), which makes the fallback matter
+    // here in a way it does not on the admin side: with Redis down the admin surface already
+    // answers 503 at the session middleware, but this one keeps serving straight from PostgreSQL.
+    const cached =
+      await this.redis.getJson<RegistrationOptionsResponseDto>(
+        LIFF_OPTIONS_KEY,
+      );
+    if (cached) return cached;
+
     const [departments, personnelRoles] = await Promise.all([
       this.prisma.department.findMany({
         where: { deletedAt: null, isSystemReserved: false },
@@ -365,7 +722,10 @@ export class LineUserService {
         orderBy: { name: 'asc' },
       }),
     ]);
-    return { departments, personnelRoles };
+
+    const payload = { departments, personnelRoles };
+    await this.redis.setJson(LIFF_OPTIONS_KEY, payload);
+    return payload;
   }
 
   /**
@@ -448,6 +808,7 @@ export class LineUserService {
               firstName: dto.firstName,
               lastName: dto.lastName,
               phone: dto.phone,
+              phoneDigits: toPhoneDigits(dto.phone),
               departmentId: dto.departmentId,
               personnelRoleId: dto.personnelRoleId,
             },
@@ -456,7 +817,10 @@ export class LineUserService {
 
           const updated = await tx.lineUser.update({
             where: { id: user.id },
-            data: { access: 'PENDING' },
+            // `registeredAt` is written HERE, in the same transaction as the registration row, so
+            // "has a registration" and "has a submission date" can never disagree. Written once:
+            // a later self-edit or admin correction does not move it.
+            data: { access: 'PENDING', registeredAt: created.createdAt },
             select: { access: true },
           });
 
@@ -475,11 +839,17 @@ export class LineUserService {
 
       // Emit site 2 — after the commit, BEFORE the LINE push (a best-effort HTTP call that can take
       // a second or more; the socket path must not sit behind it).
-      await this.publish(wasCreated ? 'created' : 'updated', userId);
+      // No operator: the LINE user submitted their own registration through the LIFF app.
+      await this.publish(wasCreated ? 'created' : 'updated', userId, null);
 
       // Best-effort "we received your registration" push (PENDING copy). Outside the transaction
       // so a push failure can never roll back the committed registration/access change.
       await this.notifyAccessChange(lineUserId, access);
+
+      // A new registration is a new holder of both chosen options, so the admin option lists'
+      // `holderCount` just moved. Only the ADMIN keys — the LIFF payload carries no count.
+      // The caller's own status changed too (UNREGISTERED → PENDING, registration now present).
+      await this.redis.del(...OPTION_LIST_KEYS, lineStatusKey(lineUserId));
 
       // A fresh registration is never REJECTED — no reason to surface.
       return this.toStatusDto(access, registration, null);
@@ -542,6 +912,7 @@ export class LineUserService {
           firstName: dto.firstName,
           lastName: dto.lastName,
           phone: dto.phone,
+          phoneDigits: toPhoneDigits(dto.phone),
           departmentId: dto.departmentId,
           personnelRoleId: dto.personnelRoleId,
         },
@@ -561,7 +932,8 @@ export class LineUserService {
     this.logger.log(`LineUser registration edited. id=${user.id}`);
 
     // Emit site 3 — after the `$transaction` resolves, before the conditional PENDING push.
-    await this.publish('updated', user.id);
+    // No operator: the LINE user edited their own registration.
+    await this.publish('updated', user.id, null);
 
     // A REJECTED resubmit re-enters review → send the existing PENDING ack, AFTER the transaction
     // commits (fail-soft) so a push failure can't roll back the committed resubmit. A PENDING edit
@@ -569,6 +941,13 @@ export class LineUserService {
     if (wasRejected) {
       await this.notifyAccessChange(lineUserId, AppAccess.PENDING);
     }
+
+    // The edit may have moved this holder from one option to another — two counts, one write.
+    // Dropped unconditionally rather than only when the ids changed: comparing costs a branch that
+    // can be wrong, and an unnecessary drop costs one miss.
+    // The status payload carries the edited fields verbatim, and a REJECTED resubmit also flipped
+    // `access` and cleared `rejectionReason` — so it goes too.
+    await this.redis.del(...OPTION_LIST_KEYS, lineStatusKey(lineUserId));
 
     // Both paths land on PENDING with the reason cleared (REJECTED resubmit) or already null (edit).
     return this.toStatusDto(AppAccess.PENDING, updated, null);
@@ -579,15 +958,173 @@ export class LineUserService {
    * `sub`, so a caller can only ever read their own status. A LIFF-first user with no prior row gets
    * a fresh `UNREGISTERED` row + `registration: null`.
    */
-  async getStatus(lineUserId: string): Promise<LineUserStatusResponseDto> {
-    const user = await this.getOrCreateByLineUserId(lineUserId);
+  async getStatus(
+    lineUserId: string,
+    /** The caller's live LINE display fields, from their verified ID token. See below. */
+    profile?: LineProfileClaims,
+  ): Promise<LineUserStatusResponseDto> {
+    // Cache-aside (R1). Two queries, and this is the one call every LINE user makes every time
+    // they open the app.
+    //
+    // ⚠️ `access` IS IN THIS PAYLOAD, and a stale one shows a blocked user the allowed screen.
+    // That is tolerable ONLY because it is a routing hint and never an enforcement point: the
+    // rich menu is switched LINE-side, and `register`/`updateRegistration` re-read the row from
+    // PostgreSQL before writing anything (R5). Every write that can move `access` drops this key
+    // below — six of them. If a seventh is ever added and forgets, the failure is a user staring
+    // at the wrong screen for five minutes, not a user doing something they may not do.
+    const key = lineStatusKey(lineUserId);
+    const cached = await this.redis.getJson<LineUserStatusResponseDto>(key);
+    if (cached) return cached;
+
+    let user = await this.getOrCreateByLineUserId(lineUserId);
+
+    /*
+     * ⚠️ THIS IS WHERE A RENAME IS NOTICED, and it is free. `LineIdTokenGuard` has already
+     * verified this call's ID token against LINE, and that same signed payload carries the
+     * caller's current display name and picture — so keeping our copy fresh costs a comparison
+     * and, only when something really changed, one UPDATE. See `syncProfile`.
+     *
+     * ⚠️ ON THE CACHE MISS, DELIBERATELY. Above the cache check it would run on every LIFF poll;
+     * here it runs at most once per `lineStatusKey` TTL per user, which is the throttle this path
+     * would otherwise need built by hand. The cost is that a rename reaches the back-office up to
+     * one TTL after the user's next app open — an operator reading a name that was correct five
+     * minutes ago, against a page that never showed it at all before this.
+     *
+     * ⚠️ IT ALSO BACKFILLS. `getOrCreateByLineUserId` creates a bare row for anyone who reaches
+     * the LIFF without a `follow` webhook ever having been processed — no name, no picture. That
+     * row used to stay blank forever; now the first status call fills it in.
+     */
+    if (profile) user = await this.syncProfile(user, profile);
+
     const registration = await this.prisma.lineUserRegistration.findFirst({
       where: { lineUserId: user.id, deletedAt: null },
       select: REGISTRATION_OWNER_SELECT,
     });
     // `rejectionReason` is non-null only when access === REJECTED (invariant) — pass it straight
     // through so the LIFF RejectedScreen can render it.
-    return this.toStatusDto(user.access, registration, user.rejectionReason);
+    const dto = this.toStatusDto(
+      user.access,
+      registration,
+      user.rejectionReason,
+    );
+
+    await this.redis.setJson(key, dto);
+    return dto;
+  }
+
+  /**
+   * The caller's own client-portal settings (`Q-C9`). Header-derived and param-less like
+   * `getStatus`: the identity is the verified `sub`, so a caller can only ever read their own row
+   * and cross-user reads are structurally impossible rather than merely checked.
+   *
+   * 🔴 IT NEVER WRITES, AND THAT IS THE FEATURE. Every existing follower predates this table, so a
+   * missing row is the NORMAL case, not an error — it means "has never opened `#/settings`" and the
+   * answer is the documented defaults. Creating the row here (a lazy upsert, or the backfill
+   * migration this replaced) would mint one for every follower who never visits the screen, which
+   * is precisely the database footprint the ruling refuses. `updatedAt: null` is how the response
+   * says so honestly.
+   *
+   * ONE query, through the relation rather than two round trips: `lineUser: { lineUserId,
+   * deletedAt: null }` reaches the settings row from the LINE-side `U…` id in a single statement.
+   * A soft-deleted (unfollowed) user answers defaults, matching every other read on this surface.
+   */
+  async getSettings(lineUserId: string): Promise<LineUserSettingsResponseDto> {
+    const row = await this.prisma.lineUserSettings.findFirst({
+      where: { lineUser: { lineUserId, deletedAt: null } },
+      select: { theme: true, notifications: true, updatedAt: true },
+    });
+
+    if (!row) {
+      return {
+        theme: DEFAULT_LINE_USER_THEME,
+        notifications: defaultNotificationPreferences(),
+        updatedAt: null,
+      };
+    }
+
+    return {
+      theme: row.theme,
+      notifications: toNotificationPreferences(row.notifications),
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  /**
+   * The caller's own settings write — the ONLY writer of `LineUserSettings` (`Q-C9`). Identity is
+   * the verified `sub`; there is no cross-user write and no id in the DTO to make one with.
+   *
+   * 🔴 MERGE, NEVER REPLACE, AT KEY LEVEL. `{ notifications: { decisions: false } }` must leave
+   * `announcements` and `reminders` exactly as they were — a whole-column write would delete them.
+   * An absent field means UNCHANGED, the same reading `PATCH` has everywhere else in this service;
+   * see `definedPreferences` for the `useDefineForClassFields` trap that makes a plain spread wrong.
+   *
+   * ⚠️ `preferences` and `privacy` are NEVER touched here. They are reserved columns with no DTO
+   * field, so `forbidNonWhitelisted` already 400s any attempt to send them — but the absence of a
+   * write is the second half of "a key that no document describes does not get written".
+   *
+   * ⚠️ NO `$transaction`, deliberately. `getOrCreateByLineUserId` may create the `LineUser` row for
+   * a LIFF-first caller, and the upsert below is the only other write — but a settings write that
+   * failed after that create would leave exactly the bare `UNREGISTERED` row `GET /line-users/status`
+   * creates on its own on the very next request. There is no inconsistent state to protect, so a
+   * transaction here would be ceremony.
+   */
+  async patchSettings(
+    lineUserId: string,
+    dto: UpdateLineUserSettingsDto,
+  ): Promise<LineUserSettingsResponseDto> {
+    // A LIFF-first caller may have no `LineUser` row at all, and the settings FK needs one. This is
+    // a WRITE the user explicitly asked for, so creating it here is not the footprint the read path
+    // refuses.
+    const user = await this.getOrCreateByLineUserId(lineUserId);
+
+    const existing = await this.prisma.lineUserSettings.findUnique({
+      where: { lineUserId: user.id },
+      select: { theme: true, notifications: true },
+    });
+
+    const notifications = {
+      ...toNotificationPreferences(existing?.notifications),
+      ...definedPreferences(dto.notifications),
+    };
+    // Absent theme = unchanged; unchanged with no row = the documented default.
+    const theme = dto.theme ?? existing?.theme ?? DEFAULT_LINE_USER_THEME;
+
+    const saved = await this.prisma.lineUserSettings.upsert({
+      where: { lineUserId: user.id },
+      create: { lineUserId: user.id, theme, notifications },
+      update: { theme, notifications },
+      select: { theme: true, notifications: true, updatedAt: true },
+    });
+
+    // PII discipline, as everywhere in this file: the id only. A preference is not a secret, but
+    // logging bodies is the habit that eventually logs one.
+    this.logger.log(`LineUser settings updated. id=${user.id}`);
+
+    return {
+      theme: saved.theme,
+      notifications: toNotificationPreferences(saved.notifications),
+      updatedAt: saved.updatedAt,
+    };
+  }
+
+  /**
+   * The consumer half of the version screen (`NEEDS_DESIGN.md` §3). Behind `LineIdTokenGuard`, so a
+   * build string is never published to the open internet — the same reasoning that keeps the admin
+   * endpoint off the public `/health` probe.
+   *
+   * ⚠️ It resolves through the SHARED `resolveAppVersion`, which the admin `GET /system/version`
+   * also uses. `#/version` compares the bundle's build-time constant against this answer and reports
+   * whether they agree; two resolvers could disagree about the server's own number and the screen
+   * would be reporting on the resolver instead of on the deploy.
+   *
+   * No Prisma, no I/O, nothing per-user — but it lives here rather than in the controller because
+   * the controller layer holds no logic in this service.
+   */
+  getClientVersion(): LineUserVersionResponseDto {
+    return {
+      version: resolveAppVersion(),
+      status: LINE_CLIENT_VERSION_STATUS,
+    };
   }
 
   /**
@@ -603,14 +1140,12 @@ export class LineUserService {
     limit,
     search,
     access,
+    sort = 'new',
   }: ListLineUsersQueryDto): Promise<PaginatedLineUsersResponseDto> {
-    const trimmed = search?.trim();
     const where: Prisma.LineUserWhereInput = {
       deletedAt: null, // AC-B6 — soft-deleted rows never appear, in data or in total.
       ...(access ? { access } : {}),
-      ...(trimmed
-        ? { displayName: { contains: trimmed, mode: 'insensitive' } }
-        : {}),
+      ...buildSearchFilter(search),
     };
 
     const [rows, total] = await this.prisma.$transaction(
@@ -618,9 +1153,7 @@ export class LineUserService {
         this.prisma.lineUser.findMany({
           where,
           select: LINE_USER_PUBLIC_FIELDS,
-          // The `id` tiebreak is MANDATORY — `followedAt` is not unique, and without it rows can
-          // repeat or vanish across pages.
-          orderBy: [{ followedAt: 'desc' }, { id: 'desc' }],
+          orderBy: buildOrderBy(sort),
           skip: (page - 1) * limit,
           take: limit,
         }),
@@ -665,13 +1198,19 @@ export class LineUserService {
    * the same case is a 400 here. On success the write persists the trimmed `reason` and the reject
    * push (`notifyRejection`) is sent instead of the ALLOWED/BLOCKED copy. The write ALSO enforces the
    * invariant: any non-REJECTED target clears `rejectionReason` to null.
+   *
+   * Block (`access === BLOCKED`) may carry the SAME `reason` field, and it is **optional** here —
+   * see the write below for why the two reasons are not symmetric. It lands in `blockReason`, under
+   * the mirror-image invariant: any non-BLOCKED target clears it to null. There is no push and no
+   * extra guard; a block with no reason behaves exactly as it did before this field existed.
    */
   async updateAccess(
     id: string,
     access: AppAccess,
-    role: SystemRole,
+    actor: AdminActor,
     reason?: string,
   ): Promise<LineUserResponseDto> {
+    const { role } = actor;
     const row = await this.prisma.lineUser.findUnique({
       where: { id },
       select: { id: true, access: true, deletedAt: true },
@@ -712,6 +1251,21 @@ export class LineUserService {
         // Invariant: set the guarded non-empty reason on REJECTED, clear it on every other target.
         // `reason!` is safe — the guard above guarantees it is non-empty when access === REJECTED.
         rejectionReason: access === AppAccess.REJECTED ? reason! : null,
+        /*
+         * The same invariant for the Block note, from the SAME `reason` field — one body key, and
+         * which column it lands in is decided by the target state, so a row can never hold both.
+         *
+         * ⚠️ NOT GUARDED, unlike the reject above, and that asymmetry is the design: a rejection
+         * reason is a MESSAGE pushed to the user (an empty one sends a blank LINE message), a block
+         * reason is an INTERNAL NOTE nobody outside this building reads. Requiring it here would
+         * also break `BLOCKED → BLOCKED`, which exists so an ADMIN can retry a 502 rich-menu apply
+         * by re-sending the same body.
+         *
+         * A re-block that carries no `reason` therefore CLEARS the previous note, and that is the
+         * right reading: the column describes the block currently in force, not a history of them.
+         * Keeping the old text would attach yesterday's sentence to today's decision.
+         */
+        blockReason: access === AppAccess.BLOCKED ? (reason ?? null) : null,
       },
       select: LINE_USER_PUBLIC_FIELDS,
     });
@@ -752,7 +1306,7 @@ export class LineUserService {
     // raises a retryable 502 above, and NO event is emitted on that path: broadcasting a row whose
     // LINE-side state we know is inconsistent, from a request that answers 502, is worse than being
     // briefly stale, and the retry re-emits (the operation is idempotent).
-    await this.publish('updated', updated.id);
+    await this.publish('updated', updated.id, actor);
 
     // Best-effort notification, only after BOTH the DB write and the rich-menu apply succeeded.
     // Pushed to the LINE-side U… id (updated.lineUserId), never the cuid. A push failure here does
@@ -765,6 +1319,11 @@ export class LineUserService {
     } else {
       await this.notifyAccessChange(updated.lineUserId, access);
     }
+
+    // THE invalidation that matters most on this surface: `access` is the field the LIFF routes
+    // its four screens off, and this is the only method that changes it. Same `U…` the push above
+    // was addressed to — if that one is right, this one is.
+    await this.redis.del(lineStatusKey(updated.lineUserId));
 
     return this.toDto(updated);
   }
@@ -797,8 +1356,9 @@ export class LineUserService {
   async updateRegistrationByAdmin(
     id: string,
     dto: AdminUpdateLineUserRegistrationDto,
-    role: SystemRole,
+    actor: AdminActor,
   ): Promise<LineUserResponseDto> {
+    const { role } = actor;
     // Plain reads outside the tx (mirrors updateRegistration). `access` is NOT selected — the edit is
     // orthogonal to the access matrix and is not PENDING-gated.
     const row = await this.prisma.lineUser.findUnique({
@@ -833,6 +1393,7 @@ export class LineUserService {
           firstName: dto.firstName,
           lastName: dto.lastName,
           phone: dto.phone,
+          phoneDigits: toPhoneDigits(dto.phone),
           departmentId: dto.departmentId,
           personnelRoleId: dto.personnelRoleId,
         },
@@ -851,7 +1412,18 @@ export class LineUserService {
     // Emit site 5 — after the `$transaction` and the re-read, before returning. A SUPER_ADMIN may
     // reach a soft-deleted row here; `publish`'s `deletedAt: null` filter is what stops that row
     // from being broadcast.
-    await this.publish('updated', row.id);
+    await this.publish('updated', row.id, actor);
+
+    // Same as the self-edit path: an admin correcting a typo can also move the holder between two
+    // options, and the admin option lists count LINE registrations as well as staff.
+    //
+    // ⚠️ `updated.lineUserId` — the LINE-side `U…` — NOT `row.id`, which is the cuid this method
+    // is keyed on. The status cache is keyed the way the LIFF caller asks for it, not the way the
+    // admin addresses it, and the two are different strings on the same row.
+    await this.redis.del(
+      ...OPTION_LIST_KEYS,
+      lineStatusKey(updated!.lineUserId),
+    );
 
     return this.toDto(updated!);
   }
@@ -865,7 +1437,10 @@ export class LineUserService {
       statusMessage: user.statusMessage,
       richMenuType: user.richMenuType,
       access: user.access,
+      rejectionReason: user.rejectionReason,
+      blockReason: user.blockReason,
       followedAt: user.followedAt.toISOString(),
+      registeredAt: user.registeredAt?.toISOString() ?? null,
       registration: user.registration
         ? {
             firstName: user.registration.firstName,

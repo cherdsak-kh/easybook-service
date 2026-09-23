@@ -43,27 +43,91 @@ npm run auth:create-superadmin    # create the first SUPER_ADMIN — interactive
                                   # (idempotent; --force RESETS the existing one's credentials)
 npm run auth:hash-password -- 'pw'  # print an argon2id hash for a password (debug/DB seeding; no DB, no endpoint by design)
 npm run options:seed              # seed baseline Department / PersonnelRole options (never writes isSystemReserved)
+npm run venue-types:seed          # seed the 5 starting VenueType categories + reserved tombstone row (idempotent)
+npm run venues:sweep-photos       # sweep orphan staged photos from venues/_new/ (--dry-run, --hours=N; default 24, min 1)
+npm run sanitize:thai-backfill    # re-run sanitizeThaiText over the 9 Thai text columns (--dry-run; skips unique-index collisions)
 ```
 
-Redis must be running for anything session-backed. There is still no `docker-compose.yml` — see
-the DOCKER-1 backlog item.
+Redis must be running for anything session-backed. A `Dockerfile` and a `docker-compose.staging.yml`
+exist, but both are *staging deploy* artifacts (the compose file declares only the app container and
+is driven by `.github/workflows/cd.yml`); there is still **no local-dev compose** — run Postgres and
+Redis yourself. See the DOCKER-1 backlog item.
 
 ## Architecture
 
 **Module wiring** (`src/app.module.ts`): `ConfigModule` (global, `validate: validateEnv`) →
 `PrismaModule` (global) → `RedisModule` (global) → `CsrfModule` (global) → `ThrottlerModule`
-(registered `global: true` so `LoginThrottleGuard` can resolve it) → `HealthModule` → `LineModule`
-→ `AuthModule` → `SystemUsersModule` → `OptionsModule`. `OptionsModule` (`src/options/`) exposes the
-admin-curated `Department` / `PersonnelRole` option tables via `DepartmentsController` /
-`PersonnelRolesController` — the same tables `SystemUser` and LINE registrations reference (see the
-`isSystemReserved` note below). Booking/Resource domain modules don't exist yet — they are added as
-their own future tasks; don't assume they're stubbed out anywhere.
+(registered `global: true` so `LoginThrottleGuard` can resolve it) → `HealthModule` →
+`RealtimeModule` → `LineModule` → `AuthModule` → `SystemUsersModule` → `OptionsModule`.
+`RealtimeModule` (`src/realtime/`) hosts **two** Socket.IO namespaces that share the transport and
+nothing else. Only the names in `REALTIME_NAMESPACE_ALLOWLIST` are served — including socket.io's
+unconditionally-created default `/`, which is refused there; adding a `@WebSocketGateway` is *not*
+enough to make a namespace reachable, and that trip-wire is deliberate.
+- **`/admin`** (`RealtimeGateway`) — server→client only (**zero `@SubscribeMessage`**):
+  `lineUser.created` / `.updated` / `.deleted`, `bookingRequest.created` / `.updated`, plus
+  `session.closed`. Its handshake reuses the express session (`SessionIoAdapter`, installed in
+  `configureApp`) and namespace membership *is* the `SUPER_ADMIN|ADMIN` boundary — there are no rooms.
+- **`/client`** (`ClientRealtimeGateway`, `CLIENT-REALTIME-1`) — the LIFF end-user side, which inverts
+  every one of those choices on purpose. A LINE end-user has no session and no cookie, so the
+  handshake verifies a **LINE ID token** through the *same* `verifyLineIdToken` the REST guard uses
+  (never a second copy of the `aud`/`iss`/`exp` checks), resolves the `sub` to a non-soft-deleted
+  `LineUser` and requires `access === ALLOWED`. Refusals are the same two status classes as `/admin`,
+  never diagnostics; a LINE **verify outage is `UNAUTHENTICATED` too**, because REST may answer a
+  retryable 502 but a socket that cannot prove whose it is must not be held open.
+  - **Rooms carry the authorization here, because the namespace cannot**: membership means only "an
+    `ALLOWED` LINE user", i.e. nearly everybody. Every emit is targeted at `user:<cuid>`
+    (⚠️ the **cuid** `LineUser.id` — what `BookingRequest.lineUserId` holds, *not* the `U…` sub;
+    keying it wrong is a room nobody is in and an event that silently vanishes), `venue:<venueId>`,
+    or the one shared `schedule:all`. There is deliberately **no method that emits namespace-wide**.
+  - **Three events, and `D-C13` is which room each goes to:** `client.bookingUpdated`
+    (`{ id, code, status, rejectReason }` → the owner's room *only*: a code and a reject reason are
+    one person's business), `client.venueAvailabilityChanged` (`{ venueId }` **and nothing else** →
+    that venue's watchers, so it says availability moved and never whose), and
+    `client.scheduleUpdated` (**payload-free** → `schedule:all`). 🔴 `emitSchedulePulse()` takes no
+    argument and must never grow one — that room holds every connected end-user, so anything it
+    carries is published to all of them.
+  - **It accepts inbound messages, the first in the codebase**: `venue:watch` / `venue:unwatch`, which
+    change room membership and nothing else (hand-validated, capped by `CLIENT_MAX_ROOMS_PER_SOCKET`).
+    No booking is created, cancelled or approved over a socket — every write goes through REST so it
+    can answer with a status code and a reason.
+
+**What reaches `/client` is decided by STATUS, never by `kind`** (`src/bookings/booking-realtime.ts`),
+through **two separate lists** — the split is structural because one of them is a privacy boundary.
+`CLIENT_ANNOUNCED_STATUSES` (owner + venue rooms) includes **`PENDING`**, and must, because
+`OCCUPYING_STATUSES` does: a pending request occupies the venue calendar the moment it lands, so a
+competing user on `#/venue/:id` has to watch the hour go amber or they will submit for the same slot —
+the occupancy rule and the fan-out rule have to agree. It also includes **`EXPIRED`** (#ISSUE-06): the
+expiry cron frees the hour a pending request was painting, so the owner's room and the venue's room
+hear it — never `schedule:all`. `SCHEDULE_PULSE_STATUSES` is `APPROVED` /
+`CANCELLED` **only**: `#/home` shows approved activities, so pulsing `schedule:all` for a pending
+submission would both leak that an unapproved request exists and make every open client refetch a view
+that cannot have changed. Both LIFF cancellations (`cancelPendingBooking`, `cancelApprovedSlot`)
+publish through the same dispatcher, so a user freeing a slot moves the admin queue *and* every
+competing calendar.
+
+Both gateways are **fail-soft and emit only after the commit**: `publishBookingRequests` takes
+`PrismaService` — a `Prisma.TransactionClient` is not assignable to it, which is the compile-time form
+of that rule — each namespace gets its own `try/catch` so one dead transport cannot cost the other its
+event, and a fan-out failure is a `warn` carrying ids only, never a failed HTTP write.
+`LineModule` imports `RealtimeModule` so `LineUserService` emits through the gateway directly.
+`OptionsModule` (`src/options/`) exposes the admin-curated `Department` / `PersonnelRole` option
+tables via `DepartmentsController` / `PersonnelRolesController` — the same tables `SystemUser` and
+LINE registrations reference (see the `isSystemReserved` note below). Booking/Resource domain
+modules don't exist yet — they are added as their own future tasks; don't assume they're stubbed
+out anywhere.
 `AuthModule` ↔ `SystemUsersModule` is a genuine circular reference resolved with `forwardRef` on both
 sides: `SystemUsersModule` needs the guards, and `AuthSystemController` needs `SystemUsersService`
 (which owns every `SystemUser` write — `PATCH /auth/system/me` and the avatar's `profilePictureUrl`
 included). Re-providing `SystemUsersService` in `AuthModule` instead would mint a **second instance**
 and is exactly the drift `PUBLIC_FIELDS` exists to prevent. `StorageModule` is imported by `AuthModule`
-only.
+and `VenuesModule`. **Scheduling is split in two:** the single `ScheduleModule.forRoot()` lives in
+`AppModule`. Each job is a provider in its own module: `OrphanPhotoSweeperCron` in `StorageModule`
+(daily 03:00 `venues/_new/` sweep) and `BookingExpiryCron` in `BookingsModule` (every minute,
+`PENDING` → `EXPIRED` at `firstStartAt`, #ISSUE-06). **All three registrations read one constant**,
+`SCHEDULING_ENABLED` in `src/common/scheduling.constants.ts`. Under jest (`NODE_ENV=test` /
+`JEST_WORKER_ID` set) none of them is added to the module graph, because `test/e2e-app.ts` boots the
+real `AppModule` and a registered `CronJob` is an open handle in every e2e suite. Guarding inside the
+handler body is not equivalent and does not work.
 
 **API surface**: the global prefix is `API_BASE_PATH` (`src/common/api.constants.ts` = `/api/v1`).
 Controllers are mounted under that automatically via `main.ts`; don't hardcode `/api/v1` in
@@ -90,6 +154,14 @@ importing `PrismaModule`. Prisma 7 specifics:
   a non-2xx/exception response. Follow this pattern for new event types.
 - `LineService` is a thin wrapper over `@line/bot-sdk`'s `MessagingApiClient` /
   `MessagingApiBlobClient` (reply/push messaging, rich-menu CRUD). Nothing here talks to Prisma.
+- **Channel credentials can change at runtime** (`INTEGRATIONS-API-1`): `LineCredentialsService` holds
+  the Channel ID / secret / access token, `AppSetting` rows (`line.*`, saved by a SUPER_ADMIN through
+  `PATCH /system/integrations/line`) winning over `LINE_CHANNEL_*`. A new token rebuilds
+  `LineService.client` (keep that field name — the e2e suites read it to prove their fake is wired);
+  `LineSignatureGuard` reads the secret from it per request. 🔴 Stored rows are **ignored under
+  `NODE_ENV=test`**, or a token saved in the dev DB would replace the e2e fake client with a real one
+  and `announcements-send` would really multicast. The secret and token sit in **plaintext** in
+  `app_settings` and are never returned by any endpoint.
 - `LineUserService` owns the `LineUser` Prisma model: upsert-on-follow (preserves existing
   `access`/`richMenuType` on re-follow), soft-delete-on-unfollow (`deletedAt`, never a hard
   delete), and applying a user's `richMenuType` to their live LINE account.
@@ -244,8 +316,12 @@ also the only enforcement needed for "PATCH cannot set `password`/`email`/`lineU
 fields simply don't exist on `UpdateSystemUserDto`. Note that `useDefineForClassFields` is effective
 (it defaults to true at `target` >= ES2022; currently ES2022), so `'role' in dto` is *always* true — test presence with `dto.role !== undefined`,
 and use `@ValidateIf((_o, v) => v !== undefined)` (not `@IsOptional()`) on optional non-nullable
-fields, or an explicit `null` reaches a `NOT NULL` column. Swagger is wired in `main.ts` and can be
-disabled via `SWAGGER_ENABLED=false`; controllers not meant for the public contract (like the LINE
+fields, or an explicit `null` reaches a `NOT NULL` column. Swagger is mounted by `mountSwagger`
+(`src/system/swagger.setup.ts`) and gated **at runtime** by `SwaggerGateService`: the stored
+`AppSetting system.swagger_enabled` wins, else `SWAGGER_ENABLED=true`, else **off** (unset = off since
+`INTEGRATIONS-API-1`; `.env.example` sets `true` because the app's `gen:api` needs `/docs-json`). While
+off, the docs paths answer Nest's own 404. The gate must be mounted before `app.init()` — the e2e app
+does it through `createE2eApp`'s `beforeInit` hook; controllers not meant for the public contract (like the LINE
 webhook) should use `@ApiExcludeController()`.
 
 **Environment** (see `.env.example`): `PORT` (3300), `CORS_ORIGIN` (defaults to the Vite dev

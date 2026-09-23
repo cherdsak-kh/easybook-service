@@ -22,12 +22,80 @@ import { isCookieSecure, resolveSameSite } from '../config/env.validation';
  * double-submit CSRF that protects the cookie-session admin surface is irrelevant to them (same
  * reasoning as the webhook). The two option GETs and `GET /line-users/status` are GETs and already
  * CSRF-safe via `ignoredMethods`. The admin option CRUD is cookie-session and is NOT exempt.
+ *
+ * `POST /line-users/bookings` (`CLIENT-BOOKING-1`) joins the list on exactly the same grounds: same
+ * `LineIdTokenGuard`, same bearer token, same absence of a cookie.
+ *
+ * `PATCH /line-users/settings` (Phase 7a, `Q-C9`) joins on those same grounds again. Its two
+ * neighbours — `GET /line-users/settings` and `GET /line-users/version` — need no entry: they are
+ * GETs and `ignoredMethods` already exempts them by method.
+ *
+ * `POST /line-users/feedback` and `POST /line-users/feedback/photos` (`CLIENT-ISSUE-1`) join on
+ * those same grounds a third time — same `LineIdTokenGuard`, same bearer token, same absence of a
+ * cookie. ⚠️ BOTH ENTRIES ARE NEEDED AND THE FIRST DOES NOT COVER THE SECOND: matching is exact
+ * `req.path`, exactly as the settings pair already demonstrates. The multipart route is no
+ * different from the JSON one here — the upload carries no cookie either, and a multipart body
+ * could not carry a `_csrf` field anyway (the token is a header, never a body key).
+ *
+ * 🔴 THE TEST FOR THIS LIST IS "IS THERE AMBIENT AUTHORITY?", NEVER "IS IT INCONVENIENT?". A path
+ * belongs here only when the request carries no cookie a foreign origin could ride — a bearer token
+ * has to be read and attached by script, which the same-origin policy already prevents. Adding a
+ * cookie-session route here would silently remove its CSRF protection with no test failing.
+ *
+ * ⚠️ MATCHED BY EXACT `req.path`, so every entry here is a literal with no parameters. A route with
+ * a path parameter cannot be exempted by this list at all — see {@link CSRF_EXEMPT_PATTERNS}, which
+ * exists for exactly that and applies the same admission test. GET routes need no entry in either:
+ * `ignoredMethods` already exempts them by method.
  */
 export const CSRF_EXEMPT_PATHS: readonly string[] = [
   `${API_BASE_PATH}/line/webhook`,
   `${API_BASE_PATH}/line-users/register`,
   `${API_BASE_PATH}/line-users/registration`,
+  `${API_BASE_PATH}/line-users/bookings`,
+  `${API_BASE_PATH}/line-users/settings`,
+  `${API_BASE_PATH}/line-users/feedback`,
+  `${API_BASE_PATH}/line-users/feedback/photos`,
 ];
+
+/** Escapes a literal so it can be embedded in a `RegExp` — `API_BASE_PATH` is configuration. */
+const literal = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** One URL path segment: no `/`, no `.`, and bounded — the shape of a cuid or a booking `code`. */
+const SEGMENT = '[A-Za-z0-9_-]{1,64}';
+
+/**
+ * The same exemption, for the routes whose paths carry a PARAMETER.
+ *
+ * 🔴 WHY THIS LIST HAD TO EXIST AT ALL. {@link CSRF_EXEMPT_PATHS} is matched by exact `req.path`,
+ * which no parameterised route can ever satisfy — `PATCH /line-users/bookings/<cuid>/cancel` is a
+ * different string on every request. Before `CLIENT-BOOKING-2` every cookieless bearer route
+ * happened to be a literal, so the limitation cost nothing and reads in that list's own comment as
+ * if it were a design choice. It was an accident of the routes that existed.
+ *
+ * 🔴 THE ADMISSION TEST IS UNCHANGED AND IS THE ONLY THING THAT MATTERS: *is there ambient
+ * authority?* Both entries are `LineIdTokenGuard` routes — bearer token, no cookie, nothing a
+ * foreign origin could ride. Adding a cookie-session route here would silently remove its CSRF
+ * protection with no test failing, and a pattern makes that easier to do by accident than a literal
+ * does, which is why the two lists are kept apart rather than merged.
+ *
+ * ⚠️ EVERY PATTERN IS ANCHORED AT BOTH ENDS AND CONTAINS NO `.` OR `.*`. The segment class excludes
+ * `/`, so `^…/bookings/<SEGMENT>/cancel$` cannot be widened by a crafted path — no traversal, no
+ * suffix, no second route smuggled in behind a slash. An unanchored or dot-bearing pattern here
+ * would be an exemption for paths nobody enumerated.
+ */
+export const CSRF_EXEMPT_PATTERNS: readonly RegExp[] = [
+  new RegExp(
+    `^${literal(API_BASE_PATH)}/line-users/bookings/${SEGMENT}/cancel$`,
+  ),
+  new RegExp(
+    `^${literal(API_BASE_PATH)}/line-users/bookings/${SEGMENT}/slots/${SEGMENT}/cancel$`,
+  ),
+];
+
+/** True when a path is exempt by either list. The only reader is {@link CsrfService.middleware}. */
+export const isCsrfExempt = (path: string): boolean =>
+  CSRF_EXEMPT_PATHS.includes(path) ||
+  CSRF_EXEMPT_PATTERNS.some((re) => re.test(path));
 
 export const CSRF_COOKIE_NAME = 'eb.csrf';
 export const INVALID_CSRF_TOKEN = 'Invalid CSRF token.';
@@ -78,10 +146,10 @@ export class CsrfService {
     return this.csrf.invalidCsrfTokenError;
   }
 
-  /** The protection middleware, with the LINE webhook exempted (exact `req.path` match). */
+  /** The protection middleware, with the two exemption lists applied. */
   middleware(): RequestHandler {
     return (req: Request, res: Response, next: NextFunction) =>
-      CSRF_EXEMPT_PATHS.includes(req.path)
+      isCsrfExempt(req.path)
         ? next()
         : this.csrf.doubleCsrfProtection(req, res, next);
   }

@@ -40,11 +40,20 @@ export class LineWebhookService {
         if (userId) {
           await this.storeFollower(userId);
         }
-        if (event.replyToken) {
-          await this.line.reply(event.replyToken, [
-            { type: 'text', text: 'Welcome to easy-book-app! 🎉' },
-          ]);
-        }
+        /*
+         * ⚠️ NO REPLY (PO, 22 ส.ค. 2569). This used to answer `Welcome to easy-book-app! 🎉` — an
+         * English line, in a product whose every other word is Thai, that had survived from the
+         * first day of the LINE module.
+         *
+         * ⚠️ IT DOES NOT MEAN A NEW FOLLOWER IS GREETED BY SILENCE, and that is why deleting it is
+         * safe rather than a regression. LINE has a **greeting message** of its own, configured in
+         * the Official Account Manager and delivered by LINE the instant somebody adds the account
+         * — before this webhook is even called. It is where a welcome belongs: editable by whoever
+         * owns the copy, without a deploy. Two welcomes would have arrived back to back.
+         *
+         * What still happens here is the part only we can do: `storeFollower` writes the row the
+         * back-office lists them from.
+         */
         break;
       }
 
@@ -56,15 +65,22 @@ export class LineWebhookService {
         break;
       }
 
+      /*
+       * ⚠️ A TYPED MESSAGE IS ANSWERED WITH NOTHING (PO, 22 ส.ค. 2569). It used to echo
+       * `You said: ${text}` — a scaffold from the day the webhook was wired up, which had become
+       * the product telling every user, in English, that nobody is reading.
+       *
+       * Silence is the honest answer while there is no conversational feature: the account's
+       * surface is the rich menu and the LIFF app, and an echo invited people to type at a bot
+       * that cannot help them. The event is still handled — it is the only signal a chat-only
+       * follower gives us that their LINE profile may have changed.
+       */
       case 'message':
-        if (event.message.type === 'text' && event.replyToken) {
-          await this.line.reply(event.replyToken, [
-            { type: 'text', text: `You said: ${event.message.text}` },
-          ]);
-        }
+        await this.refreshProfile(event);
         break;
 
       case 'postback': {
+        await this.refreshProfile(event);
         if (!event.replyToken) {
           break;
         }
@@ -102,6 +118,28 @@ export class LineWebhookService {
 
   private userIdOf(event: webhook.Event): string | undefined {
     return event.source?.type === 'user' ? event.source.userId : undefined;
+  }
+
+  /**
+   * Keep a chat-only follower's stored LINE profile from going stale.
+   *
+   * LINE announces a rename with **no event at all**, so the only way to learn about one is to
+   * look while the user happens to be talking to us. Anybody who opens the LIFF is refreshed for
+   * free from their own ID token (`LineUserService.getStatus`); this covers the follower who only
+   * ever uses the chat, and it costs a real `getProfile` call — hence the cooldown inside
+   * `refreshProfileFromLine` rather than a fetch per message.
+   *
+   * ⚠️ NOT ON `follow`, which does the fuller `upsertOnFollow` (it also clears `deletedAt` and
+   * moves `followedAt`), and NOT on `unfollow`, where refreshing the profile of somebody who just
+   * left would be work in the wrong direction.
+   *
+   * ⚠️ IT NEVER THROWS AND NEVER BLOCKS THE REPLY'S CORRECTNESS. `handleEvents` already swallows
+   * per-event failures so LINE does not retry the batch, and this is awaited only so the refresh
+   * cannot outlive the request that started it.
+   */
+  private async refreshProfile(event: webhook.Event): Promise<void> {
+    const userId = this.userIdOf(event);
+    if (userId) await this.users.refreshProfileFromLine(userId);
   }
 
   /** Best-effort profile fetch + upsert; the row is stored even if getProfile fails. */

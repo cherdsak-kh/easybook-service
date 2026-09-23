@@ -45,10 +45,10 @@ describe('isRealtimeEligible', () => {
   it.each([
     [SystemRole.SUPER_ADMIN, false, true],
     [SystemRole.ADMIN, false, true],
-    [SystemRole.STAFF, false, false],
+    [SystemRole.VIEWER, false, false],
     [SystemRole.SUPER_ADMIN, true, false],
     [SystemRole.ADMIN, true, false],
-    [SystemRole.STAFF, true, false],
+    [SystemRole.VIEWER, true, false],
   ])(
     'role=%s mustChangePassword=%s -> %s',
     (role, mustChangePassword, expected) => {
@@ -193,8 +193,8 @@ describe('the authorize step (design §3.4 outcome table)', () => {
     expect(error?.message).toBe(REALTIME_ERRORS.unauthenticated);
   });
 
-  it('STAFF -> FORBIDDEN', async () => {
-    findUnique.mockResolvedValue({ ...liveRow, role: SystemRole.STAFF });
+  it('VIEWER -> FORBIDDEN', async () => {
+    findUnique.mockResolvedValue({ ...liveRow, role: SystemRole.VIEWER });
     const error = await run(authenticate, makeSocket(fresh()));
     expect(error?.message).toBe(REALTIME_ERRORS.forbidden);
   });
@@ -240,12 +240,12 @@ describe('the authorize step (design §3.4 outcome table)', () => {
   });
 
   it('rejections carry a coarse status class ONLY — no id, email or role', async () => {
-    findUnique.mockResolvedValue({ ...liveRow, role: SystemRole.STAFF });
+    findUnique.mockResolvedValue({ ...liveRow, role: SystemRole.VIEWER });
     const error = await run(authenticate, makeSocket(fresh()));
 
     expect(error?.message).toBe('FORBIDDEN');
     expect(error?.message).not.toContain('user-1');
     expect(error?.message).not.toContain('ada@easybook.local');
-    expect(error?.message).not.toContain('STAFF');
+    expect(error?.message).not.toContain('VIEWER');
   });
 });

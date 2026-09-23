@@ -21,7 +21,7 @@ const baseRow: PublicSystemUser = {
   email: 'ada@easybook.local',
   firstName: 'Ada',
   lastName: 'Lovelace',
-  role: SystemRole.STAFF,
+  role: SystemRole.VIEWER,
   department: { id: 7, name: 'IT' },
   personnelRole: { id: 9, name: 'Director' },
   mustChangePassword: false,

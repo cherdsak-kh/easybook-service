@@ -10,18 +10,24 @@ export interface RichMenuSpec {
  * Identifies the live rich menu for each RichMenuType by name + size (as created
  * by `scripts/setup-rich-menu.ts`).
  *
- * NOTE: both menus are now 2500x1686. TYPE_1 used to be the half-height 2500x843
- * format, and while it was, size genuinely disambiguated the two. It no longer
- * does — the NAME is the only discriminator today, so `findRichMenuId` degrades to
- * a name match and duplicate names on the LINE account would make resolution
+ * NOTE: TYPE_1 is the half-height 2500x843 format and TYPE_2 is the full-height
+ * 2500x1686 one, so name + size is once again a genuine composite key. Do NOT
+ * lean on that: this height has flipped twice already (843 → 1686 on 2026-07-31,
+ * back to 843 with the current artwork), and whenever the two menus share a size
+ * the NAME is the only discriminator left — `findRichMenuId` then degrades to a
+ * name match, and duplicate names on the LINE account would make resolution
  * non-deterministic. The setup script deletes menus by name before recreating
  * them, which is what keeps duplicates from existing in the first place. Keep
  * these dimensions in sync with the actual files in `assets/richmenu/` — LINE
  * rejects an upload whose image size differs from the size declared at create
- * time.
+ * time, and it accepts only a fixed set of sizes (2500x1686, 2500x843, 1200x810,
+ * 1200x405, 800x540, 800x270).
+ *
+ * Verified 2026-08-29 against the JPEG SOF markers: menu_type_1.jpg is 2500x843
+ * and menu_type_2.jpg is 2500x1686.
  */
 export const RICH_MENU_SPECS: Record<RichMenuType, RichMenuSpec> = {
-  TYPE_1: { name: 'easy-book-liff', width: 2500, height: 1686 },
+  TYPE_1: { name: 'easy-book-liff', width: 2500, height: 843 },
   TYPE_2: { name: 'easy-book-main', width: 2500, height: 1686 },
 };
 
@@ -53,19 +59,19 @@ export interface RichMenuShortcut {
 export const RICH_MENU_SHORTCUTS = {
   myBookings: {
     data: 'action=my-bookings',
-    label: 'My Bookings',
+    label: 'การจองของฉัน',
     pendingMessage:
       'ฟีเจอร์ "การจองของฉัน" กำลังพัฒนาอยู่ เร็ว ๆ นี้จะเปิดให้ใช้งาน 🙏',
   },
   reportIssue: {
     data: 'action=report-issue',
-    label: 'Report Issue',
+    label: 'แจ้งปัญหา',
     pendingMessage:
       'ฟีเจอร์ "แจ้งปัญหา" กำลังพัฒนาอยู่ เร็ว ๆ นี้จะเปิดให้ใช้งาน 🙏',
   },
   settings: {
     data: 'action=settings',
-    label: 'Settings',
+    label: 'ตั้งค่า',
     pendingMessage:
       'ฟีเจอร์ "ตั้งค่า" กำลังพัฒนาอยู่ เร็ว ๆ นี้จะเปิดให้ใช้งาน 🙏',
   },

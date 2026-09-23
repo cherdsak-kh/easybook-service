@@ -35,7 +35,7 @@
  * resetting the credential IS the request. What that reversal must NOT drag along, and does not:
  *   - `role` is untouched in the `update` branch, AND an existing non-SUPER_ADMIN at that address is
  *     REFUSED outright (see `assertTargetIsSuperAdminOrAbsent`). Otherwise `--force` on a typo'd
- *     address would reset an ordinary ADMIN/STAFF user's password and flip their `isActive` /
+ *     address would reset an ordinary ADMIN/VIEWER user's password and flip their `isActive` /
  *     `deletedAt` — privilege-adjacent damage by typo.
  *   - `lineUserId` stays untouched. It is a notification address, not a credential.
  *   - The email burn + restore contract still holds: `upsert` on `email` returns the SAME row,
@@ -56,6 +56,10 @@ import { Logger } from '@nestjs/common';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { Prisma, PrismaClient, SystemRole } from '@prisma/client';
 import { PasswordService } from '../src/auth/password.service';
+import {
+  TOMBSTONE_DEPARTMENT_NAME,
+  TOMBSTONE_PERSONNEL_ROLE_NAME,
+} from '../src/options/options.constants';
 
 const logger = new Logger('CreateSuperAdmin');
 
@@ -71,9 +75,48 @@ export const MIN_PASSWORD_LENGTH = 12;
  * expression. No name comparison ever decides privilege; the `isSystemReserved` FLAG is the boundary
  * and `SystemUser.role` is the only thing that grants anything.)
  */
-export const RESERVED_DEPARTMENT_NAME = 'ผู้พัฒนาระบบ (System Developer)';
-export const RESERVED_PERSONNEL_ROLE_NAME =
-  'ผู้ดูแลระบบระดับสูง (System Administrator)';
+/*
+ * ⚠️ RENAMED 19 ส.ค. 2569 (PO), and the pair now reads as a PERSON and the UNIT that person sits
+ * in: `ผู้พัฒนาระบบ` is a job title, `ฝ่ายพัฒนาระบบ` is where the job is done. Previously they were
+ * `ผู้พัฒนาระบบ` (department) and `EasyBook Development` (position) — a person-shaped name in the
+ * table of units, a product name in the table of titles, and neither matching the prototype.
+ *
+ * The English gloss in parentheses is kept on both, because on screen these two rows sit in a list
+ * of ordinary Thai options an operator curates: the gloss is what makes a row read as "belonging to
+ * the system" at a glance, next to `ผู้ดูแลระบบ`, which is an ordinary row granting nothing.
+ * It is a READING AID, never the boundary — `isSystemReserved` is.
+ *
+ * ⚠️ RENAMING THESE IS NOT RENAMING THE ROWS IN A DATABASE THAT ALREADY RAN THIS SCRIPT. Both are
+ * resolved BY NAME, so a rename makes the next run CREATE a new pair and re-point the SUPER_ADMIN
+ * at it; the old two rows survive, still flagged reserved, and no endpoint can rename or delete
+ * them (a reserved row is a 404 to everyone, SUPER_ADMIN included). An existing database therefore
+ * needs a reseed or a hand-written SQL fix — there is no in-product path.
+ */
+export const RESERVED_DEPARTMENT_NAME = 'ฝ่ายพัฒนาระบบ (System Development)';
+export const RESERVED_PERSONNEL_ROLE_NAME = 'ผู้พัฒนาระบบ (System Developer)';
+
+/**
+ * The TOMBSTONE rows: where the holders of a deleted option are re-pointed (OPT-FALLBACK-1).
+ *
+ * `departmentId` and `personnelRoleId` are REQUIRED FKs on both `SystemUser` and
+ * `LineUserRegistration`, so "the option they held was deleted" is not a state the database can
+ * hold — there is no null to move them to. Something has to receive them, it has to exist before
+ * the first delete rather than be conjured during one, and it must never be assignable, or an
+ * admin could file a real person under "not found" from a dropdown.
+ *
+ * Reserved is exactly that property and it already exists, so these are ordinary reserved rows and
+ * this script stays the only writer of `isSystemReserved: true` in the codebase. They are seeded
+ * here and not in `options:seed` for the same reason the two above are: that command must never
+ * write the flag.
+ *
+ * ⚠️ The names are DELIBERATELY not a euphemism. An operator reading a staff row that says
+ * "ไม่พบตำแหน่ง" is being told the truth — the option that row pointed at was deleted — and any
+ * softer wording would read as a real job title and hide it.
+ */
+export {
+  TOMBSTONE_DEPARTMENT_NAME,
+  TOMBSTONE_PERSONNEL_ROLE_NAME,
+} from '../src/options/options.constants';
 
 /** Max re-prompts per field, so a non-interactive edge case cannot spin forever. */
 const MAX_ATTEMPTS = 3;
@@ -322,7 +365,7 @@ export const NOT_A_SUPER_ADMIN_MESSAGE =
  *
  * Necessary because `role` is absent from the `upsert`'s `update` block, which prevents a silent
  * PROMOTION but does not prevent the damage: without this check, `--force` on a typo'd address would
- * blindly reset an ordinary ADMIN/STAFF user's `passwordHash`, clear their forced-reset gate, and
+ * blindly reset an ordinary ADMIN/VIEWER user's `passwordHash`, clear their forced-reset gate, and
  * flip `isActive` / `deletedAt`. Absence from `update` is necessary but NOT sufficient.
  *
  * Deliberately looks past `deletedAt`: a soft-deleted ADMIN at that address is still that ADMIN's
@@ -379,6 +422,16 @@ export async function createSuperAdmin(
   // uniqueness is a PARTIAL index (`WHERE deletedAt IS NULL`), which upsert cannot express.
   const personnelRoleId = await resolveOrCreateReservedPersonnelRole(prisma);
   const departmentId = await resolveOrCreateReservedDepartment(prisma);
+
+  // The tombstones (OPT-FALLBACK-1). Same helpers, different names — resolve-or-create is already
+  // idempotent, so running this script again adopts the existing rows rather than duplicating them.
+  // Seeded here rather than on first use because a delete that has to CREATE its own destination
+  // fails at the worst possible moment: mid-transaction, with holders already counted.
+  await resolveOrCreateReservedPersonnelRole(
+    prisma,
+    TOMBSTONE_PERSONNEL_ROLE_NAME,
+  );
+  await resolveOrCreateReservedDepartment(prisma, TOMBSTONE_DEPARTMENT_NAME);
 
   const isReset = existing > 0;
 

@@ -1,0 +1,503 @@
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform, Type } from 'class-transformer';
+import {
+  ArrayMaxSize,
+  ArrayUnique,
+  IsArray,
+  IsIn,
+  IsInt,
+  IsNotEmpty,
+  IsOptional,
+  IsString,
+  IsUrl,
+  Max,
+  MaxLength,
+  Min,
+  ValidateIf,
+} from 'class-validator';
+import { ListFacetsDto } from '../../common/dto/list-facets.dto';
+import { sanitizeThaiText } from '../../common/sanitize-thai.util';
+import { PaginationMetaDto } from '../../system-users/dto/paginated-system-users-response.dto';
+import { VENUE_PHOTOS_MAX } from '../venues.constants';
+
+/**
+ * ⚠️ STILL HERE ON PURPOSE, but for TWO fields now, not three — `closedReason` and the photo `url`.
+ *
+ * - **`url`**: rewriting a URL's characters would be a bug, not a fix. An object key is opaque
+ *   percent-encoded bytes; `sanitizeThaiText` folding a pair of them would produce a URL that
+ *   addresses nothing, and the failure would look like a missing photo.
+ * - **`closedReason`**: nothing ever MATCHES on it. It is displayed prose — never a search key,
+ *   never compared against a stored string — so the false "not found" that `sanitizeThaiText`
+ *   exists to prevent has no way to occur here. Untouched for now rather than untouchable:
+ *   sanitising it would be harmless, just not load-bearing, so it is not worth the churn.
+ *
+ * ⚠️ `q` LEFT THIS LIST. It is compared against `Venue.name`, which is WRITTEN through
+ * `sanitizeThaiText` — so a query normalised differently from the write path can never match a row
+ * that only ever existed in the normalised spelling, and the operator reads that as "the venue is
+ * gone". Query normalisation must equal write normalisation; see `ListVenuesQueryDto.q`.
+ */
+const trim = ({ value }: { value: unknown }): unknown =>
+  typeof value === 'string' ? value.trim() : value;
+
+/**
+ * `''` → `null`, so an emptied optional text field CLEARS the column instead of storing a blank
+ * string. Two representations of "nothing" in one nullable column is how `location === ''` starts
+ * rendering as an empty line where the card expects an em-dash.
+ */
+const emptyToNull = ({ value }: { value: unknown }): unknown => {
+  if (typeof value !== 'string') return value;
+  const t = value.trim();
+  return t === '' ? null : t;
+};
+
+export const VENUE_STATUSES = ['open', 'closed'] as const;
+export type VenueStatus = (typeof VENUE_STATUSES)[number];
+
+/**
+ * The search box and the two filters the venues screen offers — and only those.
+ *
+ * ⚠️ NO PAGINATION ON THE **ADMIN** LIST, and that is a decision rather than an omission. `GET /venues`
+ * returns everything; the footer states a count. The LIFF catalogue is paginated since
+ * `CLIENT-PAGINATION-1`, through {@link ListLineVenuesQueryDto}, which EXTENDS this class — so the two
+ * surfaces share one definition of the search and the two filters, and only the consumer grows pages.
+ * There is also no `capacity` filter: a range control is the third-biggest thing in the toolbar, and
+ * "at least N people" belongs on the LIFF booking form where somebody actually knows N.
+ */
+export class ListVenuesQueryDto {
+  /**
+   * ⚠️ SANITISED WITH THE SAME FUNCTION THE WRITE PATH USES, and that symmetry IS the feature.
+   * `Venue.name` is stored through `sanitizeThaiText`, so a row typed as `ห้องเเดง` (SARA E twice)
+   * is stored as `ห้องแดง` (SARA AE). The two render identically, so an operator who searches by
+   * typing the name the same way they originally typed it would send the double-SARA-E spelling —
+   * which, under a plain `trim`, is a different string from every byte in the column and returns
+   * zero rows. The screen then says the venue does not exist while the venue is sitting in the list
+   * behind the filter.
+   *
+   * `sanitizeThaiText` can only SHORTEN or PRESERVE (see its header), so it cannot make a `q` that
+   * passed `@MaxLength(100)` newly overflow, and a non-string is returned untouched so `@IsString()`
+   * still produces the 400 rather than the transform coercing it.
+   *
+   * ⚠️ `location` IS NOT STORED SANITISED (it keeps `emptyToNull`'s plain trim), so the OR-branch on
+   * location only matches locations that were themselves typed correctly. That is a strict
+   * improvement over the previous state, not a regression: before this, a malformed `q` matched
+   * NEITHER column. Sanitising `location` on write is the follow-up, not a reason to leave `q` wrong.
+   */
+  @ApiPropertyOptional({
+    maxLength: 100,
+    description:
+      'Case-insensitive substring match on the venue NAME or LOCATION. Normalised with the same Thai sanitiser the venue name is stored with (double SARA E → SARA AE, tone reordering, zero-widths stripped, trimmed), so a search matches what was written; empty/absent → no search filter.',
+  })
+  @Transform(sanitizeThaiText)
+  @IsString()
+  @MaxLength(100)
+  @IsOptional()
+  q?: string;
+
+  /**
+   * ⚠️ THE RESERVED TOMBSTONE ID IS ACCEPTED HERE, and that is the exact opposite of what `POST` and
+   * `PATCH` do with it — on purpose. The tombstone is where venues LAND when their category is
+   * deleted, so an operator must be able to filter for "what fell in there" to repair it. What they
+   * must not be able to do is FILE a venue into it deliberately, which would make the row mean two
+   * different things. Reading a bucket and choosing it are different acts.
+   */
+  @ApiPropertyOptional({
+    description:
+      'Filter by category id. The reserved tombstone id is accepted here (unlike on create/update), so orphaned venues can be found and re-filed.',
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  venueTypeId?: number;
+
+  @ApiPropertyOptional({
+    enum: VENUE_STATUSES,
+    description: '`open` = เปิดให้จอง · `closed` = ปิดชั่วคราว. Absent → both.',
+  })
+  @IsIn(VENUE_STATUSES)
+  @IsOptional()
+  status?: VenueStatus;
+}
+
+/**
+ * The fields shared by create and update. Kept as one class rather than two so a new column cannot
+ * be added to one path and forgotten on the other.
+ *
+ * ⚠️ `isOpen` AND `closedReason` ARE ABSENT FROM BOTH, and their absence IS the control:
+ * `forbidNonWhitelisted: true` turns any attempt to set them into a 400 (AC-S6). Closing requires a
+ * reason and reopening clears it, so it is a TRANSITION with its own endpoints — folding it in here
+ * would create a path that sets `isOpen: false` with no reason attached, inside a diff somebody
+ * skimmed while fixing a typo.
+ */
+class VenueWritableFields {
+  @ApiProperty({ example: 'หอประชุมวารณ', maxLength: 120 })
+  @Transform(sanitizeThaiText)
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  name!: string;
+
+  @ApiProperty({
+    example: 4,
+    description:
+      'Category id. Must be an ACTIVE, non-reserved venue type — anything else is the same 400 as an unknown id.',
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  venueTypeId!: number;
+
+  @ApiProperty({ example: 900, minimum: 1, maximum: 100000 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100000)
+  capacity!: number;
+
+  @ApiPropertyOptional({
+    // ⚠️ `type: String` IS NOT REDUNDANT ON A NULLABLE FIELD. The reflected `design:type` of a
+    // `string | null` union is `Object`, so Swagger emits a schema with no `type` at all and
+    // `openapi-typescript` renders it as `Record<string, never>` — a frontend that then cannot
+    // assign a string to its own location field. Found by the app's `tsc -b`, not by reading.
+    type: String,
+    example: 'อาคารหอประชุม ชั้น 1',
+    maxLength: 200,
+    nullable: true,
+    description: 'ที่ตั้ง. An empty string clears it.',
+  })
+  // `@ValidateIf`, not `@IsOptional()` — see the repo note on `useDefineForClassFields`: an explicit
+  // `null` must reach the column (that is how the field is CLEARED), and `@IsOptional()` would skip
+  // validation for null as well as undefined, which is the same outcome here but for the wrong
+  // reason. Being explicit keeps the two cases distinguishable if a NOT NULL column ever copies this.
+  @ValidateIf((_o, v) => v !== undefined && v !== null)
+  @Transform(emptyToNull)
+  @IsString()
+  @MaxLength(200)
+  @IsOptional()
+  location?: string | null;
+
+  @ApiPropertyOptional({
+    type: String,
+    example: 'หอประชุมใหญ่ของโรงเรียน มีเวทีถาวรและระบบไฟเวที',
+    maxLength: 500,
+    nullable: true,
+    description: 'รายละเอียด. An empty string clears it.',
+  })
+  @ValidateIf((_o, v) => v !== undefined && v !== null)
+  @Transform(emptyToNull)
+  @IsString()
+  @MaxLength(500)
+  @IsOptional()
+  description?: string | null;
+
+  /**
+   * The whole tick set, not a diff. Absent → no ticks (create) / unchanged (update).
+   *
+   * `@ArrayUnique` because `[3, 3]` would otherwise hit the composite primary key and surface as a
+   * P2002 the operator reads as "amenity already exists".
+   */
+  @ApiPropertyOptional({
+    type: [Number],
+    example: [1, 3, 4],
+    description:
+      'The COMPLETE set of amenity ids for this venue — the server replaces, it does not merge. Every id must be an ACTIVE amenity.',
+  })
+  @IsArray()
+  @ArrayUnique()
+  @Type(() => Number)
+  @IsInt({ each: true })
+  @Min(1, { each: true })
+  @IsOptional()
+  amenityIds?: number[];
+
+  /**
+   * The whole ORDERED photo set, not a diff. `photoUrls[0]` IS THE COVER.
+   *
+   * ⚠️ EVERY URL MUST ALREADY HAVE BEEN UPLOADED through `POST /venues/photos`. The service checks
+   * the bucket prefix; see `INVALID_PHOTO_URL` for why this is stricter than the avatar contract.
+   *
+   * ⚠️ `@ArrayMaxSize` IS THE REAL CEILING. The dialog also stops at ten and says what it refused,
+   * but that is UX — a limit enforced only in a file picker is a suggestion (AC-S8).
+   */
+  @ApiPropertyOptional({
+    type: [String],
+    maxItems: VENUE_PHOTOS_MAX,
+    description: `The COMPLETE ordered list of photo URLs; index 0 is the cover. Max ${VENUE_PHOTOS_MAX}. Each must be a URL returned by POST /venues/photos.`,
+  })
+  @IsArray()
+  @ArrayMaxSize(VENUE_PHOTOS_MAX)
+  @ArrayUnique()
+  @IsUrl({ protocols: ['https'], require_protocol: true }, { each: true })
+  @IsOptional()
+  photoUrls?: string[];
+}
+
+/** Body for `POST /venues`. A venue is always created OPEN — the form has no switch in create mode. */
+export class CreateVenueDto extends VenueWritableFields {}
+
+/**
+ * Body for `PATCH /venues/:id`.
+ *
+ * Every field is optional, but an omitted `amenityIds` / `photoUrls` means UNCHANGED, not "clear
+ * them" — clearing is `[]`. The distinction matters because the form always sends both, so a request
+ * that omits one came from somewhere else and almost certainly did not mean to wipe it.
+ */
+export class UpdateVenueDto {
+  @ApiPropertyOptional({ example: 'หอประชุมวารณ', maxLength: 120 })
+  @Transform(sanitizeThaiText)
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(120)
+  @IsOptional()
+  name?: string;
+
+  @ApiPropertyOptional({ example: 4 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  venueTypeId?: number;
+
+  @ApiPropertyOptional({ example: 900, minimum: 1, maximum: 100000 })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100000)
+  @IsOptional()
+  capacity?: number;
+
+  @ApiPropertyOptional({ type: String, maxLength: 200, nullable: true })
+  @ValidateIf((_o, v) => v !== undefined && v !== null)
+  @Transform(emptyToNull)
+  @IsString()
+  @MaxLength(200)
+  @IsOptional()
+  location?: string | null;
+
+  @ApiPropertyOptional({ type: String, maxLength: 500, nullable: true })
+  @ValidateIf((_o, v) => v !== undefined && v !== null)
+  @Transform(emptyToNull)
+  @IsString()
+  @MaxLength(500)
+  @IsOptional()
+  description?: string | null;
+
+  @ApiPropertyOptional({ type: [Number], example: [1, 3] })
+  @IsArray()
+  @ArrayUnique()
+  @Type(() => Number)
+  @IsInt({ each: true })
+  @Min(1, { each: true })
+  @IsOptional()
+  amenityIds?: number[];
+
+  @ApiPropertyOptional({ type: [String], maxItems: VENUE_PHOTOS_MAX })
+  @IsArray()
+  @ArrayMaxSize(VENUE_PHOTOS_MAX)
+  @ArrayUnique()
+  @IsUrl({ protocols: ['https'], require_protocol: true }, { each: true })
+  @IsOptional()
+  photoUrls?: string[];
+}
+
+/** Body for `POST /venues/:id/close`. The reason is REQUIRED — see `CLOSE_REASON_REQUIRED`. */
+export class CloseVenueDto {
+  @ApiProperty({
+    example: 'ปิดปรับปรุงพื้นสนามถึง 30 ก.ย. 2569',
+    maxLength: 500,
+    description:
+      'Shown on the venue card and, once LIFF exists, to every end user who tries to book the room. A blank or whitespace-only reason is a 400.',
+  })
+  @Transform(trim)
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(500)
+  reason!: string;
+}
+
+/** Body for `DELETE /venues/photos` — discarding an object the operator uploaded and then cancelled. */
+export class DiscardVenuePhotoDto {
+  @ApiProperty({
+    description:
+      'A URL previously returned by POST /venues/photos that is NOT referenced by any venue. Referenced URLs are refused.',
+  })
+  @Transform(trim)
+  @IsUrl({ protocols: ['https'], require_protocol: true })
+  url!: string;
+}
+
+/** The category, as it appears nested on a venue. */
+export class VenueTypeSummaryDto {
+  @ApiProperty({ example: 4 })
+  id!: number;
+
+  @ApiProperty({ example: 'หอประชุม' })
+  name!: string;
+
+  /**
+   * ⚠️ CARRIED ON THE NESTED OBJECT SO THE CARD CAN RENDER IT DIFFERENTLY. A venue whose category was
+   * deleted sits on the tombstone, and `ไม่พบประเภทสถานที่` printed in the same blue badge as
+   * `โรงยิม` reads as a category somebody chose. The screen paints it slate instead — the colour this
+   * portal already uses for "a system placeholder, not a real value".
+   *
+   * The client must key that off this FLAG and never off the name. The string is the one thing a
+   * translator would edit without thinking, and a name match would turn that edit into orphaned
+   * venues quietly rendering as an ordinary category.
+   */
+  @ApiProperty({
+    example: false,
+    description:
+      'True only for the reserved tombstone category. Render it differently; never match on the name.',
+  })
+  isFallback!: boolean;
+}
+
+/** One photo. `position` is 0-based and 0 IS the cover. */
+export class VenuePhotoDto {
+  @ApiProperty({ example: 'clx0000000000000000000000' })
+  id!: string;
+
+  @ApiProperty({ example: 'https://cdn.example.com/venues/9f8e….jpg' })
+  url!: string;
+
+  @ApiProperty({ example: 0, description: '0-based. Position 0 is the cover.' })
+  position!: number;
+}
+
+/** One amenity tick, resolved to a name. */
+export class VenueAmenityDto {
+  @ApiProperty({ example: 1 })
+  id!: number;
+
+  @ApiProperty({ example: 'เครื่องเสียง' })
+  name!: string;
+}
+
+/**
+ * Public view of a `Venue`. `deletedAt` is NEVER exposed — soft-deleted rows simply do not appear.
+ */
+export class VenueResponseDto {
+  @ApiProperty({ example: 'clx0000000000000000000000' })
+  id!: string;
+
+  @ApiProperty({ example: 'หอประชุมวารณ' })
+  name!: string;
+
+  /**
+   * ⚠️ NESTED AND RESOLVED WITHOUT A `deletedAt` FILTER, which is the read half of the asymmetry
+   * `CLAUDE.md` states for `SystemUser.departmentId`. An existing venue keeps resolving its category
+   * name forever, even after that category is soft-deleted; adding the filter would return `null`
+   * into a non-nullable DTO field and 500 the entire list.
+   */
+  @ApiProperty({ type: VenueTypeSummaryDto })
+  venueType!: VenueTypeSummaryDto;
+
+  @ApiProperty({ example: 900 })
+  capacity!: number;
+
+  @ApiProperty({
+    type: String,
+    example: 'อาคารหอประชุม ชั้น 1',
+    nullable: true,
+  })
+  location!: string | null;
+
+  @ApiProperty({
+    type: String,
+    example: 'มีเวทีถาวรและระบบไฟเวที',
+    nullable: true,
+  })
+  description!: string | null;
+
+  @ApiProperty({
+    example: true,
+    description:
+      'เปิดให้จอง. False = ปิดชั่วคราว — still visible to end users, but accepts no new booking requests. Changed only via POST /venues/:id/close and /reopen.',
+  })
+  isOpen!: boolean;
+
+  @ApiProperty({
+    type: String,
+    example: null,
+    nullable: true,
+    description:
+      'Non-null if and only if `isOpen` is false. Cleared on every reopen.',
+  })
+  closedReason!: string | null;
+
+  @ApiProperty({
+    type: [VenuePhotoDto],
+    description:
+      'Ordered. Index 0 is the cover. Empty for a venue with no photos yet.',
+  })
+  photos!: VenuePhotoDto[];
+
+  @ApiProperty({ type: [VenueAmenityDto], description: 'Ordered `name ASC`.' })
+  amenities!: VenueAmenityDto[];
+
+  @ApiProperty({ example: '2026-08-25T10:00:00.000Z' })
+  createdAt!: string;
+
+  @ApiProperty({ example: '2026-08-25T10:00:00.000Z' })
+  updatedAt!: string;
+}
+
+/** How many venue cards one LIFF page carries — whole rows in both the 1- and 2-column grid. */
+export const LINE_VENUES_PAGE_SIZE_DEFAULT = 12;
+
+/**
+ * `GET /line-users/venues?q=&venueTypeId=&status=&page=&limit=` — the LIFF catalogue (`CLIENT-PAGINATION-1`).
+ *
+ * The admin DTO plus offset pagination, copied validator for validator from `ListLineUsersQueryDto`:
+ * `?page=0`, `?limit=101`, `?page=1.5` and `?page=abc` are all 400s. The field initialisers are
+ * load-bearing — do NOT add `@Expose()` (same footgun `ListSystemUsersQueryDto` documents).
+ */
+export class ListLineVenuesQueryDto extends ListVenuesQueryDto {
+  @ApiPropertyOptional({
+    minimum: 1,
+    default: 1,
+    description: '1-based page number.',
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @IsOptional()
+  page: number = 1;
+
+  @ApiPropertyOptional({
+    minimum: 1,
+    maximum: 100,
+    default: LINE_VENUES_PAGE_SIZE_DEFAULT,
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  @IsOptional()
+  limit: number = LINE_VENUES_PAGE_SIZE_DEFAULT;
+}
+
+/** The `{ data, meta, facets }` envelope for `GET /line-users/venues`. */
+export class PaginatedLineVenuesResponseDto {
+  @ApiProperty({
+    type: [VenueResponseDto],
+    description:
+      'Ordered `isOpen DESC, name ASC, id ASC` — bookable venues first. The client must not re-sort: appended pages would shuffle.',
+  })
+  data!: VenueResponseDto[];
+
+  @ApiProperty({ type: PaginationMetaDto })
+  meta!: PaginationMetaDto;
+
+  @ApiProperty({ type: ListFacetsDto })
+  facets!: ListFacetsDto;
+}
+
+/** `POST /venues/photos` — the object exists in the bucket; nothing references it yet. */
+export class VenuePhotoUploadResponseDto {
+  @ApiProperty({
+    description:
+      'The durable https URL of the stored object. Put it in `photoUrls` on the next create/update, or discard it with DELETE /venues/photos.',
+  })
+  url!: string;
+}

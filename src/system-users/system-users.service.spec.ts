@@ -6,10 +6,13 @@ import {
 } from '@nestjs/common';
 import { Prisma, SystemRole } from '@prisma/client';
 import { PasswordService } from '../auth/password.service';
+import { RedisService } from '../redis/redis.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { SystemUsersService } from './system-users.service';
+import type { StaffStatus } from './dto/list-system-users-query.dto';
 import {
   CONCURRENT_MODIFICATION,
+  DELETED_FILTER_IS_SUPER_ADMIN_ONLY,
   EMAIL_TAKEN,
   INVALID_DEPARTMENT,
   INVALID_PERSONNEL_ROLE,
@@ -21,8 +24,16 @@ import { PUBLIC_FIELDS } from './system-users.fields';
 import { CANNOT_RESET_OWN_PASSWORD } from './system-users.policy';
 import type { Actor } from './system-users.policy';
 
-const SUPER_ADMIN_ACTOR: Actor = { id: 'sa-1', role: SystemRole.SUPER_ADMIN };
-const ADMIN_ACTOR: Actor = { id: 'ad-1', role: SystemRole.ADMIN };
+const SUPER_ADMIN_ACTOR: Actor = {
+  id: 'sa-1',
+  role: SystemRole.SUPER_ADMIN,
+  createdById: null,
+};
+const ADMIN_ACTOR: Actor = {
+  id: 'ad-1',
+  role: SystemRole.ADMIN,
+  createdById: null,
+};
 
 const row = {
   id: 'sa-2',
@@ -125,6 +136,10 @@ describe('SystemUsersService', () => {
     generateTemporaryPassword,
   } as unknown as PasswordService;
 
+  // The cache is invalidation-only on this service — it never reads. A no-op `del` keeps every
+  // existing assertion about the DB writes exactly as it was.
+  const redis = { del: jest.fn() } as unknown as RedisService;
+
   /** Runs the interactive-transaction callback, capturing its isolation options. */
   const runInteractiveTx = () =>
     $transaction.mockImplementation(
@@ -140,7 +155,7 @@ describe('SystemUsersService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    service = new SystemUsersService(prisma, password);
+    service = new SystemUsersService(prisma, password, redis);
   });
 
   // ───────────────────────────── create ─────────────────────────────
@@ -288,7 +303,7 @@ describe('SystemUsersService', () => {
   // ───────────────────────── reset-password ─────────────────────────
 
   describe('resetPassword', () => {
-    const target = { id: 'sa-2', role: SystemRole.STAFF };
+    const target = { id: 'sa-2', role: SystemRole.VIEWER };
 
     it('AC-B7 — issues a new temp password, sets mustChangePassword, returns the plaintext once', async () => {
       runInteractiveTx();
@@ -355,7 +370,10 @@ describe('SystemUsersService', () => {
     it('filters soft-deleted rows from both data and total, and uses RepeatableRead (DD-16, AC-40)', async () => {
       $transaction.mockResolvedValue([[row], 1]);
 
-      const result = await service.findManyPaginated({ page: 2, limit: 20 });
+      const result = await service.findManyPaginated(
+        { page: 2, limit: 20 },
+        SystemRole.ADMIN,
+      );
 
       const [operations, options] = $transaction.mock.calls[0] as [
         unknown[],
@@ -384,7 +402,10 @@ describe('SystemUsersService', () => {
     it('reports totalPages 0 when there are no rows, and never 404s a page past the end (AC-39)', async () => {
       $transaction.mockResolvedValue([[], 0]);
 
-      const result = await service.findManyPaginated({ page: 999, limit: 20 });
+      const result = await service.findManyPaginated(
+        { page: 999, limit: 20 },
+        SystemRole.ADMIN,
+      );
 
       expect(result.data).toEqual([]);
       expect(result.meta).toEqual({
@@ -395,9 +416,90 @@ describe('SystemUsersService', () => {
       });
     });
 
+    it.each([
+      [
+        'active',
+        { deletedAt: null, isActive: true, mustChangePassword: false },
+      ],
+      [
+        'pending',
+        { deletedAt: null, isActive: true, mustChangePassword: true },
+      ],
+      ['suspended', { deletedAt: null, isActive: false }],
+      ['deleted', { deletedAt: { not: null } }],
+    ])(
+      'status=%s filters by the badge precedence the screen renders',
+      async (status, w) => {
+        $transaction.mockResolvedValue([[], 0]);
+
+        await service.findManyPaginated(
+          { page: 1, limit: 20, status: status as StaffStatus },
+          SystemRole.SUPER_ADMIN,
+        );
+
+        expect(findMany).toHaveBeenCalledWith(
+          expect.objectContaining({ where: w }),
+        );
+      },
+    );
+
+    it('status=pending EXCLUDES a suspended user who also owes a password change', async () => {
+      $transaction.mockResolvedValue([[], 0]);
+
+      await service.findManyPaginated(
+        { page: 1, limit: 20, status: 'pending' },
+        SystemRole.ADMIN,
+      );
+
+      // The screen shows that person as ระงับการใช้งาน, so this filter must not return them —
+      // otherwise filtering by one badge yields rows displaying another.
+      const [[args]] = findMany.mock.calls as [
+        [{ where: { isActive?: boolean } }],
+      ];
+      expect(args.where.isActive).toBe(true);
+    });
+
+    it('status=deleted is a 403 for an ADMIN, and never an empty list (STAFF-DELETED-1)', async () => {
+      await expect(
+        service.findManyPaginated(
+          { page: 1, limit: 20, status: 'deleted' },
+          SystemRole.ADMIN,
+        ),
+      ).rejects.toThrow(DELETED_FILTER_IS_SUPER_ADMIN_ONLY);
+      // Refused before any query — an empty result would be a lie that also teaches nothing.
+      expect($transaction).not.toHaveBeenCalled();
+    });
+
+    it('search matches first name, last name, email OR phone number, case-insensitively', async () => {
+      $transaction.mockResolvedValue([[], 0]);
+
+      await service.findManyPaginated(
+        { page: 1, limit: 20, search: '  ada ' },
+        SystemRole.ADMIN,
+      );
+
+      const like = { contains: 'ada', mode: 'insensitive' };
+      expect(findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            deletedAt: null,
+            OR: [
+              { firstName: like },
+              { lastName: like },
+              { email: like },
+              { phoneNumber: like },
+            ],
+          },
+        }),
+      );
+    });
+
     it('serialises dates as ISO strings', async () => {
       $transaction.mockResolvedValue([[row], 1]);
-      const result = await service.findManyPaginated({ page: 1, limit: 20 });
+      const result = await service.findManyPaginated(
+        { page: 1, limit: 20 },
+        SystemRole.ADMIN,
+      );
       expect(result.data[0].createdAt).toBe('2026-07-01T00:00:00.000Z');
       expect(result.data[0].lastLoginAt).toBeNull();
     });
@@ -423,7 +525,7 @@ describe('SystemUsersService', () => {
   describe('update', () => {
     beforeEach(() => {
       runInteractiveTx();
-      txFindFirst.mockResolvedValue({ id: 'staff-1', role: SystemRole.STAFF });
+      txFindFirst.mockResolvedValue({ id: 'staff-1', role: SystemRole.VIEWER });
       txUpdate.mockResolvedValue(row);
       txCount.mockResolvedValue(1);
     });
@@ -443,8 +545,8 @@ describe('SystemUsersService', () => {
 
     // ────── system-reserved options: W4, the attack path this feature closes (AC-B6) ──────
 
-    it('AC-B6 — an ADMIN patching a STAFF may NOT assign a reserved option: 400, never 403', async () => {
-      // Without this guard an ADMIN could assign the System Developer department to a STAFF they
+    it('AC-B6 — an ADMIN patching a VIEWER may NOT assign a reserved option: 400, never 403', async () => {
+      // Without this guard an ADMIN could assign the System Developer department to a VIEWER they
       // already control. The reserved row is filtered out of the lookup, so it misses and 400s
       // EXACTLY as an unknown id would — byte-identical body, no existence oracle.
       txDepartmentFindFirst.mockResolvedValue(null);
@@ -526,7 +628,7 @@ describe('SystemUsersService', () => {
     //
     // Before the canPatch amendment the 403 fired first, so this whole path was unreachable for an
     // ADMIN on their own row. It is reachable for the first time, and the existence-oracle rule
-    // must hold on it exactly as it does on a STAFF target.
+    // must hold on it exactly as it does on a VIEWER target.
 
     describe('an ADMIN patching their OWN row (SELF-PROFILE-2)', () => {
       beforeEach(() => {
@@ -667,7 +769,7 @@ describe('SystemUsersService', () => {
     });
 
     it.each([
-      ['role', { role: SystemRole.STAFF }],
+      ['role', { role: SystemRole.VIEWER }],
       ['isActive', { isActive: false }],
     ])(
       'runs a patch containing `%s` at Serializable and checks the invariant',
@@ -705,7 +807,7 @@ describe('SystemUsersService', () => {
 
     // AC-50 — unreachable end to end by design (§6.4), so it is proven here.
     it.each([
-      ['demoting', { role: SystemRole.STAFF }],
+      ['demoting', { role: SystemRole.VIEWER }],
       ['deactivating', { isActive: false }],
     ])(
       '%s the last active SUPER_ADMIN is a 409 and rolls back (AC-50)',
@@ -773,7 +875,7 @@ describe('SystemUsersService', () => {
   describe('softDelete', () => {
     beforeEach(() => {
       runInteractiveTx();
-      txFindFirst.mockResolvedValue({ id: 'staff-1', role: SystemRole.STAFF });
+      txFindFirst.mockResolvedValue({ id: 'staff-1', role: SystemRole.VIEWER });
       txUpdate.mockResolvedValue({ id: 'staff-1' });
       txCount.mockResolvedValue(1);
     });

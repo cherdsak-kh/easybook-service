@@ -31,12 +31,27 @@ import { LineUserResponseDto } from './dto/line-user-response.dto';
 import { ListLineUsersQueryDto } from './dto/list-line-users-query.dto';
 import { PaginatedLineUsersResponseDto } from './dto/paginated-line-users-response.dto';
 import { UpdateLineUserAccessDto } from './dto/update-line-user-access.dto';
+import type { AdminActor } from './line-user.service';
 import { LineUserService } from './line-user.service';
+
+/**
+ * The acting operator, for the policy AND for the realtime event (REALTIME-1).
+ *
+ * `name` is the display name a colleague already sees on the staff screen — no email, no role,
+ * nothing an event needs to be an audit record rather than a "who just did that?" answer.
+ */
+const actorOf = (user: AuthenticatedSystemUser): AdminActor => ({
+  id: user.id,
+  name: `${user.firstName} ${user.lastName}`.trim(),
+  role: user.role,
+});
 
 /**
  * Back-office management of LINE end-users. Route prefix: `/api/v1/line-users`.
  *
- * Session-guarded (`SUPER_ADMIN`/`ADMIN` only) and keyed on the cuid `LineUser.id`. The former
+ * Session-guarded and keyed on the cuid `LineUser.id`. **The read and the writes carry different
+ * roles**: `GET` is open to all three (a VIEWER may look), both `PATCH`es stay `SUPER_ADMIN|ADMIN`.
+ * The former
  * standalone `PATCH /line/users/:lineUserId/rich-menu` route was removed — rich-menu switching is
  * now derived from `access` via `LineUserService.updateAccess` (see
  * claude_planning/20260714_1742_line_user_registration/).
@@ -53,12 +68,20 @@ import { LineUserService } from './line-user.service';
 export class LineUsersController {
   constructor(private readonly users: LineUserService) {}
 
+  /*
+   * ⚠️ VIEWER READS THIS COLLECTION (PO, 19 ส.ค. 2569) — the writes below do not widen.
+   *
+   * `การลงทะเบียน` is not in the portal's `VIEWER_DENY` list, so the menu offers it to a VIEWER;
+   * with the read closed, following that row produced a full-page 403. Same defect the PO reported
+   * on เจ้าหน้าที่ระบบ the same day, and the same fix: ผู้ดูข้อมูล means "may look, may not touch",
+   * and it is the two `@Patch`es that make touching impossible — not this one.
+   */
   @Get()
-  @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN)
+  @Roles(SystemRole.SUPER_ADMIN, SystemRole.ADMIN, SystemRole.VIEWER)
   @ApiOperation({
     summary: 'List LINE users, paginated.',
     description:
-      'Soft-deleted rows are excluded from `data` and from `meta.total`. Optional `search` is a case-insensitive substring match on `displayName`; optional `access` narrows to one state. Ordered `followedAt DESC, id DESC`. A page beyond the last one is a 200 with an empty `data`, not a 404.',
+      'Soft-deleted rows are excluded from `data` and from `meta.total`. Optional `search` matches the LINE display name, the registered name, the resolved position/department and the phone (digits-only too); optional `access` narrows to one state; `sort` picks one of `new`/`old`/`name`, defaulting to `new`. Readable by every role. A page beyond the last one is a 200 with an empty `data`, not a 404.',
   })
   @ApiOkResponse({
     description: 'A page of LINE users.',
@@ -69,7 +92,7 @@ export class LineUsersController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF has no access to this collection.',
+    description: 'The caller must change their password before using the app.',
     type: ErrorResponseDto,
   })
   @ApiServiceUnavailableResponse({
@@ -104,7 +127,7 @@ export class LineUsersController {
   })
   @ApiForbiddenResponse({
     description:
-      'STAFF; CSRF failure; or an access transition not permitted for ADMIN.',
+      'VIEWER; CSRF failure; or an access transition not permitted for ADMIN.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
@@ -121,7 +144,7 @@ export class LineUsersController {
     @Body() dto: UpdateLineUserAccessDto,
     @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<LineUserResponseDto> {
-    return this.users.updateAccess(id, dto.access, user.role, dto.reason);
+    return this.users.updateAccess(id, dto.access, actorOf(user), dto.reason);
   }
 
   // Two path segments (`:id/registration`) — cannot collide with the single-segment admin `:id` or
@@ -147,7 +170,7 @@ export class LineUsersController {
     type: ErrorResponseDto,
   })
   @ApiForbiddenResponse({
-    description: 'STAFF, or a CSRF failure.',
+    description: 'VIEWER, or a CSRF failure.',
     type: ErrorResponseDto,
   })
   @ApiNotFoundResponse({
@@ -164,6 +187,6 @@ export class LineUsersController {
     @Body() dto: AdminUpdateLineUserRegistrationDto,
     @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<LineUserResponseDto> {
-    return this.users.updateRegistrationByAdmin(id, dto, user.role);
+    return this.users.updateRegistrationByAdmin(id, dto, actorOf(user));
   }
 }

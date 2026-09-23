@@ -1,6 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { ExecutionContext, UnauthorizedException } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
+import type { LineCredentialsService } from './line-credentials.service';
 import { LineSignatureGuard } from './line-signature.guard';
 
 const SECRET = 'test-channel-secret';
@@ -22,8 +22,8 @@ function contextFor(rawBody?: Buffer, signature?: string): ExecutionContext {
 
 describe('LineSignatureGuard', () => {
   const guard = new LineSignatureGuard({
-    get: () => SECRET,
-  } as unknown as ConfigService);
+    channelSecret: () => SECRET,
+  } as unknown as LineCredentialsService);
 
   it('allows a request with a valid signature', () => {
     const body = '{"events":[]}';

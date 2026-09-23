@@ -11,6 +11,7 @@ describe('LineWebhookService', () => {
   const users = {
     upsertOnFollow: jest.fn(),
     softDeleteByLineUserId: jest.fn(),
+    refreshProfileFromLine: jest.fn(),
   };
 
   beforeEach(async () => {
@@ -18,6 +19,7 @@ describe('LineWebhookService', () => {
     line.reply.mockResolvedValue(undefined);
     users.upsertOnFollow.mockResolvedValue(undefined);
     users.softDeleteByLineUserId.mockResolvedValue({ count: 1 });
+    users.refreshProfileFromLine.mockResolvedValue(undefined);
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -29,7 +31,7 @@ describe('LineWebhookService', () => {
     service = module.get<LineWebhookService>(LineWebhookService);
   });
 
-  it('follow: fetches profile, upserts the user, and replies', async () => {
+  it('follow: fetches profile and upserts the user, and says NOTHING back', async () => {
     line.getProfile.mockResolvedValue({ displayName: 'Alice', language: 'en' });
     const event = {
       type: 'follow',
@@ -43,7 +45,10 @@ describe('LineWebhookService', () => {
     expect(users.upsertOnFollow).toHaveBeenCalledWith(
       expect.objectContaining({ lineUserId: 'U1', displayName: 'Alice' }),
     );
-    expect(line.reply).toHaveBeenCalled();
+    // ⚠️ The welcome moved OUT of this repo (PO, 22 ส.ค. 2569): LINE delivers its own greeting
+    // message, configured in the Official Account Manager, before this webhook even runs. A reply
+    // here would be the second welcome in two seconds — and this one was English.
+    expect(line.reply).not.toHaveBeenCalled();
   });
 
   it('follow: still stores the user when getProfile fails', async () => {
@@ -59,6 +64,25 @@ describe('LineWebhookService', () => {
     expect(users.upsertOnFollow).toHaveBeenCalledWith(
       expect.objectContaining({ lineUserId: 'U2', displayName: null }),
     );
+  });
+
+  it('message: a typed message is answered with nothing', async () => {
+    // The `You said: …` echo was scaffolding from the day the webhook was wired up, and it had
+    // become the product telling every user in English that nobody is reading. Silence is the
+    // honest answer while there is no conversational feature — the account's surface is the rich
+    // menu and the LIFF app.
+    const event = {
+      type: 'message',
+      replyToken: 'rt',
+      message: { type: 'text', text: 'สวัสดีครับ' },
+      source: { type: 'user', userId: 'U5' },
+    } as unknown as webhook.Event;
+
+    await service.handleEvents([event]);
+
+    expect(line.reply).not.toHaveBeenCalled();
+    // Still handled, though: it is the only signal a chat-only follower gives us.
+    expect(users.refreshProfileFromLine).toHaveBeenCalledWith('U5');
   });
 
   it('unfollow: soft-deletes the user', async () => {
@@ -116,5 +140,42 @@ describe('LineWebhookService', () => {
     await service.handleEvents([event]);
 
     expect(line.reply).not.toHaveBeenCalled();
+  });
+
+  /**
+   * A follower who never opens the LIFF can still rename themselves, and LINE sends no event for
+   * it. Chatting is the only other time they show up, so `message`/`postback` are where we look —
+   * the cooldown that keeps it from being a fetch per message lives in `LineUserService`.
+   */
+  describe('profile refresh', () => {
+    const eventOf = (type: string, userId?: string) =>
+      ({
+        type,
+        replyToken: 'rt',
+        message: { type: 'text', text: 'hi' },
+        postback: { data: RICH_MENU_SHORTCUTS.settings.data },
+        source: userId ? { type: 'user', userId } : { type: 'group' },
+      }) as unknown as webhook.Event;
+
+    it.each(['message', 'postback'])('refreshes on %s', async (type) => {
+      await service.handleEvents([eventOf(type, 'U7')]);
+      expect(users.refreshProfileFromLine).toHaveBeenCalledWith('U7');
+    });
+
+    it('does not refresh on follow — `upsertOnFollow` already wrote the profile', async () => {
+      line.getProfile.mockResolvedValue({ displayName: 'Alice' });
+      await service.handleEvents([eventOf('follow', 'U7')]);
+      expect(users.refreshProfileFromLine).not.toHaveBeenCalled();
+    });
+
+    it('does not refresh on unfollow — they left', async () => {
+      await service.handleEvents([eventOf('unfollow', 'U7')]);
+      expect(users.refreshProfileFromLine).not.toHaveBeenCalled();
+    });
+
+    it('does nothing for an event with no user source', async () => {
+      await service.handleEvents([eventOf('message')]);
+      expect(users.refreshProfileFromLine).not.toHaveBeenCalled();
+    });
   });
 });

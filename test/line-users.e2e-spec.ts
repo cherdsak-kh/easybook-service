@@ -5,7 +5,10 @@ import request from 'supertest';
 import type { App } from 'supertest/types';
 import { PasswordService } from '../src/auth/password.service';
 import { API_BASE_PATH } from '../src/common/api.constants';
-import { ACCESS_NOTIFICATION_MESSAGES } from '../src/line/line-user.service';
+import {
+  ACCESS_NOTIFICATION_MESSAGES,
+  toPhoneDigits,
+} from '../src/line/line-user.service';
 import { LineService } from '../src/line/line.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import {
@@ -22,11 +25,11 @@ jest.setTimeout(120_000);
 
 const SU_PREFIX = 'e2e-lusu-';
 const LU_PREFIX = 'e2e-lu-';
-const PASSWORD = 'e2e-correct-horse-battery';
+const PASSWORD = 'E2e-correct-horse-battery-1';
 
 const SUPER = `${SU_PREFIX}super@easybook.local`;
 const ADMIN = `${SU_PREFIX}admin@easybook.local`;
-const STAFF = `${SU_PREFIX}staff@easybook.local`;
+const VIEWER = `${SU_PREFIX}staff@easybook.local`;
 
 const url = (path: string) => `${API_BASE_PATH}${path}`;
 
@@ -59,6 +62,7 @@ interface LineUserBody {
   displayName: string | null;
   access: AppAccess;
   followedAt: string;
+  registeredAt: string | null;
   registration: RegistrationSummary | null;
 }
 
@@ -176,7 +180,7 @@ describe('LINE Users management (e2e)', () => {
     for (const [email, role] of [
       [SUPER, SystemRole.SUPER_ADMIN],
       [ADMIN, SystemRole.ADMIN],
-      [STAFF, SystemRole.STAFF],
+      [VIEWER, SystemRole.VIEWER],
     ] as Array<[string, SystemRole]>) {
       await prisma.systemUser.create({
         data: { email, firstName: 'E2E', lastName: role, role, ...base },
@@ -199,15 +203,26 @@ describe('LINE Users management (e2e)', () => {
 
     // The ALLOWED fixture carries a registration so the list-embed can be asserted; the others
     // deliberately have none (registration: null in the row).
-    await prisma.lineUserRegistration.create({
+    const reg = await prisma.lineUserRegistration.create({
       data: {
         lineUserId: luIds[`${LU_PREFIX}allowed`],
         firstName: 'Bob',
         lastName: 'Allowed',
         phone: '081-000-0000',
+        phoneDigits: toPhoneDigits('081-000-0000'),
         departmentId: optionIds.departmentId,
         personnelRoleId: optionIds.personnelRoleId,
       },
+    });
+
+    // ⚠️ `registeredAt` lives on the LineUser and `register()` writes it in the same transaction
+    // as the row above. This fixture writes straight to the database, so it has to do that half
+    // itself — otherwise it builds a state the service cannot produce: a registration exists while
+    // the row says the person never registered. That is the standing cost of the denormalised
+    // column, and it lands on anything that bypasses the service.
+    await prisma.lineUser.update({
+      where: { id: luIds[`${LU_PREFIX}allowed`] },
+      data: { registeredAt: reg.createdAt },
     });
   };
 
@@ -256,9 +271,17 @@ describe('LINE Users management (e2e)', () => {
       .expect(401);
   });
 
-  it('AC-B7 — STAFF gets 403 on both routes (not 401)', async () => {
-    const { agent, token } = await login(STAFF);
-    await agent.get(url('/line-users')).expect(403);
+  /*
+   * ⚠️ AMENDED 19 ส.ค. 2569 (PO): a VIEWER READS this collection and writes nothing.
+   *
+   * It used to assert 403 on both routes, which matched the code and not the product: the portal's
+   * menu offers การลงทะเบียน to a VIEWER, so the closed read turned a menu row into a full-page 403.
+   * The half that is the actual boundary — the PATCH — is unchanged and asserted right below it, in
+   * the same test, so widening the read can never be mistaken for widening the write.
+   */
+  it('AC-B7 — VIEWER may LIST (200) but not write (403); no session is 401 on both', async () => {
+    const { agent, token } = await login(VIEWER);
+    await agent.get(url('/line-users')).expect(200);
     await agent
       .patch(url(`/line-users/${luIds[`${LU_PREFIX}pending`]}`))
       .set('x-csrf-token', token)
@@ -266,8 +289,8 @@ describe('LINE Users management (e2e)', () => {
       .expect(403);
   });
 
-  it('AC-B1/B7 — both SUPER_ADMIN and ADMIN may list', async () => {
-    for (const email of [SUPER, ADMIN]) {
+  it('AC-B1/B7 — all three roles may list', async () => {
+    for (const email of [SUPER, ADMIN, VIEWER]) {
       const { agent } = await login(email);
       await agent.get(url('/line-users')).expect(200);
     }
@@ -295,7 +318,9 @@ describe('LINE Users management (e2e)', () => {
       await agent.get(url('/line-users?limit=101')).expect(400);
       await agent.get(url('/line-users?limit=0')).expect(400);
       await agent.get(url('/line-users?page=0')).expect(400);
-      await agent.get(url('/line-users?sort=name')).expect(400);
+      // Was `sort=name`, which became a REAL parameter on 2026-08-16 — at which point this
+      // line asserted that a supported feature is rejected.
+      await agent.get(url('/line-users?nonsenseParam=x')).expect(400);
     });
 
     it('AC-B3 — a page beyond the last is 200 with empty data and truthful meta', async () => {
@@ -360,6 +385,11 @@ describe('LINE Users management (e2e)', () => {
         personnelRoleId: optionIds.personnelRoleId,
         personnelRole: ROLE_NAME,
       });
+
+      // LU-REGDATE-1: the submission date lives on the ROW, beside followedAt — not inside the
+      // registration summary. It is what the screen shows as `วันที่ลงทะเบียน`, and a follower who
+      // never registered carries null there, which is the dash.
+      expect(allowed?.registeredAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 
       // A follower with no registration renders gracefully as null (AC-F7 backend half).
       const pending = rows.find((u) => u.lineUserId === `${LU_PREFIX}pending`);
@@ -501,7 +531,7 @@ describe('LINE Users management (e2e)', () => {
 
       // Pushed to the LINE-side U… id (the fixture's lineUserId), NOT the cuid.
       expect(pushSpy).toHaveBeenCalledWith(lineUserId, [
-        { type: 'text', text: ALLOWED_MSG },
+        expect.objectContaining({ type: 'flex', altText: ALLOWED_MSG }),
       ]);
 
       // Best-effort: even when the push rejects, the PATCH still succeeds (no 500/502) and the
@@ -515,7 +545,7 @@ describe('LINE Users management (e2e)', () => {
         .expect(200);
       expect((blocked.body as LineUserBody).access).toBe(AppAccess.BLOCKED);
       expect(pushSpy).toHaveBeenCalledWith(lineUserId, [
-        { type: 'text', text: BLOCKED_MSG },
+        expect.objectContaining({ type: 'flex', altText: BLOCKED_MSG }),
       ]);
 
       const row = await prisma.lineUser.findUnique({
@@ -813,6 +843,7 @@ describe('LINE Users management (e2e)', () => {
           firstName: 'Ghost',
           lastName: 'User',
           phone: '082-222-2222',
+          phoneDigits: toPhoneDigits('082-222-2222'),
           departmentId: optionIds.departmentId,
           personnelRoleId: optionIds.personnelRoleId,
         },
@@ -855,8 +886,8 @@ describe('LINE Users management (e2e)', () => {
       expect((await regRowOf('allowed'))?.firstName).toBe('Bob');
     });
 
-    it('AC-B2 — STAFF is 403 and no session is 401', async () => {
-      const staff = await login(STAFF);
+    it('AC-B2 — VIEWER is 403 and no session is 401', async () => {
+      const staff = await login(VIEWER);
       await staff.agent
         .patch(regUrl('allowed'))
         .set('x-csrf-token', staff.token)

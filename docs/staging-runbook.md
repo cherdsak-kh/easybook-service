@@ -217,13 +217,24 @@ and works exactly as before — realtime is an enhancement, never a dependency.
 
 ## 2. `SWAGGER_ENABLED` in staging
 
-`SWAGGER_ENABLED` is opt-out (defaults to `true` — see `env.validation.ts` / `main.ts`). Staging
-sits behind Cloudflare + Nginx with **no auth in front of `/docs`**, so the public OpenAPI surface
-must be explicitly turned off there:
+Since `INTEGRATIONS-API-1` (22 ก.ย. 2569) `/docs` and `/docs-json` are **always mounted and gated at
+runtime** by `SwaggerGateService` (`src/system/swagger-gate.service.ts`). Which way the gate stands:
+
+1. the `AppSetting` row `system.swagger_enabled`, once a SUPER_ADMIN has toggled it on
+   การเชื่อมต่อระบบ (`PATCH /api/v1/system/integrations/swagger`) — this **wins**;
+2. otherwise `SWAGGER_ENABLED=true` turns it on;
+3. otherwise it is **OFF**. Unset now means off (it used to mean on).
+
+While off, every docs path answers the same `404` body as an unknown route. Staging sits behind
+Cloudflare + Nginx with **no auth in front of `/docs`**, so keep the default off:
 
 ```
 SWAGGER_ENABLED=false
 ```
+
+⚠️ The env var no longer has the last word. If someone switched Swagger on from the UI, turn it off
+there (or delete the row: `DELETE FROM app_settings WHERE key = 'system.swagger_enabled';`, then
+restart). The flag is cached in-process, so a manual SQL change takes effect only after a restart.
 
 Set this in the `staging` environment inside Infisical (not in this repo — there is no
 `.env.production`/`.env.staging` committed with real values). Documented as a placeholder note in

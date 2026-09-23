@@ -3,6 +3,7 @@ import type { ArgumentMetadata } from '@nestjs/common';
 import { AppAccess } from '@prisma/client';
 import { AdminUpdateLineUserRegistrationDto } from './admin-update-line-user-registration.dto';
 import { CreateLineUserRegistrationDto } from './create-line-user-registration.dto';
+import { UpdateLineUserSettingsDto } from './line-user-settings.dto';
 import { ListLineUsersQueryDto } from './list-line-users-query.dto';
 import { UpdateLineUserAccessDto } from './update-line-user-access.dto';
 
@@ -60,8 +61,28 @@ describe('ListLineUsersQueryDto (through the global ValidationPipe)', () => {
   });
 
   it('rejects an unknown query param (AC-B3)', async () => {
-    const messages = await messagesOf({ sort: 'name' });
-    expect(messages.join(' ')).toContain('property sort should not exist');
+    // This used to probe with `sort`, which became a REAL parameter on 2026-08-16 — at which point
+    // the test was asserting that a supported feature is rejected. Probing with a key nobody will
+    // ever implement keeps it testing forbidNonWhitelisted instead of the parameter list.
+    const messages = await messagesOf({ nonsenseParam: 'x' });
+    expect(messages.join(' ')).toContain(
+      'property nonsenseParam should not exist',
+    );
+  });
+
+  it.each(['new', 'old', 'name'])('accepts sort=%s', async (value) => {
+    await expect(validate({ sort: value })).resolves.toMatchObject({
+      sort: value,
+    });
+  });
+
+  it("defaults sort to 'new' when absent", async () => {
+    await expect(validate({})).resolves.toMatchObject({ sort: 'new' });
+  });
+
+  it('rejects an unknown sort value', async () => {
+    const messages = await messagesOf({ sort: 'sideways' });
+    expect(messages.join(' ')).toMatch(/sort/);
   });
 
   it('rejects an invalid access value (AC-B5)', async () => {
@@ -266,5 +287,100 @@ describe('AdminUpdateLineUserRegistrationDto (through the global ValidationPipe)
     ['a bad phone', { ...VALID, phone: 'not a phone!!' }],
   ])('AC-B4 — rejects %s', async (_label, body) => {
     await expect(messagesOf(body)).resolves.toBeInstanceOf(Array);
+  });
+});
+
+/**
+ * `PATCH /line-users/settings` (`Q-C9` / Phase 7a).
+ *
+ * 🔴 THIS DTO IS THE ONLY SHAPE CHECK THE `notifications` COLUMN HAS. It is JSONB, so Postgres will
+ * store `{"decisions":"yes"}` without complaint — the nested class plus the global pipe is what
+ * refuses it. A bare `object` or `Record<string, unknown>` field would validate happily and persist
+ * nonsense, which is why the nested-key rejections below are asserted one at a time rather than
+ * assumed to follow from the parent property existing.
+ */
+describe('UpdateLineUserSettingsDto (through the global ValidationPipe)', () => {
+  const { validate, messagesOf } = runner<UpdateLineUserSettingsDto>(
+    UpdateLineUserSettingsDto,
+    'body',
+  );
+
+  it('accepts an empty body — every field is optional and absence means unchanged', async () => {
+    await expect(validate({})).resolves.toBeInstanceOf(
+      UpdateLineUserSettingsDto,
+    );
+  });
+
+  it.each(['light', 'dark', 'system'])('accepts theme=%s', async (theme) => {
+    await expect(validate({ theme })).resolves.toMatchObject({ theme });
+  });
+
+  it('rejects a theme outside the three supported values', async () => {
+    const messages = await messagesOf({ theme: 'solarized' });
+    expect(messages.join(' ')).toMatch(/theme/);
+  });
+
+  it('accepts a single notification key and leaves the others undefined (the merge is the service’s job)', async () => {
+    const result = await validate({ notifications: { decisions: false } });
+    expect(result.notifications?.decisions).toBe(false);
+    expect(result.notifications?.announcements).toBeUndefined();
+    expect(result.notifications?.reminders).toBeUndefined();
+  });
+
+  it('rejects an unknown TOP-LEVEL key via forbidNonWhitelisted', async () => {
+    const messages = await messagesOf({ theme: 'dark', darkMode: true });
+    expect(messages.join(' ')).toContain('property darkMode should not exist');
+  });
+
+  it('rejects a client-supplied lineUserId (impersonation guard)', async () => {
+    const messages = await messagesOf({ lineUserId: 'U-evil' });
+    expect(messages.join(' ')).toContain(
+      'property lineUserId should not exist',
+    );
+  });
+
+  it('rejects the two RESERVED columns — nothing may write an undocumented key into them', async () => {
+    // `Q-C9`: "a key that no document describes does not get written". The way `preferences` and
+    // `privacy` stay null through Phase 7 is that they have no DTO field at all.
+    const messages = await messagesOf({
+      preferences: { anything: 1 },
+      privacy: { anything: 1 },
+    });
+    const joined = messages.join(' ');
+    expect(joined).toContain('property preferences should not exist');
+    expect(joined).toContain('property privacy should not exist');
+  });
+
+  it('rejects an unknown key NESTED inside notifications', async () => {
+    // The failure this guards against is silent: without `@ValidateNested` + `@Type`, an unknown
+    // nested key is simply carried through and merged into the JSONB blob.
+    const messages = await messagesOf({
+      notifications: { decisions: false, sms: true },
+    });
+    expect(messages.join(' ')).toContain('property sms should not exist');
+  });
+
+  it.each([
+    ['a string', 'yes'],
+    ['a number', 1],
+    ['an explicit null', null],
+  ])('rejects %s as a notification value', async (_label, value) => {
+    // `null` is in this list on purpose: `@IsOptional` would have SKIPPED it and let it reach the
+    // column, which is why these fields use `@ValidateIf((_o, v) => v !== undefined)` instead.
+    const messages = await messagesOf({ notifications: { decisions: value } });
+    expect(messages.join(' ')).toMatch(/decisions/);
+  });
+
+  it('rejects an explicit null theme for the same reason', async () => {
+    const messages = await messagesOf({ theme: null });
+    expect(messages.join(' ')).toMatch(/theme/);
+  });
+
+  it.each([
+    ['a string', 'all-on'],
+    ['an explicit null', null],
+  ])('rejects %s as the notifications object itself', async (_label, value) => {
+    const messages = await messagesOf({ notifications: value });
+    expect(messages.join(' ')).toMatch(/notifications/);
   });
 });

@@ -8,6 +8,7 @@ import type { Redis } from 'ioredis';
 import type { Namespace, Socket } from 'socket.io';
 import { SESSION_ABSOLUTE_MAX_AGE_MS } from '../auth/auth.constants';
 import { resolveSystemUserById } from '../auth/session-user.resolver';
+import type { AdminBookingRequestListItemDto } from '../bookings/dto/admin-booking-response.dto';
 import type { LineUserResponseDto } from '../line/dto/line-user-response.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import { REDIS_CLIENT, SESSION_KEY_PREFIX } from '../redis/redis.constants';
@@ -16,6 +17,7 @@ import {
   DEFAULT_WS_REVALIDATE_INTERVAL_MS,
   REALTIME_ADMIN_NAMESPACE,
   REALTIME_EVENTS,
+  type RealtimeActor,
   SESSION_CLOSED_REASONS,
   WS_SWEEP_BUDGET_MS,
   type SessionClosedReason,
@@ -121,19 +123,73 @@ export class RealtimeGateway
 
   // ───────────────────────────────── emit surface ─────────────────────────────────
 
-  /** Broadcasts a row that now exists (or re-exists) in the operator's list. */
-  emitLineUserCreated(dto: LineUserResponseDto): void {
-    this.emit(REALTIME_EVENTS.lineUserCreated, dto, dto.id);
+  /**
+   * Broadcasts a row that now exists (or re-exists) in the operator's list.
+   *
+   * ⚠️ `actor` is REQUIRED at the call site and nullable in value. Making it optional would let a
+   * future emit site forget it and silently ship an event that says what changed but not who
+   * changed it — which is the gap REALTIME-1 exists to close. `null` is a real answer: nobody
+   * operated, a LINE user followed or edited their own registration.
+   */
+  emitLineUserCreated(
+    dto: LineUserResponseDto,
+    actor: RealtimeActor | null,
+  ): void {
+    this.emit(REALTIME_EVENTS.lineUserCreated, { user: dto, actor }, dto.id);
   }
 
   /** Broadcasts a row whose contents changed. */
-  emitLineUserUpdated(dto: LineUserResponseDto): void {
-    this.emit(REALTIME_EVENTS.lineUserUpdated, dto, dto.id);
+  emitLineUserUpdated(
+    dto: LineUserResponseDto,
+    actor: RealtimeActor | null,
+  ): void {
+    this.emit(REALTIME_EVENTS.lineUserUpdated, { user: dto, actor }, dto.id);
   }
 
   /** Broadcasts a row that left the operator's list (unfollow → soft delete). */
-  emitLineUserDeleted(id: string): void {
-    this.emit(REALTIME_EVENTS.lineUserDeleted, { id }, id);
+  emitLineUserDeleted(id: string, actor: RealtimeActor | null): void {
+    this.emit(REALTIME_EVENTS.lineUserDeleted, { id, actor }, id);
+  }
+
+  /**
+   * Broadcasts a booking request that now exists in the approval queue.
+   *
+   * ⚠️ `actor` is REQUIRED at the call site and nullable in value, for the same reason as the
+   * `lineUser*` pair: `null` is a real answer — a LINE user submitted it through LIFF, and no
+   * operator did anything.
+   *
+   * ⚠️ THE DTO IS `AdminBookingRequestListItemDto` AND NOTHING ELSE, including on the paths that
+   * already hold a richer detail DTO. The client's type is generated from this contract, so a
+   * payload that carried a few extra detail fields would be a shape the generated client does not
+   * describe — and one the next refresh would silently drop.
+   */
+  emitBookingRequestCreated(
+    dto: AdminBookingRequestListItemDto,
+    actor: RealtimeActor | null,
+  ): void {
+    this.emit(
+      REALTIME_EVENTS.bookingRequestCreated,
+      { booking: dto, actor },
+      dto.id,
+    );
+  }
+
+  /**
+   * Broadcasts a booking request whose contents changed.
+   *
+   * 🔴 CALLED ONCE PER CHANGED ROW. An approval that auto-rejects two overlapping requests calls
+   * this three times — once for the subject and once for each loser. See
+   * `REALTIME_EVENTS.bookingRequestUpdated`.
+   */
+  emitBookingRequestUpdated(
+    dto: AdminBookingRequestListItemDto,
+    actor: RealtimeActor | null,
+  ): void {
+    this.emit(
+      REALTIME_EVENTS.bookingRequestUpdated,
+      { booking: dto, actor },
+      dto.id,
+    );
   }
 
   /**

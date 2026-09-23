@@ -2,13 +2,12 @@ import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
 import { NestExpressApplication } from '@nestjs/platform-express';
-import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { Request, Response } from 'express';
 import morgan from 'morgan';
 import pc from 'picocolors';
 import { AppModule } from './app.module';
 import { configureApp } from './app.setup';
-import { DEFAULT_SESSION_COOKIE_NAME } from './session/session.middleware';
+import { mountSwagger } from './system/swagger.setup';
 
 // Reverse-proxy hops in front of the app. This is a DEPLOYMENT fact, not a code constant.
 //
@@ -155,32 +154,10 @@ async function bootstrap() {
   // CORS, global prefix, cookie-parser, session, CSRF, validation — order matters (see app.setup).
   configureApp(app);
 
-  // OpenAPI / Swagger UI at /docs (raw spec at /docs-json). Can be disabled in prod.
-  if (config.get<string>('SWAGGER_ENABLED', 'true') !== 'false') {
-    const sessionCookie = config.get<string>(
-      'SESSION_COOKIE_NAME',
-      DEFAULT_SESSION_COOKIE_NAME,
-    );
-    const swaggerConfig = new DocumentBuilder()
-      .setTitle('EasyBook API')
-      .setDescription('REST contract for the EasyBook booking service.')
-      .setVersion('v1')
-      .addCookieAuth(
-        sessionCookie,
-        { type: 'apiKey', in: 'cookie', name: sessionCookie },
-        // The security-scheme name referenced by @ApiCookieAuth('session').
-        'session',
-      )
-      // The LINE ID token (Bearer) that authenticates the LIFF-client endpoints
-      // (`/line-users/register`, `/line-users/status`); referenced by @ApiBearerAuth().
-      .addBearerAuth(
-        { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
-        'bearer',
-      )
-      .build();
-    const document = SwaggerModule.createDocument(app, swaggerConfig);
-    SwaggerModule.setup('docs', app, document);
-  }
+  // OpenAPI / Swagger UI at /docs (raw spec at /docs-json), ALWAYS mounted and gated per request by
+  // `SwaggerGateService` — a SUPER_ADMIN switches it on/off at runtime (INTEGRATIONS-API-1). Must run
+  // before `listen()` (which calls `init()`): see `mountSwagger`.
+  mountSwagger(app);
 
   const port = config.get<number>('PORT', 3300);
   await app.listen(port);

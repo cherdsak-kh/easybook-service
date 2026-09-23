@@ -17,11 +17,12 @@ const trim = ({ value }: { value: unknown }): unknown =>
  * member, including `PENDING` — approve/block are just the frontend labels the operator sends as
  * `ALLOWED`/`BLOCKED`, and no special-casing of `PENDING` is warranted at the transport boundary.
  *
- * `reason` is the operator-authored revision reason for the Reject action. It is **optional at the
- * transport layer** (meaningless for ALLOWED/BLOCKED), but the service REQUIRES a non-empty trimmed
- * value when `access === REJECTED` (a missing/blank reason on a REJECTED request is a `400`); it is
- * ignored (not persisted) for any non-REJECTED target. Trimming happens HERE (single normalization
- * site) so the service only needs to test emptiness.
+ * `reason` is ONE field serving TWO columns, chosen by the target state — `rejectionReason` on a
+ * Reject, `blockReason` on a Block (19 ส.ค. 2569). It stays optional at the transport layer, and the
+ * service requires it only for `REJECTED` (a missing/blank reason there is a `400`), because that
+ * one is pushed to the user as a LINE message while a block reason is an internal note. For every
+ * other target it is still accepted and still not persisted. Trimming happens HERE (single
+ * normalization site) so the service only needs to test emptiness.
  */
 export class UpdateLineUserAccessDto {
   @ApiProperty({
@@ -37,10 +38,10 @@ export class UpdateLineUserAccessDto {
     maxLength: 500,
     example: 'เบอร์โทรศัพท์ไม่ถูกต้อง กรุณากรอกใหม่',
     description:
-      'The operator-authored revision reason. Optional at the transport layer (meaningless for ' +
-      'ALLOWED/BLOCKED), but the service REQUIRES a non-empty trimmed value when `access === REJECTED` ' +
-      '— a missing/blank reason on a REJECTED request is a 400. Ignored (not persisted) for any ' +
-      'non-REJECTED target. Max 500 chars.',
+      'The operator-authored reason. Optional at the transport layer, but the service REQUIRES a ' +
+      'non-empty trimmed value when `access === REJECTED` (it is pushed to the user on LINE) — a ' +
+      'missing/blank reason there is a 400. On `access === BLOCKED` it is optional and persisted as ' +
+      '`blockReason`, a back-office-only note. Ignored (not persisted) for any other target. Max 500 chars.',
   })
   @IsOptional()
   @IsString()

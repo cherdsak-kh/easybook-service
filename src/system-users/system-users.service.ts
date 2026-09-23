@@ -11,14 +11,20 @@ import { PasswordService } from '../auth/password.service';
 import { normaliseEmail } from '../auth/login-throttle.key';
 import { mapTransactionError } from '../common/prisma-tx.util';
 import { PrismaService } from '../prisma/prisma.service';
+import { OPTION_LIST_KEYS } from '../redis/cache-keys';
+import { RedisService } from '../redis/redis.service';
 import type { UpdateOwnProfileDto } from '../auth/dto/update-own-profile.dto';
 import { CreateSystemUserDto } from './dto/create-system-user.dto';
-import { ListSystemUsersQueryDto } from './dto/list-system-users-query.dto';
+import {
+  ListSystemUsersQueryDto,
+  type StaffStatus,
+} from './dto/list-system-users-query.dto';
 import { PaginatedSystemUsersResponseDto } from './dto/paginated-system-users-response.dto';
 import { SystemUserResponseDto } from './dto/system-user-response.dto';
 import { SystemUserWithTemporaryPasswordDto } from './dto/system-user-with-temporary-password.dto';
 import { UpdateSystemUserDto } from './dto/update-system-user.dto';
 import {
+  DELETED_FILTER_IS_SUPER_ADMIN_ONLY,
   EMAIL_TAKEN,
   INVALID_DEPARTMENT,
   INVALID_PERSONNEL_ROLE,
@@ -90,6 +96,33 @@ async function assertOptionsAssignable(
   }
 }
 
+/**
+ * The status filter, and it is a PRECEDENCE rather than four independent predicates — copied from
+ * the screen that renders the badge (`deleted` > `suspended` > `pending` > `active`).
+ *
+ * The one that is easy to get wrong is `pending`: a suspended user who also owes a password change
+ * shows `ระงับการใช้งาน`, so `pending` must exclude them. Otherwise filtering by one badge returns
+ * rows that visibly display another — which reads as a broken screen, not a broken query.
+ *
+ * ⚠️ EVERY branch carries its own `deletedAt` clause, including the default. This function owns
+ * that decision entirely, so nothing above it re-adds `deletedAt: null` and quietly makes
+ * `status=deleted` return nothing at all.
+ */
+function statusFilter(status?: StaffStatus): Prisma.SystemUserWhereInput {
+  switch (status) {
+    case 'deleted':
+      return { deletedAt: { not: null } };
+    case 'suspended':
+      return { deletedAt: null, isActive: false };
+    case 'pending':
+      return { deletedAt: null, isActive: true, mustChangePassword: true };
+    case 'active':
+      return { deletedAt: null, isActive: true, mustChangePassword: false };
+    default:
+      return { deletedAt: null }; // identity read → soft-deleted rows are invisible
+  }
+}
+
 /** `role = SUPER_ADMIN AND isActive = true AND deletedAt IS NULL`. */
 const ACTIVE_SUPER_ADMIN: Prisma.SystemUserWhereInput = {
   role: SystemRole.SUPER_ADMIN,
@@ -128,7 +161,24 @@ export class SystemUsersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly password: PasswordService,
+    private readonly redis: RedisService,
   ) {}
+
+  /**
+   * Drop the admin option lists after a write that changed who holds which option.
+   *
+   * ⚠️ THE CALL SITES ARE EXACTLY FOUR: `create`, `update`, `softDelete`, `restore` — the writes
+   * that can add, remove or move a holder. `resetPassword`, `updateOwnProfile` and `setOwnAvatar`
+   * are deliberately NOT among them: neither `departmentId` nor `personnelRoleId` nor `deletedAt`
+   * is reachable from any of the three, so they cannot move a count, and calling this on every
+   * avatar upload would evict a list that every admin screen reads.
+   *
+   * `holderCount` is why this exists at all. The option NAMES change a few times a year; the
+   * counts change every time anybody hires, edits, deletes or restores a person.
+   */
+  private dropOptionCounts(): Promise<void> {
+    return this.redis.del(...OPTION_LIST_KEYS);
+  }
 
   /**
    * The only creation path besides the offline seed script.
@@ -188,6 +238,7 @@ export class SystemUsersService {
 
       // `id=`-only, exactly as before. NEVER log the DTO or the temp password (AC-B7).
       this.logger.log(`SystemUser created. id=${created.id} by=${actor.id}`);
+      await this.dropOptionCounts();
       return { ...toSystemUserDto(created), temporaryPassword };
     } catch (error) {
       if (
@@ -249,11 +300,39 @@ export class SystemUsersService {
    * so `meta.total` could genuinely disagree with `data`. A read-only RepeatableRead transaction
    * can never abort.
    */
-  async findManyPaginated({
-    page,
-    limit,
-  }: ListSystemUsersQueryDto): Promise<PaginatedSystemUsersResponseDto> {
-    const where: Prisma.SystemUserWhereInput = { deletedAt: null }; // identity read → filter
+  async findManyPaginated(
+    { page, limit, search, role, status }: ListSystemUsersQueryDto,
+    actorRole: SystemRole,
+  ): Promise<PaginatedSystemUsersResponseDto> {
+    // ⚠️ The boundary, and it lives HERE rather than in a guard or a DTO: a guard runs before the
+    // pipe and cannot see `status`, and a DTO cannot see who is asking. The screen hides the
+    // option for other roles, which is UX — this is the control.
+    if (status === 'deleted' && actorRole !== SystemRole.SUPER_ADMIN) {
+      throw new ForbiddenException(DELETED_FILTER_IS_SUPER_ADMIN_ONLY);
+    }
+
+    const q = search?.trim();
+    const where: Prisma.SystemUserWhereInput = {
+      ...statusFilter(status), // carries the deletedAt clause — see the note there
+      ...(role ? { role } : {}),
+      ...(q
+        ? {
+            OR: [
+              { firstName: { contains: q, mode: 'insensitive' } },
+              { lastName: { contains: q, mode: 'insensitive' } },
+              { email: { contains: q, mode: 'insensitive' } },
+              // ⚠️ FORMAT-SENSITIVE, unlike LineUserRegistration's search. That model carries a
+              // normalized `phoneDigits` column alongside `phone` precisely so an operator can
+              // find a number however it was typed; `SystemUser` has no such column, so
+              // `0812345678` does NOT match a stored `081-234-5678`. Fixing that is a schema
+              // change (architect/pm), not something to paper over here with a digits-only
+              // fallback — a second OR term on the raw column cannot match across separators.
+              // A NULL phoneNumber simply never matches `contains`, which is correct.
+              { phoneNumber: { contains: q, mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+    };
 
     const [rows, total] = await this.prisma.$transaction(
       [
@@ -291,7 +370,7 @@ export class SystemUsersService {
    * Target load, policy, write and invariant, all inside ONE transaction (DD-8) — so the
    * authorization decision and the write see the same snapshot. A guard that fetched the target
    * would read it outside the write's transaction, leaving a window in which a concurrent
-   * `STAFF → ADMIN` promotion lets an `ADMIN` patch an `ADMIN`.
+   * `VIEWER → ADMIN` promotion lets an `ADMIN` patch an `ADMIN`.
    */
   async update(
     actor: Actor,
@@ -302,7 +381,7 @@ export class SystemUsersService {
     // SUPER_ADMIN count, so a profile-only patch needs neither the invariant nor Serializable.
     // Running every update at Serializable would be actively harmful: the invariant's `count()`
     // predicate seq-scans `system_users`, so Postgres SSI escalates to a page/relation predicate
-    // lock, and two operators editing two unrelated STAFF profiles would 409 each other.
+    // lock, and two operators editing two unrelated VIEWER profiles would 409 each other.
     const touchesInvariant =
       patch.role !== undefined || patch.isActive !== undefined;
 
@@ -359,6 +438,9 @@ export class SystemUsersService {
           ? { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
           : undefined,
       );
+      // Unconditional, not "only if departmentId/personnelRoleId was in the patch": the cheap
+      // wrong answer is an extra miss, the expensive one is a stale count nobody traces back.
+      await this.dropOptionCounts();
       return toSystemUserDto(updated);
     } catch (error) {
       mapTransactionError(error); // rethrows; P2034 / 40001 / 40P01 → 409, never 500
@@ -400,6 +482,8 @@ export class SystemUsersService {
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
       });
       this.logger.log(`SystemUser soft-deleted. id=${id} by=${actor.id}`);
+      // A soft-deleted holder leaves the count — `HOLDER_COUNT` filters `deletedAt: null`.
+      await this.dropOptionCounts();
     } catch (error) {
       mapTransactionError(error);
     }
@@ -428,7 +512,7 @@ export class SystemUsersService {
    * `null`. The end state is identical and correct; that is not worth a Serializable transaction.
    */
   async restore(id: string): Promise<SystemUserResponseDto> {
-    return this.prisma.$transaction(async (tx) => {
+    const dto = await this.prisma.$transaction(async (tx) => {
       const target = await tx.systemUser.findUnique({
         where: { id },
         select: { id: true, deletedAt: true },
@@ -445,6 +529,10 @@ export class SystemUsersService {
       this.logger.log(`SystemUser restored. id=${restored.id}`);
       return toSystemUserDto(restored);
     });
+
+    // A restored holder re-enters the count, so this is the mirror of `softDelete`'s drop.
+    await this.dropOptionCounts();
+    return dto;
   }
 
   /**
@@ -454,7 +542,9 @@ export class SystemUsersService {
    * set (enforced by `forbidNonWhitelisted` at the pipe), there is no target but self, and no field
    * here bears an invariant. A single-row update with no cross-row read needs no ceremony.
    *
-   * Field by field, never `{...dto}` — same discipline as `update()`.
+   * Field by field, never `{...dto}` — same discipline as `update()`. With the DTO down to one
+   * field (2026-08-16) that discipline costs nothing and still matters: a spread would silently
+   * start writing whatever the DTO gains next.
    */
   async updateOwnProfile(
     id: string,
@@ -462,12 +552,7 @@ export class SystemUsersService {
   ): Promise<SystemUserResponseDto> {
     const updated = await this.prisma.systemUser.update({
       where: { id },
-      data: {
-        firstName: patch.firstName,
-        lastName: patch.lastName,
-        phoneNumber: patch.phoneNumber,
-        profilePictureUrl: patch.profilePictureUrl,
-      },
+      data: { profilePictureUrl: patch.profilePictureUrl },
       select: PUBLIC_FIELDS,
     });
     return toSystemUserDto(updated);

@@ -150,6 +150,63 @@ export function validateEnv(
     );
   }
 
+  /*
+   * `LINE_LIFF_URL` — the button on two of the four status cards. OPTIONAL EVERYWHERE, including
+   * production: an unset value renders those cards without a footer, which is a card that is
+   * slightly less convenient, not a broken one.
+   *
+   * ⚠️ CHECKED WHENEVER PRESENT, for the same reason `R2_PUBLIC_BASE_URL` is. LINE validates a
+   * `uri` action's scheme and rejects the WHOLE message if it fails — so a typo here would not
+   * produce a dud button, it would silently stop every approval and every return notification
+   * from arriving at all. That failure would surface as "users say they never got the message",
+   * days later, with nothing in our logs but a push warning. Boot is the place to catch it.
+   */
+  const liffUrl = str(raw, 'LINE_LIFF_URL');
+  if (liffUrl !== undefined) {
+    let parsed: URL | undefined;
+    try {
+      parsed = new URL(liffUrl);
+    } catch {
+      errors.push('LINE_LIFF_URL must be a valid absolute URL.');
+    }
+    // https only — LINE refuses anything else in a `uri` action, and the LIFF endpoint is https
+    // by definition.
+    if (parsed && parsed.protocol !== 'https:') {
+      errors.push('LINE_LIFF_URL must use https.');
+    }
+  }
+
+  /*
+   * `API_EXTERNAL_URL` — the canonical public URL of THIS backend. `GET /system/integrations`
+   * builds the Swagger link and the LINE Webhook URL from it, because only the backend knows its
+   * own public origin: the browser's `window.location` names the FRONTEND, which LINE cannot call.
+   *
+   * OPTIONAL IN EVERY ENVIRONMENT, production included — unset falls back to
+   * `http://localhost:${PORT}`, which is right on a dev box and merely unhelpful elsewhere. A
+   * missing convenience URL must not block a boot (same stance as `LINE_LIFF_URL`).
+   *
+   * ⚠️ CHECKED WHENEVER PRESENT, like `R2_PUBLIC_BASE_URL`: a value that does not parse would be
+   * pasted into the LINE Developers console as a webhook that can never be called, and that
+   * failure surfaces days later as "the bot stopped responding". Boot is the place to catch it.
+   * `http:` is allowed as well as `https:` (local dev is `http://localhost:3300`), and a trailing
+   * slash is NOT an error — unlike `R2_PUBLIC_BASE_URL`, which is concatenated raw, this value is
+   * normalised by `IntegrationsService` before use.
+   */
+  const apiExternalUrl = str(raw, 'API_EXTERNAL_URL');
+  if (apiExternalUrl !== undefined) {
+    let apiUrl: URL | undefined;
+    try {
+      apiUrl = new URL(apiExternalUrl);
+    } catch {
+      errors.push(
+        'API_EXTERNAL_URL must be a valid absolute URL (e.g. https://api.example.com).',
+      );
+    }
+    if (apiUrl && apiUrl.protocol !== 'http:' && apiUrl.protocol !== 'https:') {
+      errors.push('API_EXTERNAL_URL must use http or https.');
+    }
+  }
+
   const sessionSecret = str(raw, 'SESSION_SECRET');
   const csrfSecret = str(raw, 'CSRF_SECRET');
   const cookieSecureRaw = str(raw, 'SESSION_COOKIE_SECURE');
