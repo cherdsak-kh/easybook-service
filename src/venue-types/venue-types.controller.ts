@@ -162,7 +162,7 @@ export class VenueTypesController {
   @ApiOperation({
     summary: 'Soft-delete a venue type option.',
     description:
-      'Sets `deletedAt`; never a hard delete. Venues filed under it are re-pointed to the reserved tombstone row in the same transaction. A second DELETE on the same id is a 404, as is the reserved row itself. Answers 500 if the tombstone row has never been seeded — run `npm run venue-types:seed`.',
+      'Sets `deletedAt`; never a hard delete. Venues filed under it are re-pointed to the reserved tombstone row in the same transaction. If that tombstone row does not exist yet (database never seeded), it is created first, so the delete still succeeds. A second DELETE on the same id is a 404, as is the reserved row itself.',
   })
   @ApiHeader({ name: 'x-csrf-token', required: true })
   @ApiNoContentResponse({ description: 'Soft-deleted. Empty body.' })

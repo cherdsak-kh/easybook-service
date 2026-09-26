@@ -23,10 +23,13 @@
  * type", which reads as a bug to whoever hits it; and seeding inside the migration would break the
  * DDL-only convention that three design logs state and that neither existing migration violates.
  *
- * ⚠️ UNTIL THIS RUNS, `DELETE /venue-types/:id` ANSWERS 500 `VENUE_TYPE_TOMBSTONE_ROW_MISSING`.
- * That is the designed failure — loud, honest, and it moves no data. It is also exactly the state
- * `/departments` is in on a database where `auth:create-superadmin` has never run, so this adds one
- * line to the post-migrate runbook rather than a new class of failure.
+ * ✅ THE TOMBSTONE HALF OF THIS SEED IS NOW OPTIONAL (fix `20260926_1541_venue_type_auto_tombstone`).
+ * `DELETE /venue-types/:id` used to answer 500 `VENUE_TYPE_TOMBSTONE_ROW_MISSING` until this ran;
+ * `VenueTypesService.resolveTombstoneId` now creates the reserved row on the first delete if it is
+ * missing. That makes the service a SECOND writer of the flag on this table. The race the
+ * one-writer rule guards against is closed by the partial unique index on the active name: whichever
+ * create loses gets `P2002` — the service re-probes and reuses the winner's row; this script simply
+ * fails and is safe to re-run. Running the seed is still how the five starting categories arrive.
  *
  * Idempotent: a partial-unique `name` index means an `upsert`-on-name is not expressible, so for
  * each name we `findFirst({ name, deletedAt: null })` and `create` only if absent. Existing rows
@@ -55,8 +58,8 @@ async function main(): Promise<void> {
   try {
     // ── The reserved row, first ──────────────────────────────────────────────
     // ⚠️ THE NAME IS IMPORTED, NEVER RETYPED. `VenueTypesService.softDelete` resolves this row by
-    // name; a second literal here means editing the constant later leaves the service hunting for a
-    // row this script never created, and the only symptom is a 500 on delete.
+    // name; a second literal here means editing the constant later leaves the service missing the
+    // row this script created and silently minting a second reserved row under the other spelling.
     //
     // The probe matches the service's exactly — name + active + reserved. Probing by name ALONE
     // would let an ordinary operator-created row called `ไม่พบประเภทสถานที่` satisfy this check, and

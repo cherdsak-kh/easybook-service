@@ -1,7 +1,6 @@
 import {
   ConflictException,
   Injectable,
-  InternalServerErrorException,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
@@ -12,12 +11,10 @@ import { VENUE_TYPE_CACHE_KEYS, venueTypeListKey } from '../redis/cache-keys';
 // Imported, not re-typed. These two messages ARE the option contract — an unknown id and a
 // name collision must answer identically on every curated table, and copying the strings is how two
 // screens end up disagreeing about what a 404 says. (`TOMBSTONE_ROW_MISSING` is deliberately NOT
-// imported: its text names the wrong seed command for this table. See `venue-types.constants.ts`.)
+// imported: this table's delete never fails for a missing tombstone — `resolveTombstoneId` creates
+// it on demand. See `venue-types.constants.ts`.)
 import { OPTION_NAME_TAKEN, OPTION_NOT_FOUND } from '../options/options.errors';
-import {
-  TOMBSTONE_VENUE_TYPE_NAME,
-  VENUE_TYPE_TOMBSTONE_ROW_MISSING,
-} from './venue-types.constants';
+import { TOMBSTONE_VENUE_TYPE_NAME } from './venue-types.constants';
 import { VenueTypeResponseDto } from './dto/venue-type.dto';
 
 /** A `VenueType` row narrowed to the public select. Dates are still `Date`s. */
@@ -164,10 +161,10 @@ export class VenueTypesService {
    * Rename. 404 on unknown/soft-deleted id; 409 on an active-name collision.
    *
    * A RESERVED target is also a 404 — for EVERY role, SUPER_ADMIN included. The tombstone is not
-   * CRUD-managed: `softDelete` resolves it BY NAME, so a rename would make the next delete fail to
-   * find a row that still exists. For an ADMIN the uniform 404 is additionally mandatory — a
-   * distinct 403 would be an existence oracle, and reserved must be indistinguishable from
-   * never-existed.
+   * CRUD-managed: `softDelete` resolves it BY NAME, so a rename would make the next delete miss a
+   * row that still exists and mint a second reserved one. For an ADMIN the uniform 404 is
+   * additionally mandatory — a distinct 403 would be an existence oracle, and reserved must be
+   * indistinguishable from never-existed.
    */
   async update(id: number, name: string): Promise<VenueTypeResponseDto> {
     const existing = await this.prisma.venueType.findFirst({
@@ -194,11 +191,12 @@ export class VenueTypesService {
    * Soft-delete (`update` setting `deletedAt`, NEVER a hard delete). A second delete on the same id
    * is a 404, byte-identical to an unknown id. A reserved target is likewise a 404 for every role.
    *
-   * ⚠️ THE TOMBSTONE IS RESOLVED UNCONDITIONALLY, even though there are no venues to move yet.
-   * Making the resolve conditional on "are there holders" would mean a delete succeeds today and
-   * 500s later, on a system whose only difference is unrelated data — the misconfiguration would
-   * hide until the first category that happens to hold a venue. Failing on the first delete instead
-   * points at the actual defect: migrated but never seeded.
+   * ⚠️ THE TOMBSTONE IS RESOLVED UNCONDITIONALLY, even when the category holds no venues. The
+   * resolve is a find-or-create (`resolveTombstoneId`), so a database that was migrated but never
+   * seeded no longer 500s here: the first delete creates the reserved row and every later delete
+   * reuses it. Resolving it on every delete — rather than only when there are venues to move — keeps
+   * that one code path exercised from the very first delete instead of first running on whichever
+   * category happens to hold a venue.
    */
   async softDelete(id: number): Promise<void> {
     const existing = await this.prisma.venueType.findFirst({
@@ -239,10 +237,49 @@ export class VenueTypesService {
   }
 
   /**
-   * The row a deleted category's venues are moved to. Resolved by name, ACTIVE and RESERVED — the
-   * same probe shape the seed script uses to create it.
+   * The row a deleted category's venues are moved to — found, or created if it does not exist yet.
+   *
+   * Probe: name + ACTIVE + RESERVED, the same shape the seed script uses. A same-named row with
+   * `isSystemReserved: false` never satisfies it — the flag is what makes a row the tombstone, the
+   * name alone never does.
+   *
+   * ⚠️ A CONCURRENT FIRST DELETE IS SAFE. Two deletes can both miss the probe and both try to create;
+   * the partial unique index on the ACTIVE name lets exactly one win, and the loser's `P2002` is
+   * answered by probing again and returning the winner's id. Any other error is rethrown unchanged.
+   *
+   * ⚠️ KNOWN EDGE, DELIBERATELY UNFIXED: if an ORDINARY active row already holds the tombstone name
+   * (possible only while no tombstone exists — `POST /venue-types` accepts the name then), the create
+   * hits `P2002` and the re-probe still finds nothing. That original error is rethrown (a 500) rather
+   * than looping, and the fix is for an operator to rename that row.
    */
   private async resolveTombstoneId(): Promise<number> {
+    const existingId = await this.findTombstoneId();
+    if (existingId !== null) return existingId;
+
+    try {
+      const created = await this.prisma.venueType.create({
+        data: { name: TOMBSTONE_VENUE_TYPE_NAME, isSystemReserved: true },
+        select: { id: true },
+      });
+      this.logger.log(
+        `Venue type tombstone was missing and has been auto-created. id=${created.id}`,
+      );
+      return created.id;
+    } catch (error) {
+      if (!(
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === 'P2002'
+      )) {
+        throw error;
+      }
+      const winnerId = await this.findTombstoneId();
+      if (winnerId === null) throw error;
+      return winnerId;
+    }
+  }
+
+  /** The active reserved tombstone's id, or `null` when there is none. */
+  private async findTombstoneId(): Promise<number | null> {
     const row = await this.prisma.venueType.findFirst({
       where: {
         name: TOMBSTONE_VENUE_TYPE_NAME,
@@ -251,10 +288,7 @@ export class VenueTypesService {
       },
       select: { id: true },
     });
-    if (!row) {
-      throw new InternalServerErrorException(VENUE_TYPE_TOMBSTONE_ROW_MISSING);
-    }
-    return row.id;
+    return row?.id ?? null;
   }
 
   /** A `P2002` from the partial-unique index → 409; anything else is rethrown unchanged. */

@@ -353,10 +353,11 @@ model VenueType {
   /// Settable by NO endpoint: absent from every DTO, so `forbidNonWhitelisted: true` 400s any
   /// attempt — the same construction that protects `SystemUser.lineUserId`.
   ///
-  /// ⚠️ ITS ONE WRITER IS `scripts/seed-venue-types.ts`, not `create-super-admin.ts` and not
-  /// `options:seed` (`Q16`, answered 2026-08-25). The rule those two encode is "exactly ONE writer
-  /// of this flag PER TABLE"; this table had none, so its seed script becomes that writer and may
-  /// therefore write both the ordinary rows and the reserved one.
+  /// ⚠️ ITS WRITERS ARE `scripts/seed-venue-types.ts` (`Q16`, answered 2026-08-25) AND, since fix
+  /// `20260926_1541_venue_type_auto_tombstone`, `VenueTypesService.resolveTombstoneId`, which creates
+  /// the tombstone on the first delete when it is missing. Not `create-super-admin.ts`, not
+  /// `options:seed`. Two creators cannot mint two tombstones: the partial unique index on the active
+  /// name lets one create win, and the service answers the loser's P2002 by re-probing.
   isSystemReserved Boolean @default(false)
 
   createdAt DateTime  @default(now())
