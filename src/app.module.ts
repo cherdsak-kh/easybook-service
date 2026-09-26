@@ -23,6 +23,7 @@ import { CsrfModule } from './csrf/csrf.module';
 import { FeedbackModule } from './feedback/feedback.module';
 import { HealthModule } from './health/health.module';
 import { LineModule } from './line/line.module';
+import { NotificationsModule } from './notifications/notifications.module';
 import { OptionsModule } from './options/options.module';
 import { VenueTypesModule } from './venue-types/venue-types.module';
 import { AmenitiesModule } from './amenities/amenities.module';
@@ -119,6 +120,10 @@ const throttlerModule: DynamicModule = {
     // `ANNOUNCE-API-5` — ข้อความตอบกลับด่วน (canned replies CRUD). Its routes are `/canned-replies…`,
     // a first segment no other controller uses.
     CannedRepliesModule,
+    // `NOTIF-API-1` — การแจ้งเตือน, phase 1 (the feed + per-operator read/dismiss state; nothing emits
+    // notifications until phase 3). Its routes are `/notifications…`, a first segment no other
+    // controller uses.
+    NotificationsModule,
     SystemModule,
     // Still future tasks: the admin approval + direct-booking surface (`SessionGuard`), the
     // `/client` realtime namespace, and LINE chat notifications.

@@ -700,6 +700,10 @@ model SystemUser {
   /// filter (DD-4). A hard delete nulls Announcement.createdById and keeps the row.
   createdAnnouncements Announcement[] @relation("AnnouncementCreatedBy")
 
+  /// This operator's private read/dismiss state on admin notifications (NOTIF-API-1). Cascade-deleted with a
+  /// hard-deleted user. Never resolved as history.
+  notificationReceipts AdminNotificationReceipt[] @relation("AdminNotificationReceiptOwner")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1313,4 +1317,126 @@ model CannedReply {
   updatedAt DateTime @updatedAt
 
   @@map("canned_replies")
+}
+
+/// Which prototype tab a notification belongs to (NOTIF-API-1). The wire carries these UPPER_CASE values
+/// verbatim. Phase 2 maps them to the prototype `CATS` keys:
+/// BOOKING→`bookings` (คำขอจอง), REGISTRATION→`users` (การลงทะเบียน), FEEDBACK→`feedback` (ข้อเสนอแนะ),
+/// SYSTEM→`system` (ระบบและการเชื่อมต่อ). Audit-trail events are NEVER a category (spec §1). They belong in reports/*.
+enum AdminNotificationCategory {
+  BOOKING
+  REGISTRATION
+  FEEDBACK
+  SYSTEM
+}
+
+/// The row's colour intent. These are the prototype's `tone` keys upper-cased (`sky` → SKY, and so on). The wire is
+/// UPPER_CASE and Phase 2 lower-cases or maps them. This is a Prisma enum rather than a string because the set is
+/// closed and presentational. A new tone is a design change and should cost a migration.
+enum AdminNotificationTone {
+  SKY
+  AMBER
+  ROSE
+  EMERALD
+  SLATE
+}
+
+/// The MINIMUM role that sees a notification, read as "this role and above" (D-2):
+/// SUPER_ADMIN > ADMIN > VIEWER. ALL means every operator.
+///
+/// 🔴 NOT `SystemRole`. VIEWER is never a target (ALL already covers it), and ALL is not a role. Reusing SystemRole
+/// would make `targetRole = VIEWER` typeable, and its meaning would be ambiguous.
+/// 🔴 NON-NULL with ALL, never `null = everyone`. `IN (…)` never matches NULL, so a nullable column would silently
+/// hide every all-roles row from any query that forgot `OR IS NULL` (plan R-2).
+enum AdminNotificationTargetRole {
+  ALL
+  ADMIN
+  SUPER_ADMIN
+}
+
+/// One admin-portal notification (NOTIF-API-1): the feed behind `/backend/notifications` and the topbar bell.
+///
+/// IMMUTABLE AFTER INSERT. No route updates or deletes this row. It is written ONLY by
+/// `NotificationsService.create()` (Phase 3 domain events) and by the dev seed script. There is NO public
+/// creation route (D-4). Per-operator read and dismiss state lives in `AdminNotificationReceipt`, never here
+/// (D-1). There is no global `isRead`.
+///
+/// PDPA: `title`/`body` carry personnel names, positions and phone numbers (UC-U1, UC-F2). NEVER log them.
+/// Log `id=` and counts only. Retention is `NOTIF-RETENTION-1`.
+model AdminNotification {
+  id String @id @default(cuid())
+
+  category AdminNotificationCategory
+
+  /// A human reference the row is about ("BR-25690903-001", "ISS-…"), searchable (D-5). NOT unique: one booking
+  /// legitimately produces several notifications (UC-B1, then UC-B2). Null = none.
+  code String?
+
+  /// Stored through `sanitizeThaiText` by `create()`, so `search` (sanitised the same way) matches what was
+  /// written. Unbounded `text`. The caps live in `create()` (house rule).
+  title String
+  body  String
+
+  tone AdminNotificationTone
+
+  /// One of `ADMIN_NOTIFICATION_ICONS` (kebab-case heroicon names from the spec, e.g. `user-plus`). This is a
+  /// STRING, not an enum, because Prisma enum members cannot contain `-`. An UPPER_SNAKE enum would add a third
+  /// vocabulary between the spec, the column and the SVG table. Validated by `create()`, and published as the
+  /// Swagger enum `AdminNotificationIcon`.
+  icon String
+
+  /// Portal-relative deep link. It MUST start with `/backend/` and contain no `//`, no `\` and no whitespace
+  /// (D-7, open-redirect guard, enforced in `create()`). `actionUrl` and `actionLabel` are BOTH set or BOTH null
+  /// (the CTA exists iff `actionUrl` is non-null).
+  actionUrl   String?
+  actionLabel String?
+
+  targetRole AdminNotificationTargetRole @default(ALL)
+
+  receipts AdminNotificationReceipt[] @relation("AdminNotificationReceipts")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The feed: `WHERE targetRole IN (…) [AND …] ORDER BY createdAt DESC, id DESC LIMIT n OFFSET m`. `id` is
+  /// included so the TOTAL order is index-backed (backward scan). `targetRole` is deliberately NOT leading:
+  /// an `IN` list of 2–3 values on the leading column breaks the ordered scan into a merge-and-sort, and three
+  /// values carry no selectivity worth an index.
+  @@index([createdAt, id])
+  /// The category tab with the same recency sort, and the `groupBy(category)` behind the unread pills.
+  /// Not redundant with the index above. Postgres cannot use that one for `WHERE category = ?` + sort.
+  @@index([category, createdAt])
+  @@map("admin_notifications")
+}
+
+/// The caller's own state on one notification: read and/or dismissed ("deleted for me", D-3).
+///
+/// NO ROW = UNREAD AND NOT DISMISSED. Rows appear only when an operator acts, so `create()` stays O(1) with no
+/// fan-out per operator (D-1). A row may exist with both timestamps null (marked read, then unread).
+///
+/// Never exposed. No response carries a receipt id, another operator's state, or `dismissedAt`.
+model AdminNotificationReceipt {
+  /// FK → SystemUser.id. `Cascade`: when an operator is HARD-deleted, their private state goes with them
+  /// (PDPA, plan §5). SystemUsers are normally soft-deleted, so this fires rarely, but it fires in the e2e purge.
+  systemUserId String
+  systemUser   SystemUser @relation("AdminNotificationReceiptOwner", fields: [systemUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  /// FK → AdminNotification.id. `Cascade`: the future retention purge deletes notifications and takes their
+  /// state rows with them.
+  notificationId String
+  notification   AdminNotification @relation("AdminNotificationReceipts", fields: [notificationId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  /// Null = unread. Set once, and never moved by a repeated mark-read (AC-11).
+  readAt DateTime?
+
+  /// Non-null = dismissed for this operator. It is then invisible to every route for them (404 / skipped).
+  /// There is no undismiss route.
+  dismissedAt DateTime?
+
+  /// `systemUserId` LEADS. Every runtime access is scoped to the caller (`WHERE systemUserId = $me …`), so the
+  /// PK doubles as the per-caller range index: the anti-joins in list/count, read-all, and dismiss-all-read.
+  @@id([systemUserId, notificationId])
+  /// The scan the notification-side Cascade performs (retention purge, e2e fixture cleanup).
+  @@index([notificationId])
+  @@map("admin_notification_receipts")
 }
