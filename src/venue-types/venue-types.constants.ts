@@ -2,8 +2,9 @@
  * The TOMBSTONE row for `VenueType` — where the venues of a deleted category are re-pointed.
  *
  * Lives in `src/` rather than beside the seed script because BOTH sides need it: the script creates
- * the row, and `VenueTypesService.softDelete` resolves it BY NAME on every delete. Two literals
- * would mean the delete silently fails to find a row the seed definitely created.
+ * the row, and `VenueTypesService.softDelete` resolves it BY NAME on every delete — creating it on
+ * demand when the database was never seeded. Two literals would mean the delete silently misses the
+ * row the seed created and mints a second reserved one under the other spelling.
  *
  * (Resolving by name is a `WHERE name = $1` lookup, NOT an authorization expression. No name
  * comparison decides privilege anywhere in this codebase; `isSystemReserved` is the flag that makes
@@ -12,8 +13,13 @@
 export const TOMBSTONE_VENUE_TYPE_NAME = 'ไม่พบประเภทสถานที่';
 
 /**
- * Raised when a delete cannot find the tombstone row — i.e. the database was migrated but never
- * seeded.
+ * @deprecated No longer thrown. `DELETE /venue-types/:id` used to answer 500 with this message on a
+ * database that was migrated but never seeded; since fix `20260926_1541_venue_type_auto_tombstone`
+ * the delete path finds-or-creates the tombstone (`VenueTypesService.resolveTombstoneId`), so a
+ * missing row self-heals instead. Kept only so nothing importing it breaks; do not add new uses.
+ *
+ * Historical note, kept because it still explains why this table never reuses the option tables'
+ * message:
  *
  * ⚠️ A SEPARATE CONSTANT FROM `options.constants.ts`'s, and the difference is the sentence that
  * tells an operator what to do. That one says "run the SUPER_ADMIN bootstrap", which is true for the
@@ -21,9 +27,8 @@ export const TOMBSTONE_VENUE_TYPE_NAME = 'ไม่พบประเภทส�
  * table's reserved row is written by `venue-types:seed` (`Q16`, answered 2026-08-25). Reusing the
  * message would send whoever hits this to a command that cannot fix it.
  *
- * A 500 and not a 400, exactly as for the option tables: the caller did nothing wrong, the
- * deployment is incomplete, and deleting anyway would leave live venues pointing at a soft-deleted
- * category with no record of which ones they were.
+ * It was a 500 and not a 400, as the option tables' still is: the caller did nothing wrong. The
+ * option tables still refuse to delete without their tombstone; this table now creates its own.
  */
 export const VENUE_TYPE_TOMBSTONE_ROW_MISSING =
   'The fallback venue type row is missing. Run `npm run venue-types:seed` before deleting venue types.';

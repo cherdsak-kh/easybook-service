@@ -22,7 +22,10 @@ import {
   RICH_MENU_SPECS,
 } from '../src/line/rich-menu.constants';
 
-const LIFF_URI = 'https://liff.line.me/2010582836-zgUc8zRb';
+const LIFF_URI = (
+  process.env.LINE_LIFF_URL?.trim() ||
+  'https://liff.line.me/2010582836-zgUc8zRb'
+).replace(/\/+$/, '');
 const ASSET_DIR = resolve(__dirname, '..', 'assets', 'richmenu');
 
 // `name` and `size` are taken from RICH_MENU_SPECS rather than restated here.

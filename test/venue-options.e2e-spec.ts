@@ -8,6 +8,8 @@ import type { App } from 'supertest/types';
 import { PasswordService } from '../src/auth/password.service';
 import { API_BASE_PATH } from '../src/common/api.constants';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { VENUE_TYPE_CACHE_KEYS } from '../src/redis/cache-keys';
+import { CACHE_KEY_PREFIX } from '../src/redis/redis.constants';
 import { TOMBSTONE_VENUE_TYPE_NAME } from '../src/venue-types/venue-types.constants';
 import {
   clearThrottleCounters,
@@ -71,6 +73,11 @@ describe('Venue options admin CRUD (e2e)', () => {
   };
 
   const purgeRows = async () => {
+    // Venues first: `venues.venueTypeId` is `onDelete: Restrict`, so a leftover fixture venue from an
+    // aborted run would otherwise block the venue_types purge below.
+    await prisma.$executeRawUnsafe(
+      `DELETE FROM venues WHERE "name" LIKE '${ROW_PREFIX}%'`,
+    );
     await prisma.$executeRawUnsafe(
       `DELETE FROM venue_types WHERE "name" LIKE '${ROW_PREFIX}%'`,
     );
@@ -288,34 +295,130 @@ describe('Venue options admin CRUD (e2e)', () => {
       expect(reserved.body).toEqual(unknown.body);
     });
 
-    it('DELETE is 500 when the tombstone has never been seeded, and it moves nothing', async () => {
-      const { agent, token } = await login(ADMIN);
-      const created = await agent
-        .post(url('/venue-types'))
-        .set('x-csrf-token', token)
-        .send({ name: `${ROW_PREFIX}orphan-test` })
-        .expect(201);
-      const id = (created.body as OptionBody).id;
+    /**
+     * Puts the dev DB back exactly as it was before the self-heal test: every venue on an
+     * auto-created tombstone moves back to the ORIGINAL row, the auto-created rows are hard-deleted,
+     * and only then is the original un-deleted (the other order collides on the active-name unique).
+     *
+     * ⚠️ Skipping this breaks the NEXT run, not this one: `ensureVenueTypeTombstone` un-deletes every
+     * reserved row by name, and a leftover auto-created row would collide with the original there.
+     */
+    const restoreOriginalTombstone = async (
+      originalId: number,
+      fixtureVenueIds: string[],
+    ) => {
+      await prisma.venue.deleteMany({ where: { id: { in: fixtureVenueIds } } });
+      const autoCreated = await prisma.venueType.findMany({
+        where: {
+          name: TOMBSTONE_VENUE_TYPE_NAME,
+          isSystemReserved: true,
+          id: { not: originalId },
+        },
+        select: { id: true },
+      });
+      const autoIds = autoCreated.map((row) => row.id);
+      if (autoIds.length > 0) {
+        // Not only this test's venues: the FK is Restrict, so ANY venue on the auto-created row
+        // would block its removal.
+        await prisma.venue.updateMany({
+          where: { venueTypeId: { in: autoIds } },
+          data: { venueTypeId: originalId },
+        });
+        await prisma.venueType.deleteMany({ where: { id: { in: autoIds } } });
+      }
+      await prisma.venueType.update({
+        where: { id: originalId },
+        data: { deletedAt: null },
+      });
+      await redis.del(
+        ...VENUE_TYPE_CACHE_KEYS.map((k) => CACHE_KEY_PREFIX + k),
+      );
+    };
 
-      // Simulate "migrated but never seeded". Raw SQL because no endpoint can retire this row.
+    it('AC-1…AC-4 · DELETE self-heals when the tombstone is missing: ONE reserved row is created, venues move to it, and the next delete reuses it', async () => {
+      const originalId = await tombstoneId();
+      const { agent, token } = await login(ADMIN);
+      const createType = async (suffix: string): Promise<number> =>
+        (
+          (
+            await agent
+              .post(url('/venue-types'))
+              .set('x-csrf-token', token)
+              .send({ name: `${ROW_PREFIX}${suffix}` })
+              .expect(201)
+          ).body as OptionBody
+        ).id;
+      const firstId = await createType('heal-1');
+      const secondId = await createType('heal-2');
+      // One venue under each, so the re-point is observable. Written directly: `/venues` is not
+      // what this suite tests.
+      const venueUnder = async (venueTypeId: number, suffix: string) =>
+        (
+          await prisma.venue.create({
+            data: { name: `${ROW_PREFIX}${suffix}`, venueTypeId, capacity: 1 },
+            select: { id: true },
+          })
+        ).id;
+      const v1 = await venueUnder(firstId, 'heal-v1');
+      const v2 = await venueUnder(secondId, 'heal-v2');
+      const typeOf = async (venueId: string) =>
+        (
+          await prisma.venue.findUniqueOrThrow({
+            where: { id: venueId },
+            select: { venueTypeId: true },
+          })
+        ).venueTypeId;
+      const activeTombstoneNamed = () =>
+        prisma.venueType.findMany({
+          where: { name: TOMBSTONE_VENUE_TYPE_NAME, deletedAt: null },
+          select: { id: true, isSystemReserved: true },
+        });
+
+      // Simulate "migrated but never seeded". BY ID, so the restore can find exactly this row again;
+      // raw SQL because no endpoint can retire a reserved row.
       await prisma.$executeRawUnsafe(
-        `UPDATE venue_types SET "deletedAt" = NOW() WHERE "name" = $1 AND "isSystemReserved" = true`,
-        TOMBSTONE_VENUE_TYPE_NAME,
+        `UPDATE venue_types SET "deletedAt" = NOW() WHERE id = $1`,
+        originalId,
       );
       try {
+        // AC-1 — the same success status as a seeded database, not 500.
         await agent
-          .delete(url(`/venue-types/${id}`))
+          .delete(url(`/venue-types/${firstId}`))
           .set('x-csrf-token', token)
-          .expect(500);
-        // The failure is loud AND non-destructive: the target is still live.
-        const still = await prisma.venueType.findUnique({
-          where: { id },
+          .expect(204);
+
+        // AC-2 — exactly one active row carries the name, and it is the RESERVED one.
+        const healed = await activeTombstoneNamed();
+        expect(healed).toHaveLength(1);
+        expect(healed[0].isSystemReserved).toBe(true);
+        const healedId = healed[0].id;
+        expect(healedId).not.toBe(originalId);
+
+        // AC-3 — the venue moved to the new tombstone; the target is soft-deleted.
+        expect(await typeOf(v1)).toBe(healedId);
+        const target = await prisma.venueType.findUniqueOrThrow({
+          where: { id: firstId },
           select: { deletedAt: true },
         });
-        expect(still?.deletedAt).toBeNull();
+        expect(target.deletedAt).not.toBeNull();
+
+        // AC-4 — a second delete reuses that same row; no duplicate is minted.
+        await agent
+          .delete(url(`/venue-types/${secondId}`))
+          .set('x-csrf-token', token)
+          .expect(204);
+        expect(await activeTombstoneNamed()).toEqual([
+          { id: healedId, isSystemReserved: true },
+        ]);
+        expect(await typeOf(v2)).toBe(healedId);
       } finally {
-        await ensureVenueTypeTombstone();
+        await restoreOriginalTombstone(originalId, [v1, v2]);
       }
+
+      // The restore itself is part of the contract with the next run.
+      expect(await activeTombstoneNamed()).toEqual([
+        { id: originalId, isSystemReserved: true },
+      ]);
     });
   });
 
