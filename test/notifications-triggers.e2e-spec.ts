@@ -4,14 +4,17 @@ process.env.LINE_LOGIN_CHANNEL_ID =
 
 import { createHmac } from 'node:crypto';
 import type { INestApplication } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { HTTPFetchError } from '@line/bot-sdk';
 import {
   AdminNotification,
+  AdminNotificationTargetRole,
   AppAccess,
   FeedbackType,
   SystemRole,
 } from '@prisma/client';
 import type { Redis } from 'ioredis';
+import { io, type Socket } from 'socket.io-client';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import { PasswordService } from '../src/auth/password.service';
@@ -33,14 +36,22 @@ import {
 } from '../src/notifications/triggers/triggers.constants';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { ClientRealtimeGateway } from '../src/realtime/client-realtime.gateway';
+import {
+  REALTIME_ADMIN_NAMESPACE,
+  REALTIME_EVENTS,
+  type AdminNotificationEventPayload,
+} from '../src/realtime/realtime.constants';
 import { RealtimeGateway } from '../src/realtime/realtime.gateway';
 import { NOTIF_KEY_PREFIX } from '../src/redis/redis.constants';
+import { sessionCookieName } from '../src/session/session.middleware';
 import { VenuesService } from '../src/venues/venues.service';
 import {
+  clearThrottleCounters,
   createE2eApp,
   ensureE2eOptions,
   prismaOf,
   purgeE2eUsers,
+  readCookie,
   redisOf,
   waitForRedis,
 } from './e2e-app';
@@ -53,6 +64,8 @@ const LU_PREFIX = `e2e-notif-${RUN}-`;
 const ROW_PREFIX = `e2e-notif-${RUN}-`;
 const SU_PREFIX = `e2e-notif-${RUN}-su-`;
 const PASSWORD = 'E2e-correct-horse-battery-1';
+/** `NOTIF-RT-1` — a second fixture, ADMIN rather than SUPER_ADMIN, for the audience e2e. */
+const ADMIN_EMAIL = `${SU_PREFIX}admin@easybook.local`;
 
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
@@ -77,6 +90,7 @@ const httpError = (status: number) =>
 interface Session {
   agent: request.Agent;
   token: string;
+  cookie: string;
 }
 
 describe('Admin notification triggers — NOTIF-EVENTS-1 (e2e)', () => {
@@ -84,6 +98,11 @@ describe('Admin notification triggers — NOTIF-EVENTS-1 (e2e)', () => {
   let prisma: PrismaService;
   let redis: Redis;
   let server: () => App;
+  let baseUrl: string;
+  let cookieName: string;
+
+  /** `NOTIF-RT-1`: leaked sockets keep engine.io timers alive and hang `app.close()`. */
+  const openSockets: Socket[] = [];
 
   let venueTypeId = 0;
   let venueAId = '';
@@ -147,13 +166,73 @@ describe('Admin notification triggers — NOTIF-EVENTS-1 (e2e)', () => {
     const agent = request.agent(server());
     const csrf = await agent.get(url('/auth/system/csrf')).expect(200);
     const token = (csrf.body as { csrfToken: string }).csrfToken;
-    await agent
+    const res = await agent
       .post(url('/auth/system/login'))
       .set('x-csrf-token', token)
       .send({ email, password: PASSWORD })
       .expect(200);
-    return { agent, token };
+    const raw = readCookie(res, cookieName);
+    if (!raw) throw new Error(`Login as ${email} set no ${cookieName} cookie.`);
+    return { agent, token, cookie: raw.split(';')[0] };
   };
+
+  // ───────────────────────────── NOTIF-RT-1 socket helpers ─────────────────────────────
+  // Copied from `booking-realtime.e2e-spec.ts`; extracting a shared helper is E2E-SOCKET-HELPER-1.
+
+  /**
+   * `forceNew` is NOT optional: socket.io-client caches one `Manager` per origin, so a second socket
+   * would otherwise reuse the first one's engine connection — and its `Cookie` header.
+   *
+   * No `Origin` header is sent: an absent Origin passes `originGuard`, as in that suite. No
+   * `transports` override either — this suite mocks `global.fetch`, and socket.io-client's polling
+   * transport goes through XHR/`ws`, neither of which touches `fetch`.
+   */
+  const connectSocket = (cookie: string): Socket => {
+    const socket = io(`${baseUrl}${REALTIME_ADMIN_NAMESPACE}`, {
+      path: '/socket.io',
+      forceNew: true,
+      reconnection: false,
+      extraHeaders: { Cookie: cookie },
+    });
+    openSockets.push(socket);
+    return socket;
+  };
+
+  const waitForConnect = (socket: Socket, timeoutMs = 5_000): Promise<void> =>
+    new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () =>
+          reject(new Error(`Socket did not connect within ${timeoutMs}ms.`)),
+        timeoutMs,
+      );
+      socket.once('connect', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      socket.once('connect_error', (error: Error) => {
+        clearTimeout(timer);
+        reject(new Error(`Socket was rejected: ${error.message}`));
+      });
+    });
+
+  /** Event-driven, never a fixed sleep — a fixed sleep is what makes socket suites flaky. */
+  const waitUntil = async (
+    predicate: () => boolean,
+    what: string,
+    timeoutMs = 5_000,
+  ): Promise<void> => {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) {
+        throw new Error(`Timed out after ${timeoutMs}ms waiting for ${what}.`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  };
+
+  /** The ONLY fixed wait here, and only ever to prove an ABSENCE. */
+  const settle = (ms = 400): Promise<void> =>
+    new Promise((resolve) => setTimeout(resolve, ms));
 
   /** `x-line-signature` over the real webhook secret — same recipe as `system-integrations.e2e-spec.ts`. */
   const signedWebhook = (events: unknown[]) => {
@@ -254,6 +333,11 @@ describe('Admin notification triggers — NOTIF-EVENTS-1 (e2e)', () => {
     prisma = prismaOf(app);
     redis = redisOf(app);
     await waitForRedis(redis);
+    // `NOTIF-RT-1`: Socket.IO attaches to the HTTP server at init, but nothing can connect until it
+    // is LISTENING — same reason `realtime.e2e-spec.ts` / `booking-realtime.e2e-spec.ts` do this.
+    await app.listen(0, '127.0.0.1');
+    baseUrl = await app.getUrl();
+    cookieName = sessionCookieName(app.get(ConfigService));
 
     // ── 2. Refuse to run unless the seam is actually armed ──
     if (app.get(AdminNotificationTriggers).isEnabled !== true) {
@@ -314,6 +398,18 @@ describe('Admin notification triggers — NOTIF-EVENTS-1 (e2e)', () => {
         select: { id: true },
       })
     ).id;
+    // `NOTIF-RT-1` — an ADMIN fixture alongside the SUPER_ADMIN one, for the audience e2e.
+    await prisma.systemUser.create({
+      data: {
+        email: ADMIN_EMAIL,
+        firstName: 'E2E',
+        lastName: 'Admin',
+        role: SystemRole.ADMIN,
+        passwordHash,
+        mustChangePassword: false,
+        ...options,
+      },
+    });
 
     const makeAllowed = async (sub: string, first: string) => {
       const row = await prisma.lineUser.create({
@@ -355,6 +451,13 @@ describe('Admin notification triggers — NOTIF-EVENTS-1 (e2e)', () => {
   }, 60_000);
 
   afterAll(async () => {
+    // `NOTIF-RT-1`: a leaked socket keeps an engine.io session (and its timers) alive and hangs
+    // `app.close()` — drain BEFORE closing.
+    while (openSockets.length > 0) {
+      const socket = openSockets.pop();
+      socket?.removeAllListeners();
+      socket?.disconnect();
+    }
     await prisma.adminNotification.deleteMany({
       where: { id: { in: createdIds } },
     });
@@ -973,5 +1076,146 @@ describe('Admin notification triggers — NOTIF-EVENTS-1 (e2e)', () => {
       .expect(201);
     expect((res.body as { code: string }).code).toMatch(/^FDB-/);
     expect(createdIds.length).toBe(n);
+  });
+
+  // ── NOTIF-RT-1 — realtime push ───────────────────────────────────────────────────────────────
+  describe('NOTIF-RT-1 — realtime push', () => {
+    let superSocket: Socket;
+    let adminSocket: Socket;
+    let superSeen: AdminNotificationEventPayload[];
+    let adminSeen: AdminNotificationEventPayload[];
+
+    /** `create()` goes through the suite's own spy, so its id lands in `createdIds` too. */
+    const mk = (targetRole: AdminNotificationTargetRole) =>
+      app.get(NotificationsService).create({
+        category: 'SYSTEM',
+        tone: 'SLATE',
+        icon: 'clock',
+        title: `${ROW_PREFIX}rt-${targetRole}`,
+        body: 'e2e realtime push',
+        targetRole,
+      });
+
+    /** X-2: triggers are ON in this suite, so assertions key on THIS row's id, never a total count. */
+    const seen = (
+      arr: AdminNotificationEventPayload[],
+      id: string,
+    ): AdminNotificationEventPayload[] => arr.filter((p) => p.id === id);
+
+    beforeAll(async () => {
+      await clearThrottleCounters(redis);
+
+      const superS = await login(`${SU_PREFIX}super@easybook.local`);
+      const adminS = await login(ADMIN_EMAIL);
+
+      superSocket = connectSocket(superS.cookie);
+      adminSocket = connectSocket(adminS.cookie);
+      await Promise.all([
+        waitForConnect(superSocket),
+        waitForConnect(adminSocket),
+      ]);
+
+      superSeen = [];
+      adminSeen = [];
+      // Attached BEFORE any create() call below.
+      superSocket.on(
+        REALTIME_EVENTS.adminNotificationCreated,
+        (p: AdminNotificationEventPayload) => superSeen.push(p),
+      );
+      adminSocket.on(
+        REALTIME_EVENTS.adminNotificationCreated,
+        (p: AdminNotificationEventPayload) => adminSeen.push(p),
+      );
+    });
+
+    afterAll(() => {
+      while (openSockets.length > 0) {
+        const socket = openSockets.pop();
+        socket?.removeAllListeners();
+        socket?.disconnect();
+      }
+    });
+
+    it('AC-2: a SUPER_ADMIN event is never transmitted to an ADMIN socket (with a positive control)', async () => {
+      const superRow = await mk(AdminNotificationTargetRole.SUPER_ADMIN);
+      // Created AFTER, on the same sockets — its arrival on the admin socket proves the ABSENCE of
+      // the earlier SUPER_ADMIN event is meaningful: Socket.IO delivers frames in order on one
+      // connection, so the later control event could not have overtaken an earlier one.
+      const controlRow = await mk(AdminNotificationTargetRole.ADMIN);
+
+      await waitUntil(
+        () =>
+          seen(superSeen, superRow.id).length === 1 &&
+          seen(adminSeen, controlRow.id).length === 1,
+        'the SUPER_ADMIN pulse on the super socket and the control pulse on the admin socket',
+      );
+      await settle(600);
+
+      expect(seen(superSeen, superRow.id)).toHaveLength(1);
+      expect(seen(adminSeen, superRow.id)).toHaveLength(0);
+      expect(
+        adminSeen.every(
+          (p) => p.targetRole !== AdminNotificationTargetRole.SUPER_ADMIN,
+        ),
+      ).toBe(true);
+    });
+
+    it('ALL and ADMIN reach both roles', async () => {
+      for (const targetRole of [
+        AdminNotificationTargetRole.ALL,
+        AdminNotificationTargetRole.ADMIN,
+      ]) {
+        const row = await mk(targetRole);
+        await waitUntil(
+          () =>
+            seen(superSeen, row.id).length === 1 &&
+            seen(adminSeen, row.id).length === 1,
+          `both sockets receiving a ${targetRole} pulse`,
+        );
+        await settle(400);
+        expect(seen(superSeen, row.id)).toHaveLength(1);
+        expect(seen(adminSeen, row.id)).toHaveLength(1);
+      }
+    });
+
+    it('AC-1: the payload has exactly the D-2/X-1 keys, and matches the created row', async () => {
+      const row = await mk(AdminNotificationTargetRole.SUPER_ADMIN);
+      await waitUntil(
+        () => seen(superSeen, row.id).length === 1,
+        'the SUPER_ADMIN pulse',
+      );
+      const payload = seen(superSeen, row.id)[0];
+
+      expect(Object.keys(payload).sort()).toEqual([
+        'createdAt',
+        'id',
+        'targetRole',
+      ]);
+      expect(payload.id).toBe(row.id);
+      expect(payload.targetRole).toBe('SUPER_ADMIN');
+      expect(payload.createdAt).toBe(row.createdAt.toISOString());
+      const json = JSON.stringify(payload);
+      expect(json).not.toContain(row.title);
+      expect(json).not.toContain(row.body);
+    });
+
+    it('AC-1: a failed create() emits nothing', async () => {
+      const n = createdIds.length;
+      await expect(
+        app.get(NotificationsService).create({
+          category: 'SYSTEM',
+          tone: 'SLATE',
+          icon: 'clock',
+          title: '',
+          body: 'e2e realtime push',
+          targetRole: AdminNotificationTargetRole.ALL,
+        }),
+      ).rejects.toThrow('AdminNotification.create');
+      await settle(400);
+
+      expect(createdIds.length).toBe(n);
+      // No pulse exists for a row that was never created.
+      expect(superSeen.every((p) => createdIds.includes(p.id))).toBe(true);
+    });
   });
 });

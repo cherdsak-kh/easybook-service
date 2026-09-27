@@ -217,6 +217,7 @@ describe('the authorize step (design §3.4 outcome table)', () => {
       expect(socketData(socket)).toMatchObject({
         systemUserId: 'user-1',
         sid: 'sid-42',
+        role,
       });
       expect(socketData(socket).connectedAt).toEqual(expect.any(Number));
     },

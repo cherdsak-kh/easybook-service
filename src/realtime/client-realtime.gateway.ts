@@ -173,8 +173,9 @@ export const createClientAuthenticateMiddleware =
  *    session middleware chain. A LINE end-user has no session and no cookie, so this namespace
  *    verifies a **LINE ID token** on the handshake — through the SAME `verifyLineIdToken` the REST
  *    guard uses, never a second copy of the `aud`/`iss`/`exp` checks.
- * 2. **Rooms are mandatory here.** On `/admin`, namespace membership *is* the `SUPER_ADMIN|ADMIN`
- *    boundary, so every socket may see everything and there are no rooms. Membership here means only
+ * 2. **Rooms are mandatory here.** On `/admin`, namespace membership is the boundary for every event
+ *    but one (a SUPER_ADMIN notification pulse, which uses a single role room, `NOTIF-RT-1`).
+ *    Membership here means only
  *    "an `ALLOWED` LINE user" — nearly everybody — so `D-C13` is enforced by targeting
  *    `user:<cuid>` and `venue:<id>` instead. A namespace-wide `emit` on this gateway would be a
  *    privacy bug; there is deliberately no method that performs one.

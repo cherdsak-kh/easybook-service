@@ -8,6 +8,7 @@ import {
   SystemRole,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 import type { ListAdminNotificationsQueryDto } from './dto/notification-query.dto';
 import {
   NOTIFICATION_DISMISS_TARGET,
@@ -26,6 +27,7 @@ import {
   notificationListWhere,
   notificationSearchTerm,
   toAdminNotificationDto,
+  toAdminNotificationEventPayload,
   toUnreadCount,
   type CreateAdminNotificationInput,
 } from './notifications.service';
@@ -419,6 +421,7 @@ describe('NotificationsService', () => {
     fn(tx),
   );
   const $executeRaw = jest.fn();
+  const realtime = { emitAdminNotificationCreated: jest.fn() };
 
   let logSpy: jest.SpyInstance;
   let debugSpy: jest.SpyInstance;
@@ -439,6 +442,7 @@ describe('NotificationsService', () => {
             $executeRaw,
           },
         },
+        { provide: RealtimeGateway, useValue: realtime },
       ],
     }).compile();
     service = module.get(NotificationsService);
@@ -753,6 +757,114 @@ describe('NotificationsService', () => {
         service.create(input({ actionUrl: '//evil', actionLabel: 'x' })),
       ).rejects.toThrow(/actionUrl/);
       expect(adminNotification.create).not.toHaveBeenCalled();
+    });
+
+    // ── NOTIF-RT-1 ──────────────────────────────────────────────────────────────────────────────
+
+    it('pushes exactly the three D-2/X-1 keys, once, after the row is committed', async () => {
+      const created = { ...row(), receipts: undefined };
+      adminNotification.create.mockResolvedValue(created);
+
+      const res = await service.create(input());
+
+      expect(realtime.emitAdminNotificationCreated).toHaveBeenCalledTimes(1);
+      const payload = callArg<{
+        id: string;
+        targetRole: string;
+        createdAt: string;
+      }>(realtime.emitAdminNotificationCreated);
+      expect(Object.keys(payload).sort()).toEqual([
+        'createdAt',
+        'id',
+        'targetRole',
+      ]);
+      expect(payload).toEqual({
+        id: created.id,
+        targetRole: created.targetRole,
+        createdAt: created.createdAt.toISOString(),
+      });
+      expect(res).toBe(created);
+
+      const createOrder = adminNotification.create.mock.invocationCallOrder[0];
+      const emitOrder =
+        realtime.emitAdminNotificationCreated.mock.invocationCallOrder[0];
+      expect(emitOrder).toBeGreaterThan(createOrder);
+    });
+
+    it('a validation failure emits nothing and rejects exactly as before', async () => {
+      await expect(
+        service.create(input({ actionUrl: '//evil', actionLabel: 'x' })),
+      ).rejects.toThrow(/actionUrl/);
+      expect(realtime.emitAdminNotificationCreated).not.toHaveBeenCalled();
+    });
+
+    it('a Prisma failure emits nothing and rejects with the same error', async () => {
+      const dbError = new Error('db');
+      adminNotification.create.mockRejectedValue(dbError);
+      await expect(service.create(input())).rejects.toBe(dbError);
+      expect(realtime.emitAdminNotificationCreated).not.toHaveBeenCalled();
+    });
+
+    it('a throwing gateway still lets create() resolve with the row, and warns with the id', async () => {
+      const created = { ...row(), receipts: undefined };
+      adminNotification.create.mockResolvedValue(created);
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      realtime.emitAdminNotificationCreated.mockImplementationOnce(() => {
+        throw new Error('transport down');
+      });
+
+      const res = await service.create(input());
+
+      expect(res).toBe(created);
+      expect(String(warn.mock.calls[0][0])).toContain(`id=${created.id}`);
+
+      warn.mockRestore();
+    });
+
+    it('a missing gateway still lets create() resolve with the row', async () => {
+      const created = { ...row(), receipts: undefined };
+      adminNotification.create.mockResolvedValue(created);
+      const noGateway = new NotificationsService(
+        { adminNotification } as unknown as PrismaService,
+        undefined as unknown as RealtimeGateway,
+      );
+
+      await expect(noGateway.create(input())).resolves.toBe(created);
+    });
+
+    it('the existing create() log line is unchanged', async () => {
+      const created = { ...row(), receipts: undefined };
+      adminNotification.create.mockResolvedValue(created);
+
+      await service.create(input());
+
+      const logged = (logSpy.mock.calls as unknown[][])
+        .map((c) => String(c[0]))
+        .join('\n');
+      expect(logged).toMatch(
+        new RegExp(
+          `Notification created id=${created.id} category=${created.category} targetRole=${created.targetRole}`,
+        ),
+      );
+    });
+  });
+
+  describe('toAdminNotificationEventPayload (NOTIF-RT-1)', () => {
+    it('is pure and returns exactly the three keys, dropping everything else on the row', () => {
+      const full = row();
+      const payload = toAdminNotificationEventPayload(full);
+      expect(Object.keys(payload).sort()).toEqual([
+        'createdAt',
+        'id',
+        'targetRole',
+      ]);
+      expect(payload).toEqual({
+        id: full.id,
+        targetRole: full.targetRole,
+        createdAt: full.createdAt.toISOString(),
+      });
     });
   });
 });

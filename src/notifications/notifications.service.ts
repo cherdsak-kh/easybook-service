@@ -13,6 +13,8 @@ import {
 } from '@prisma/client';
 import { sanitizeThaiText } from '../common/sanitize-thai.util';
 import { PrismaService } from '../prisma/prisma.service';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
+import type { AdminNotificationEventPayload } from '../realtime/realtime.constants';
 import type { ListAdminNotificationsQueryDto } from './dto/notification-query.dto';
 import type {
   AdminNotificationDto,
@@ -305,6 +307,20 @@ export function normaliseCreateInput(
 }
 
 /**
+ * `NOTIF-RT-1` — the wire pulse for a committed row. Explicit keys, NEVER a spread of `row` — a new
+ * column must not reach the socket.
+ */
+export function toAdminNotificationEventPayload(
+  row: Pick<AdminNotification, 'id' | 'targetRole' | 'createdAt'>,
+): AdminNotificationEventPayload {
+  return {
+    id: row.id,
+    targetRole: row.targetRole,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+/**
  * `NOTIF-API-1` — the caller-scoped admin notification feed (design §6).
  *
  * ── THE TWO RULES EVERY METHOD FOLLOWS ──
@@ -322,7 +338,10 @@ export function normaliseCreateInput(
 export class NotificationsService {
   private readonly logger = new Logger(NotificationsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly realtime: RealtimeGateway,
+  ) {}
 
   /** E-1 — one page, newest first (`createdAt DESC, id DESC`, a total order), and the FILTERED total. */
   async list(
@@ -532,17 +551,37 @@ export class NotificationsService {
   /**
    * The Phase 3 entry point (D-4) — there is NO public creation route. Validates in the service
    * (required fields, enums, icon list, `/backend/` deep link, CTA pairing) and returns the created
-   * row. Creates no receipt rows: "no row = unread" keeps this O(1) with no fan-out (D-1).
+   * row. Creates no receipt rows: "no row = unread" keeps this O(1) with no fan-out (D-1). Then
+   * pushes `adminNotification.created` (`NOTIF-RT-1`, fail-soft).
    */
   async create(
     input: CreateAdminNotificationInput,
   ): Promise<AdminNotification> {
-    const data = normaliseCreateInput(input);
-    const row = await this.prisma.adminNotification.create({ data });
+    const data = normaliseCreateInput(input); // throws ⇒ no emit, same rejection
+    const row = await this.prisma.adminNotification.create({ data }); // rejects ⇒ no emit, same rejection
     this.logger.log(
       `Notification created id=${row.id} category=${row.category} targetRole=${row.targetRole}`,
     );
+    this.announce(row);
     return row;
+  }
+
+  /**
+   * `NOTIF-RT-1` — post-commit, fail-soft (belt and braces over the gateway's own try/catch). A
+   * missing gateway is a `TypeError` caught here.
+   */
+  private announce(row: AdminNotification): void {
+    try {
+      this.realtime.emitAdminNotificationCreated(
+        toAdminNotificationEventPayload(row),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Notification push failed (row already committed). id=${row.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   /**

@@ -4,6 +4,7 @@ import {
   SCHEDULING_ENABLED,
   schedulingEnabled,
 } from '../common/scheduling.constants';
+import { RealtimeModule } from '../realtime/realtime.module';
 import { NotificationsController } from './notifications.controller';
 import { NotificationsService } from './notifications.service';
 import { AdminNotificationTriggers } from './triggers/admin-notification-triggers.service';
@@ -15,12 +16,10 @@ import { VersionAnnouncer } from './triggers/version-announcer';
  * `การแจ้งเตือน` — `NOTIF-API-1` (phase 1: the `AdminNotification` feed and each operator's private
  * read/dismiss state) PLUS `NOTIF-EVENTS-1` (phase 3: the 15 operational triggers).
  *
- * ── STILL `imports: []` ──
- * `AdminNotificationTriggers` depends only on `PrismaService`/`RedisService` (both `@Global()`),
- * `NotificationsService` (this module's own provider) and Nest core (`Reflector`,
- * `HttpAdapterHost`). That keeps this module a SINK in the DI graph — every edge `LineModule`,
- * `BookingsModule`, `FeedbackModule` and `VenuesModule` add by importing this module points INTO the
- * sink, so none of them can close a cycle (design §2.2).
+ * ── ONE IMPORT: `RealtimeModule` (`NOTIF-RT-1`) ──
+ * `create()` pushes a pulse through `RealtimeGateway`. `RealtimeModule` imports nothing and is itself
+ * a sink, so this module stays acyclic: every edge into it (`LineModule`, `BookingsModule`,
+ * `FeedbackModule`, `VenuesModule`) still ends in a sink.
  *
  * ── `APP_INTERCEPTOR` LIVES HERE, NOT IN `configureApp` (C5, R-3) ──
  * `ServerErrorNotificationInterceptor` needs DI (`AdminNotificationTriggers`, `Reflector`), so it is
@@ -39,6 +38,7 @@ import { VersionAnnouncer } from './triggers/version-announcer';
  * legal way a Phase 3 domain event reaches the feed (plan B-1).
  */
 @Module({
+  imports: [RealtimeModule],
   controllers: [NotificationsController],
   providers: [
     NotificationsService,

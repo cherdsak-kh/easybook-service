@@ -18,11 +18,16 @@ export type SocketMiddleware = (
   next: (err?: Error) => void,
 ) => void;
 
-/** What the handshake pins onto the socket for the revalidation sweep to re-check later. */
+/**
+ * What the handshake pins onto the socket for the revalidation sweep to re-check later, and — for
+ * `role` — for the `ADMIN_SUPER_ROOM` room join (`NOTIF-RT-1`).
+ */
 export interface RealtimeSocketData {
   systemUserId: string;
   sid: string;
   connectedAt: number;
+  /** `SystemRole` at handshake; drives `ADMIN_SUPER_ROOM` membership. Re-synced from the DB by every sweep. */
+  role: SystemRole;
 }
 
 /** A handshake request after `cookieParser` + `express-session` have run over it. */
@@ -141,6 +146,7 @@ export const createAuthenticateMiddleware =
           systemUserId: result.user.id,
           sid: req.sessionID ?? '',
           connectedAt: Date.now(),
+          role: result.user.role,
         };
         Object.assign(socket.data as object, data);
         next();

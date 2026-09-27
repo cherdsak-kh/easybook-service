@@ -64,9 +64,12 @@ nothing else. Only the names in `REALTIME_NAMESPACE_ALLOWLIST` are served — in
 unconditionally-created default `/`, which is refused there; adding a `@WebSocketGateway` is *not*
 enough to make a namespace reachable, and that trip-wire is deliberate.
 - **`/admin`** (`RealtimeGateway`) — server→client only (**zero `@SubscribeMessage`**):
-  `lineUser.created` / `.updated` / `.deleted`, `bookingRequest.created` / `.updated`, plus
-  `session.closed`. Its handshake reuses the express session (`SessionIoAdapter`, installed in
-  `configureApp`) and namespace membership *is* the `SUPER_ADMIN|ADMIN` boundary — there are no rooms.
+  `lineUser.created` / `.updated` / `.deleted`, `bookingRequest.created` / `.updated`,
+  `adminNotification.created` (`NOTIF-RT-1`), plus `session.closed`. Its handshake reuses the express
+  session (`SessionIoAdapter`, installed in `configureApp`) and namespace membership *is* the
+  `SUPER_ADMIN|ADMIN` boundary for every event except `adminNotification.created` targeted at
+  `SUPER_ADMIN`: that one goes to one role room, `role:SUPER_ADMIN` (`ADMIN_SUPER_ROOM`), joined in
+  `handleConnection` and re-synced by the sweep — no other room exists.
 - **`/client`** (`ClientRealtimeGateway`, `CLIENT-REALTIME-1`) — the LIFF end-user side, which inverts
   every one of those choices on purpose. A LINE end-user has no session and no cookie, so the
   handshake verifies a **LINE ID token** through the *same* `verifyLineIdToken` the REST guard uses
