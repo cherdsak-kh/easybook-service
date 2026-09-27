@@ -3,6 +3,7 @@ import type { Redis } from 'ioredis';
 import {
   CACHE_KEY_PREFIX,
   CACHE_TTL_SECONDS,
+  NOTIF_KEY_PREFIX,
   REDIS_CLIENT,
 } from './redis.constants';
 
@@ -32,6 +33,14 @@ import {
 @Injectable()
 export class RedisService implements OnModuleDestroy {
   private readonly logger = new Logger(RedisService.name);
+
+  /**
+   * The in-process fallback for {@link claimOnce} when Redis is down (`NOTIF-EVENTS-1` §2.6, D-9).
+   * Bounded in practice: at most 3 C1 kinds and C5 signatures are bounded by routes × error codes.
+   * Per-process only — not written back to Redis on recovery. Accepted cost: at most one duplicate
+   * notification per window around a Redis outage.
+   */
+  private readonly localClaims = new Map<string, number>();
 
   constructor(@Inject(REDIS_CLIENT) private readonly client: Redis) {}
 
@@ -143,5 +152,47 @@ export class RedisService implements OnModuleDestroy {
         `Cache invalidation failed. keys=${keys.join(',')} reason=${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  /**
+   * `SET key 1 NX EX ttl` under `eb:notif:` — a throttle CLAIM, not a cache read (`NOTIF-EVENTS-1`
+   * §2.6). `true` means the caller owns this window and should act; `false` means someone already
+   * claimed it. NEVER throws.
+   *
+   * 🔴 THE CLAIM IS TAKEN BEFORE `create()` AND IS NEVER RELEASED (D-9) — a failed `create()` still
+   * consumes the window. Releasing it on failure would turn every 500 into a slow insert attempt
+   * with the DB down, which is exactly the storm this exists to prevent.
+   */
+  async claimOnce(key: string, ttlSeconds: number): Promise<boolean> {
+    const ttl = Math.max(1, Math.floor(ttlSeconds));
+    if (this.client.status === 'ready') {
+      try {
+        const result = await this.client.set(
+          NOTIF_KEY_PREFIX + key,
+          '1',
+          'EX',
+          ttl,
+          'NX',
+        );
+        return result === 'OK';
+      } catch (error) {
+        this.logger.debug(
+          `Notification claim fell back to memory. key=${key} reason=${error instanceof Error ? error.message : String(error)}`,
+        );
+        return this.claimLocally(key, ttl);
+      }
+    }
+    return this.claimLocally(key, ttl);
+  }
+
+  /** The in-process fallback half of {@link claimOnce}. Prunes expired entries on every call. */
+  private claimLocally(key: string, ttlSeconds: number): boolean {
+    const now = Date.now();
+    for (const [k, expiresAt] of this.localClaims) {
+      if (expiresAt <= now) this.localClaims.delete(k);
+    }
+    if ((this.localClaims.get(key) ?? 0) > now) return false;
+    this.localClaims.set(key, now + ttlSeconds * 1000);
+    return true;
   }
 }

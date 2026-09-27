@@ -63,3 +63,10 @@ export const NOTIFICATION_ACTION_LABEL_MAX = 60;
 
 /** The only prefix a deep link may carry (D-7, open-redirect guard). */
 export const NOTIFICATION_ACTION_URL_PREFIX = '/backend/';
+
+/**
+ * ADV-1 (`NOTIF-EVENTS-1` design §2.9, D-7) — dot segments, encoded separators and malformed
+ * percent-escapes in `actionUrl`. The URL itself is never echoed in the message.
+ */
+export const ACTION_URL_SEGMENT =
+  'actionUrl must not contain dot segments, encoded separators or malformed escapes';

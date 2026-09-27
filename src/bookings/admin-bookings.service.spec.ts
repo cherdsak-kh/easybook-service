@@ -5,6 +5,11 @@ import {
 } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { AppAccess, BookingStatus, SystemRole } from '@prisma/client';
+import { AdminNotificationTriggers } from '../notifications/triggers/admin-notification-triggers.service';
+import {
+  disabledTriggers,
+  rejectingTriggers,
+} from '../notifications/triggers/triggers.test-kit';
 import { PrismaService } from '../prisma/prisma.service';
 import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
@@ -201,6 +206,7 @@ describe('AdminBookingsService', () => {
         { provide: RealtimeGateway, useValue: realtime },
         { provide: ClientRealtimeGateway, useValue: clientRealtime },
         { provide: BookingNotifier, useValue: notifier },
+        { provide: AdminNotificationTriggers, useValue: disabledTriggers() },
       ],
     }).compile();
     service = module.get(AdminBookingsService);
@@ -551,6 +557,44 @@ describe('AdminBookingsService', () => {
       const result = await service.approve(BOOKING_ID, ACTOR);
       expect(bookingRequest.updateMany).toHaveBeenCalledTimes(1);
       expect(result.autoRejected).toEqual([]);
+    });
+
+    it('B4 AC-2 — still resolves and the write still committed when the trigger rejects', async () => {
+      pendingBooking();
+      bookingRequest.findMany.mockResolvedValueOnce([
+        {
+          id: LOSER_ID,
+          code: 'BR-25690903-002',
+          firstStartAt: at(DAY),
+          lastEndAt: at(DAY + HOUR),
+        },
+      ]);
+      const prismaDouble = {
+        bookingRequest,
+        bookingSlot,
+        venue,
+        lineUser,
+        department,
+        $transaction,
+        $executeRaw,
+      } as unknown as PrismaService;
+      const { triggers, create, warn } = rejectingTriggers(prismaDouble);
+      const svc = new AdminBookingsService(
+        prismaDouble,
+        realtime as unknown as RealtimeGateway,
+        clientRealtime as unknown as ClientRealtimeGateway,
+        notifier as unknown as BookingNotifier,
+        triggers,
+      );
+
+      const result = await svc.approve(BOOKING_ID, ACTOR);
+
+      expect(result.autoRejected).toEqual([
+        { id: LOSER_ID, code: 'BR-25690903-002' },
+      ]);
+      expect(bookingRequest.updateMany).toHaveBeenCalledTimes(2);
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
     });
 
     it('404s an unknown id, without taking a lock', async () => {
@@ -1003,6 +1047,46 @@ describe('AdminBookingsService', () => {
       expect(bookingRequest.findMany.mock.invocationCallOrder[0]).toBeLessThan(
         bookingRequest.create.mock.invocationCallOrder[0],
       );
+    });
+
+    it('B5+B4 AC-2 — still resolves and the write still committed when the trigger rejects', async () => {
+      happyPath();
+      bookingRequest.findMany.mockResolvedValueOnce([
+        {
+          id: LOSER_ID,
+          code: 'BR-25690903-009',
+          firstStartAt: at(DAY),
+          lastEndAt: at(DAY + HOUR),
+        },
+      ]);
+      bookingRequest.updateMany.mockResolvedValue({ count: 1 });
+      const prismaDouble = {
+        bookingRequest,
+        bookingSlot,
+        venue,
+        lineUser,
+        department,
+        $transaction,
+        $executeRaw,
+      } as unknown as PrismaService;
+      const { triggers, create, warn } = rejectingTriggers(prismaDouble);
+      const svc = new AdminBookingsService(
+        prismaDouble,
+        realtime as unknown as RealtimeGateway,
+        clientRealtime as unknown as ClientRealtimeGateway,
+        notifier as unknown as BookingNotifier,
+        triggers,
+      );
+
+      const result = await svc.createDirect(dto(), ACTOR);
+
+      expect(result.autoRejected).toEqual([
+        { id: LOSER_ID, code: 'BR-25690903-009' },
+      ]);
+      expect(bookingRequest.create).toHaveBeenCalled();
+      // B5 then B4 — two trigger calls, one warn each (both fail-safe, neither throws).
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledTimes(2);
     });
 
     it('409s SLOT_TAKEN on an APPROVED clash without creating anything', async () => {

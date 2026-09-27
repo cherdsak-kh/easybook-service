@@ -7,6 +7,11 @@ import {
 } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { AppAccess, BookingStatus, Prisma } from '@prisma/client';
+import { AdminNotificationTriggers } from '../notifications/triggers/admin-notification-triggers.service';
+import {
+  disabledTriggers,
+  rejectingTriggers,
+} from '../notifications/triggers/triggers.test-kit';
 import { PrismaService } from '../prisma/prisma.service';
 import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import { CLIENT_REALTIME_EVENTS } from '../realtime/realtime.constants';
@@ -194,6 +199,8 @@ describe('BookingsService', () => {
     create: jest.fn<any, [CreateArgs]>(),
     findMany: jest.fn<any, [BookingListArgs]>(),
     findFirst: jest.fn<any, [BookingFindArgs]>(),
+    // Read by `AdminNotificationTriggers` (B1/B2), not by `BookingsService` itself.
+    findUnique: jest.fn<any, [any]>(),
     updateMany: jest.fn<any, [BookingUpdateManyArgs]>(),
     update: jest.fn<any, [BookingUpdateArgs]>(),
   };
@@ -291,6 +298,7 @@ describe('BookingsService', () => {
         { provide: RealtimeGateway, useValue: realtime },
         { provide: ClientRealtimeGateway, useValue: clientRealtime },
         { provide: BookingNotifier, useValue: notifier },
+        { provide: AdminNotificationTriggers, useValue: disabledTriggers() },
       ],
     }).compile();
     service = module.get(BookingsService);
@@ -341,6 +349,44 @@ describe('BookingsService', () => {
       expect(result.venueName).toBe('ห้องประชุมใหญ่');
       expect(result.code).toMatch(/^BR-\d{8}-\d{3,}$/);
       expect(result.slots).toHaveLength(3);
+    });
+
+    it('B1 AC-2 — still resolves and the write still committed when the trigger rejects', async () => {
+      allowAndOpen();
+      echoCreate();
+      bookingRequest.findUnique.mockResolvedValue({
+        code: CODE,
+        venue: { name: 'ห้องประชุมใหญ่' },
+        lineUser: { registration: null },
+        slots: [],
+      });
+      const prismaDouble = {
+        lineUser,
+        venue,
+        bookingSlot,
+        bookingRequest,
+        appSetting,
+        venueType,
+        $transaction,
+      } as unknown as PrismaService;
+      const { triggers, create, warn } = rejectingTriggers(prismaDouble);
+      const svc = new BookingsService(
+        prismaDouble,
+        realtime as unknown as RealtimeGateway,
+        clientRealtime as unknown as ClientRealtimeGateway,
+        notifier as unknown as BookingNotifier,
+        triggers,
+      );
+
+      const result = await svc.createFromLine(
+        SUB,
+        dto([{ startAt: iso(DAY), endAt: iso(DAY + 2 * HOUR) }]),
+      );
+
+      expect(result.status).toBe(BookingStatus.PENDING);
+      expect(bookingRequest.create).toHaveBeenCalled();
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
     });
 
     // ── ADMIN-REALTIME-BOOKINGS-1 — the one emit on the LIFF side ──────────────────
@@ -1556,6 +1602,43 @@ describe('BookingsService', () => {
       expect(result.status).toBe(BookingStatus.CANCELLED);
     });
 
+    it('B2 AC-2 — still resolves and the write still committed when the trigger rejects', async () => {
+      answerFindFirst(
+        { id: BOOKING_ID, status: BookingStatus.PENDING },
+        detailRow({ status: BookingStatus.CANCELLED }),
+      );
+      bookingRequest.findUnique.mockResolvedValue({
+        code: CODE,
+        venue: { name: 'ห้องประชุมใหญ่' },
+        lineUser: { registration: null },
+        slots: [],
+      });
+      const prismaDouble = {
+        lineUser,
+        venue,
+        bookingSlot,
+        bookingRequest,
+        appSetting,
+        venueType,
+        $transaction,
+      } as unknown as PrismaService;
+      const { triggers, create, warn } = rejectingTriggers(prismaDouble);
+      const svc = new BookingsService(
+        prismaDouble,
+        realtime as unknown as RealtimeGateway,
+        clientRealtime as unknown as ClientRealtimeGateway,
+        notifier as unknown as BookingNotifier,
+        triggers,
+      );
+
+      const result = await svc.cancelPendingBooking(SUB, CODE);
+
+      expect(result.status).toBe(BookingStatus.CANCELLED);
+      expect(bookingRequest.updateMany).toHaveBeenCalled();
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
     it('makes the state check a CONDITIONAL update, not just the preceding if', async () => {
       answerFindFirst({ id: BOOKING_ID, status: BookingStatus.PENDING });
 
@@ -1808,6 +1891,49 @@ describe('BookingsService', () => {
       expect(data.status).toBeUndefined();
       expect(data.firstStartAt).toEqual(inDays(1));
       expect(data.lastEndAt).toEqual(inDays(5.1));
+    });
+
+    it('B2 AC-2 — still resolves and the write still committed when the trigger rejects', async () => {
+      approvedWithSlot(3 * DAY);
+      bookingSlot.findMany.mockResolvedValue([
+        { startAt: inDays(5), endAt: inDays(5.1) },
+        { startAt: inDays(1), endAt: inDays(1.2) },
+      ]);
+      bookingRequest.findUnique.mockResolvedValue({
+        code: CODE,
+        venue: { name: 'ห้องประชุมใหญ่' },
+        lineUser: { registration: null },
+        slots: [],
+      });
+      const prismaDouble = {
+        lineUser,
+        venue,
+        bookingSlot,
+        bookingRequest,
+        appSetting,
+        venueType,
+        $transaction,
+      } as unknown as PrismaService;
+      const { triggers, create, warn } = rejectingTriggers(prismaDouble);
+      const svc = new BookingsService(
+        prismaDouble,
+        realtime as unknown as RealtimeGateway,
+        clientRealtime as unknown as ClientRealtimeGateway,
+        notifier as unknown as BookingNotifier,
+        triggers,
+      );
+
+      const result = await svc.cancelApprovedSlot(SUB, BOOKING_ID, SLOT_ID);
+
+      expect(result.status).toBeDefined();
+      const slotWrite = bookingSlot.updateMany.mock.calls[0][0];
+      expect(slotWrite.where).toEqual({ id: SLOT_ID, isCancelled: false });
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      // The trigger fires AFTER the transaction has committed, never inside it.
+      expect(bookingSlot.updateMany.mock.invocationCallOrder[0]).toBeLessThan(
+        create.mock.invocationCallOrder[0],
+      );
     });
 
     it('flips the whole request to CANCELLED when the last live slot goes', async () => {

@@ -23,3 +23,12 @@ export const CACHE_KEY_PREFIX = 'eb:cache:';
  * the system will ever come along and fix.
  */
 export const CACHE_TTL_SECONDS = 300;
+
+/**
+ * Notification throttle markers (C1/C5, `NOTIF-EVENTS-1` design §2.6). A DISJOINT keyspace from
+ * `eb:cache:` on purpose: the cache's "300s, no exceptions, DEL-reachable, reconstructible from PG"
+ * rule describes a read-through cache, not a "did we already alert on this in the last N minutes"
+ * throttle marker — the two have different TTLs (3600s / 900s) and are never invalidated by a write.
+ * Flagged for PO in the plan (Q-8); the default is to keep it disjoint rather than reuse `eb:cache:`.
+ */
+export const NOTIF_KEY_PREFIX = 'eb:notif:';

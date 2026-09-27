@@ -8,6 +8,7 @@ import {
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { AppAccess, BookingStatus, Prisma } from '@prisma/client';
+import { AdminNotificationTriggers } from '../notifications/triggers/admin-notification-triggers.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
@@ -254,6 +255,7 @@ export class BookingsService {
     private readonly realtime: RealtimeGateway,
     private readonly clientRealtime: ClientRealtimeGateway,
     private readonly notifier: BookingNotifier,
+    private readonly triggers: AdminNotificationTriggers,
   ) {}
 
   /**
@@ -303,6 +305,8 @@ export class BookingsService {
     await this.notifier.notifyDecisions([
       { bookingId: row.id, status: 'PENDING' },
     ]);
+    // B1 (`NOTIF-EVENTS-1`) — after `notifyDecisions`, fail-safe, never rejects.
+    await this.triggers.bookingRequested({ bookingId: row.id });
     return toRequestDto(row, venue.name);
   }
 
@@ -542,6 +546,8 @@ export class BookingsService {
     await this.notifier.notifyDecisions([
       { bookingId: id, status: 'CANCELLED_BY_USER' },
     ]);
+    // B2 (`NOTIF-EVENTS-1`) — the whole-request cancel. After the commit, fail-safe, never rejects.
+    await this.triggers.bookingCancelledByRequester({ bookingId: id });
     return this.readDetail({ id });
   }
 
@@ -658,6 +664,8 @@ export class BookingsService {
     await this.notifier.notifyDecisions([
       { bookingId: id, status: 'CANCELLED_BY_USER', slotIds: [slotId] },
     ]);
+    // B2 (`NOTIF-EVENTS-1`) — the slot-cancel variant names the one freed slot. Fail-safe, never rejects.
+    await this.triggers.bookingCancelledByRequester({ bookingId: id, slotId });
     return this.readDetail({ id });
   }
 

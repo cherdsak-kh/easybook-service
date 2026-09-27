@@ -1,6 +1,7 @@
 import { HTTPFetchError, messagingApi } from '@line/bot-sdk';
 import { Logger } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
+import { disabledTriggers } from '../notifications/triggers/triggers.test-kit';
 import { LineCallError } from './line-call-error';
 import { LineService } from './line.service';
 
@@ -38,6 +39,7 @@ describe('LineService — getMessageQuota / useAccessToken', () => {
     service = new LineService(
       config,
       fake as unknown as messagingApi.MessagingApiClient,
+      disabledTriggers(),
     );
   });
 
@@ -80,7 +82,7 @@ describe('LineService — getMessageQuota / useAccessToken', () => {
   });
 
   it('no client → NOT_CONFIGURED without any call', async () => {
-    const bare = new LineService(config, null);
+    const bare = new LineService(config, null, disabledTriggers());
     await expect(bare.getMessageQuota()).rejects.toEqual(
       new LineCallError('NOT_CONFIGURED', null),
     );

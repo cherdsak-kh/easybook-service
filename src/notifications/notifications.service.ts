@@ -23,6 +23,7 @@ import type {
 } from './dto/notification-response.dto';
 import type { DismissAdminNotificationsDto } from './dto/notification-write.dto';
 import {
+  ACTION_URL_SEGMENT,
   ADMIN_NOTIFICATION_ICONS,
   NOTIFICATION_ACTION_LABEL_MAX,
   NOTIFICATION_ACTION_URL_MAX,
@@ -193,6 +194,35 @@ export interface CreateAdminNotificationInput {
 // eslint-disable-next-line no-control-regex
 const URL_FORBIDDEN_CHARS = /[\s\u0000-\u001f\u007f]/;
 
+/**
+ * ADV-1 hardening (design §2.9, D-7): decode each path segment of `actionUrl` to a fixed point (at
+ * most 3 passes — defeats `%252e%252e` double-encoding) and refuse `.`, `..`, any `/` or `\` a
+ * decode reveals, or a malformed escape. The query/fragment are NOT segment-checked — only the
+ * existing whitespace/control rule applies there. Dots inside a segment (`v0.8.0`) stay legal.
+ */
+function assertNoDangerousSegments(
+  rawUrl: string,
+  fail: (what: string) => never,
+): void {
+  const path = rawUrl.split(/[?#]/, 1)[0];
+  for (const seg of path.split('/')) {
+    if (seg === '') continue; // leading '' and a trailing slash; '//' is already refused above.
+    let s = seg;
+    for (let pass = 0; ; pass++) {
+      if (s === '.' || s === '..' || s.includes('/') || s.includes('\\')) {
+        fail(ACTION_URL_SEGMENT);
+      }
+      if (!s.includes('%')) break;
+      if (pass === 3) fail(ACTION_URL_SEGMENT);
+      try {
+        s = decodeURIComponent(s);
+      } catch {
+        fail(ACTION_URL_SEGMENT);
+      }
+    }
+  }
+}
+
 const isOneOf = <T extends string>(values: readonly T[], v: unknown): v is T =>
   typeof v === 'string' && (values as readonly string[]).includes(v);
 
@@ -256,6 +286,7 @@ export function normaliseCreateInput(
       fail(
         `actionUrl must be a portal-relative path starting with ${NOTIFICATION_ACTION_URL_PREFIX}`,
       );
+    assertNoDangerousSegments(rawUrl, fail);
     actionUrl = rawUrl;
     actionLabel = text('actionLabel', rawLabel, NOTIFICATION_ACTION_LABEL_MAX);
   }

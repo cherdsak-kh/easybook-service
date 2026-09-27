@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { LineIdTokenGuard } from '../line/guards/line-id-token.guard';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { StorageModule } from '../storage/storage.module';
 import { AdminFeedbackController } from './admin-feedback.controller';
 import { AdminFeedbackService } from './admin-feedback.service';
@@ -38,7 +39,9 @@ import { FeedbackService } from './feedback.service';
  * Nothing is exported: no other module has any business writing a submission or triaging one.
  */
 @Module({
-  imports: [StorageModule],
+  // `NotificationsModule` — `NOTIF-EVENTS-1` (F1/F2): `FeedbackService` injects
+  // `AdminNotificationTriggers`. A DI sink, so still acyclic.
+  imports: [StorageModule, NotificationsModule],
   controllers: [FeedbackController, AdminFeedbackController],
   providers: [
     FeedbackService,

@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { messagingApi } from '@line/bot-sdk';
+import { AdminNotificationTriggers } from '../notifications/triggers/admin-notification-triggers.service';
 import {
   classifyLineError,
   LineCallError,
@@ -83,6 +84,7 @@ export class LineService {
     config: ConfigService,
     @Inject(LINE_MESSAGING_CLIENT)
     client: messagingApi.MessagingApiClient | null,
+    private readonly triggers: AdminNotificationTriggers,
   ) {
     this.client = client;
     if (client === null) {
@@ -136,8 +138,24 @@ export class LineService {
     return this.requireClient().replyMessage({ replyToken, messages });
   }
 
+  /**
+   * `return await` is LOAD-BEARING (design §2.4): only then does the `catch` below see a rejection
+   * from `pushMessage` itself, rather than the caller seeing an un-awaited promise that this method
+   * never actually observed.
+   */
   async push(to: string, messages: messagingApi.Message[]): Promise<unknown> {
-    return this.requireClient().pushMessage({ to, messages });
+    try {
+      return await this.requireClient().pushMessage({ to, messages });
+    } catch (err) {
+      const c = classifyLineError(err);
+      // C1 (`NOTIF-EVENTS-1`) — fail-safe and deduped inside the trigger; never rejects.
+      await this.triggers.lineDeliveryFailed({
+        operation: 'push',
+        kind: c.kind,
+        status: c.status,
+      });
+      throw err; // the SAME object, unchanged — callers classify it.
+    }
   }
 
   /**
@@ -180,6 +198,13 @@ export class LineService {
     const client = this.client;
     if (client === null) {
       outcome.failure = { chunkIndex: 0, kind: 'NOT_CONFIGURED', status: null };
+      // C1 (`NOTIF-EVENTS-1`) — after the commit, never rejects. `multicast` still resolves its
+      // outcome regardless.
+      await this.triggers.lineDeliveryFailed({
+        operation: 'multicast',
+        kind: outcome.failure.kind,
+        status: outcome.failure.status,
+      });
       return outcome;
     }
 
@@ -230,6 +255,15 @@ export class LineService {
     this.logger.debug(
       `LINE multicast chunks=${chunks.length} requests=${outcome.requestCount} accepted=${outcome.acceptedCount} targeted=${outcome.targetedCount}`,
     );
+    // C1 (`NOTIF-EVENTS-1`) — after the commit, never rejects; the trigger itself filters kinds and
+    // dedupes. `multicast` still resolves its outcome regardless.
+    if (outcome.failure !== null) {
+      await this.triggers.lineDeliveryFailed({
+        operation: 'multicast',
+        kind: outcome.failure.kind,
+        status: outcome.failure.status,
+      });
+    }
     return outcome;
   }
 

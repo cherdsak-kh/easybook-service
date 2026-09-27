@@ -9,6 +9,11 @@ import {
 import { AppAccess, Prisma, SystemRole } from '@prisma/client';
 import { ConfigService } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
+import { AdminNotificationTriggers } from '../notifications/triggers/admin-notification-triggers.service';
+import {
+  disabledTriggers,
+  rejectingTriggers,
+} from '../notifications/triggers/triggers.test-kit';
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { RedisService } from '../redis/redis.service';
@@ -199,6 +204,7 @@ describe('LineUserService', () => {
           provide: ConfigService,
           useValue: { get: jest.fn().mockReturnValue(LIFF_URL) },
         },
+        { provide: AdminNotificationTriggers, useValue: disabledTriggers() },
       ],
     }).compile();
     service = module.get<LineUserService>(LineUserService);
@@ -229,12 +235,13 @@ describe('LineUserService', () => {
     expect(arg.update).not.toHaveProperty('richMenuType');
   });
 
-  // The unfollow path was reworked from `updateMany` (count only) to a lookup + update, because the
-  // `lineUser.deleted` payload needs the cuid. The `{ count }` return contract is UNCHANGED, so
-  // `LineWebhookService` needs no edit — asserted below.
+  // The unfollow write is a CONDITIONAL `updateMany({ where: { id, deletedAt: null } })`, not an
+  // unconditional `update` (D-3, `NOTIF-EVENTS-1`): two concurrent unfollows must not both see
+  // `count: 1`, which would fire U3 and emit `deleted` twice. The `{ count }` return contract on the
+  // METHOD is unchanged, so `LineWebhookService` needs no edit.
   it('soft-deletes only active rows for the given lineUserId', async () => {
     lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
-    lineUser.update.mockResolvedValue({ id: 'lu-1' });
+    lineUser.updateMany.mockResolvedValue({ count: 1 });
 
     await expect(service.softDeleteByLineUserId('U123')).resolves.toEqual({
       count: 1,
@@ -245,22 +252,32 @@ describe('LineUserService', () => {
     ];
     expect(lookup.where).toEqual({ lineUserId: 'U123', deletedAt: null });
 
-    const [arg] = lineUser.update.mock.calls[0] as [
+    const [arg] = lineUser.updateMany.mock.calls[0] as [
       { where: Record<string, unknown>; data: Record<string, unknown> },
     ];
-    expect(arg.where).toEqual({ id: 'lu-1' });
+    expect(arg.where).toEqual({ id: 'lu-1', deletedAt: null });
     expect(arg.data.deletedAt).toBeInstanceOf(Date);
   });
 
   it('unfollow emits lineUser.deleted with the CUID, not the LINE-side U… id', async () => {
     lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
-    lineUser.update.mockResolvedValue({ id: 'lu-1' });
+    lineUser.updateMany.mockResolvedValue({ count: 1 });
 
     await service.softDeleteByLineUserId('U123');
 
     expect(realtime.emitLineUserDeleted).toHaveBeenCalledTimes(1);
     // An unfollow has no operator — the person did it themselves, on LINE.
     expect(realtime.emitLineUserDeleted).toHaveBeenCalledWith('lu-1', null);
+  });
+
+  it('a concurrent double unfollow: the loser sees count 0 and emits/triggers nothing (D-3)', async () => {
+    lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
+    lineUser.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(service.softDeleteByLineUserId('U123')).resolves.toEqual({
+      count: 0,
+    });
+    expect(realtime.emitLineUserDeleted).not.toHaveBeenCalled();
   });
 
   it('unfollow of an absent/already-deleted row writes nothing and emits nothing', async () => {
@@ -2565,6 +2582,119 @@ describe('LineUserService', () => {
         service.refreshProfileFromLine('U123'),
       ).resolves.toBeUndefined();
       expect(lineUser.update).not.toHaveBeenCalled();
+    });
+  });
+
+  // ───────────────────────── NOTIF-EVENTS-1 fail-safe (AC-2) ─────────────────────────
+  // Per hook: with the REAL `AdminNotificationTriggers` wired to a REJECTING `NotificationsService`,
+  // the domain method still resolves with its normal result, the business write still happened, and
+  // exactly one `warn` is logged with no title/body/name/phone in it.
+  describe('NOTIF-EVENTS-1 fail-safe (AC-2)', () => {
+    const prismaDouble = {
+      lineUser,
+      lineUserRegistration,
+      department,
+      personnelRole,
+      $transaction,
+    } as unknown as PrismaService;
+    const configDouble = {
+      get: jest.fn().mockReturnValue(LIFF_URL),
+    } as unknown as ConfigService;
+    const newService = (triggers: AdminNotificationTriggers) =>
+      new LineUserService(
+        prismaDouble,
+        line as unknown as LineService,
+        realtime as unknown as RealtimeGateway,
+        redis as unknown as RedisService,
+        configDouble,
+        triggers,
+      );
+
+    it('U1 — register() still resolves and persists when the trigger rejects', async () => {
+      const tx = makeTx();
+      tx.department.findFirst.mockResolvedValue({ id: 1 });
+      tx.personnelRole.findFirst.mockResolvedValue({ id: 2 });
+      $transaction.mockImplementation((cb: (client: typeof tx) => unknown) =>
+        cb(tx),
+      );
+      tx.lineUser.findFirst.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.UNREGISTERED,
+      });
+      tx.lineUserRegistration.create.mockResolvedValue(OWNER_REGISTRATION_ROW);
+      tx.lineUser.update.mockResolvedValue({ access: AppAccess.PENDING });
+      lineUser.findFirst.mockResolvedValue(null); // `publish()`'s re-read — no event, not the point
+      line.push.mockResolvedValue(undefined);
+
+      const { triggers, create, warn } = rejectingTriggers(prismaDouble);
+      const svc = newService(triggers);
+
+      const result = await svc.register('U123', VALID_DTO);
+
+      expect(result.access).toBe(AppAccess.PENDING);
+      expect(tx.lineUserRegistration.create).toHaveBeenCalled();
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).not.toMatch(
+        /Somchai|Jaidee|081-234-5678/,
+      );
+    });
+
+    it('U2 — a REJECTED resubmit still resolves and persists when the trigger rejects', async () => {
+      $transaction.mockImplementation((cb: (client: unknown) => unknown) =>
+        cb({ lineUser, lineUserRegistration, department, personnelRole }),
+      );
+      lineUser.findFirst
+        .mockResolvedValueOnce({ id: 'lu-1', access: AppAccess.REJECTED })
+        // `publish()`'s re-read — no event, not the point of this test.
+        .mockResolvedValue(null);
+      department.findFirst.mockResolvedValue({ id: 1 });
+      personnelRole.findFirst.mockResolvedValue({ id: 2 });
+      lineUserRegistration.update.mockResolvedValue(OWNER_REGISTRATION_ROW);
+      lineUser.update.mockResolvedValue({
+        id: 'lu-1',
+        access: AppAccess.PENDING,
+      });
+      line.push.mockResolvedValue(undefined);
+
+      const { triggers, create, warn } = rejectingTriggers(prismaDouble);
+      const svc = newService(triggers);
+
+      const result = await svc.updateRegistration('U123', {
+        ...VALID_DTO,
+      });
+
+      expect(result.access).toBe(AppAccess.PENDING);
+      expect(lineUserRegistration.update).toHaveBeenCalled();
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).not.toMatch(
+        /Somchai|Jaidee|081-234-5678/,
+      );
+    });
+
+    it('U3 — an unfollow with a pending request still resolves count:1 when the trigger rejects', async () => {
+      lineUser.findFirst.mockResolvedValue({ id: 'lu-1' });
+      lineUser.updateMany.mockResolvedValue({ count: 1 });
+      // The trigger's OWN read (`AdminNotificationTriggers.unfollowedWithPending`) — same `lineUser`
+      // mock, since `prismaDouble` shares it.
+      lineUser.findUnique.mockResolvedValue({
+        access: AppAccess.PENDING,
+        registration: null,
+        bookingRequests: [{ code: 'BR-1' }],
+        _count: { bookingRequests: 1 },
+      });
+
+      const { triggers, create, warn } = rejectingTriggers(prismaDouble);
+      const svc = newService(triggers);
+
+      const result = await svc.softDeleteByLineUserId('U123');
+
+      expect(result).toEqual({ count: 1 });
+      expect(realtime.emitLineUserDeleted).toHaveBeenCalledWith('lu-1', null);
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).not.toMatch(/BR-1/);
     });
   });
 });

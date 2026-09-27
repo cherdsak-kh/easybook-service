@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { BookingStatus } from '@prisma/client';
+import { AdminNotificationTriggers } from '../notifications/triggers/admin-notification-triggers.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
@@ -46,6 +47,7 @@ export class BookingExpiryCron {
     private readonly realtime: RealtimeGateway,
     private readonly client: ClientRealtimeGateway,
     private readonly notifier: BookingNotifier,
+    private readonly triggers: AdminNotificationTriggers,
   ) {}
 
   /**
@@ -125,6 +127,10 @@ export class BookingExpiryCron {
         chunk.map((id) => ({ bookingId: id, status: 'EXPIRED' as const })),
       );
     }
+    // B3 (`NOTIF-EVENTS-1`) — ONE row per sweep, however many requests it flipped (R-2). After the
+    // chunked publish/notify loop, fail-safe, never rejects. The zero-row early return already
+    // skipped this.
+    await this.triggers.bookingsExpired({ bookingIds: ids });
     return ids;
   }
 }

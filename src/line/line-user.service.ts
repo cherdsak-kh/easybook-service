@@ -11,6 +11,7 @@ import { ConfigService } from '@nestjs/config';
 import { AppAccess, Prisma, SystemRole } from '@prisma/client';
 import type { LineUser, RichMenuType } from '@prisma/client';
 import { resolveAppVersion } from '../common/app-version';
+import { AdminNotificationTriggers } from '../notifications/triggers/admin-notification-triggers.service';
 import { PrismaService } from '../prisma/prisma.service';
 import type { RealtimeActor } from '../realtime/realtime.constants';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
@@ -354,6 +355,7 @@ export class LineUserService {
     private readonly realtime: RealtimeGateway,
     private readonly redis: RedisService,
     config: ConfigService,
+    private readonly triggers: AdminNotificationTriggers,
   ) {
     this.liffUrl = config.get<string>('LINE_LIFF_URL') ?? null;
   }
@@ -441,8 +443,13 @@ export class LineUserService {
    *
    * The id lookup exists because `updateMany` returns only a count and `lineUser.deleted` needs the
    * cuid. `lineUserId` is `@unique`, so this is an indexed read and no new index is required. The
-   * `{ count }` return type is UNCHANGED, so `LineWebhookService` needs no edit. A concurrent double
-   * unfollow can emit `deleted` twice; the client's remove-by-id is idempotent.
+   * `{ count }` return type is UNCHANGED, so `LineWebhookService` needs no edit.
+   *
+   * 🔴 D-3 (`NOTIF-EVENTS-1`): the write is a CONDITIONAL `updateMany({ where: { id, deletedAt: null } })`,
+   * not an unconditional `update`. At HEAD, two concurrent unfollows both pass the `findFirst` above
+   * and both returned `count: 1` — which would fire U3 twice and emit `deleted` twice. The `where`
+   * makes Postgres the arbiter: the loser's `updateMany` affects zero rows and returns `{ count: 0 }`
+   * before any emit or trigger.
    */
   async softDeleteByLineUserId(lineUserId: string): Promise<{ count: number }> {
     const row = await this.prisma.lineUser.findFirst({
@@ -451,10 +458,11 @@ export class LineUserService {
     });
     if (!row) return { count: 0 };
 
-    await this.prisma.lineUser.update({
-      where: { id: row.id },
+    const { count } = await this.prisma.lineUser.updateMany({
+      where: { id: row.id, deletedAt: null },
       data: { deletedAt: new Date() },
     });
+    if (count === 0) return { count: 0 };
 
     // Emit site 6. "Deleted" means "left the list you are looking at" — the physical row survives.
     // No operator: the user unfollowed.
@@ -464,6 +472,10 @@ export class LineUserService {
     // FRESH UNREGISTERED row. A surviving key would keep serving the old account's registration —
     // including its name and phone — to whoever re-opens the LIFF under that sub.
     await this.redis.del(lineStatusKey(lineUserId));
+
+    // U3 (`NOTIF-EVENTS-1`) — only when the user owns ≥1 PENDING request (R-6); the trigger's own
+    // read decides that and returns without writing when the count is 0. `row.id` is the cuid.
+    await this.triggers.unfollowedWithPending({ lineUserId: row.id });
     return { count: 1 };
   }
 
@@ -851,6 +863,13 @@ export class LineUserService {
       // The caller's own status changed too (UNREGISTERED → PENDING, registration now present).
       await this.redis.del(...OPTION_LIST_KEYS, lineStatusKey(lineUserId));
 
+      // U1 (`NOTIF-EVENTS-1`) — after the commit, the LINE push and the cache drop; fail-safe and
+      // never rejects. `registration` structurally satisfies `PersonFacts & { phone }`.
+      await this.triggers.registrationSubmitted({
+        lineUserId: userId,
+        person: registration,
+      });
+
       // A fresh registration is never REJECTED — no reason to surface.
       return this.toStatusDto(access, registration, null);
     } catch (error) {
@@ -948,6 +967,16 @@ export class LineUserService {
     // The status payload carries the edited fields verbatim, and a REJECTED resubmit also flipped
     // `access` and cleared `rejectionReason` — so it goes too.
     await this.redis.del(...OPTION_LIST_KEYS, lineStatusKey(lineUserId));
+
+    // U2 (`NOTIF-EVENTS-1`) — only the REJECTED→PENDING resubmit fires; a PENDING self-edit does not
+    // (design §2.3: "was rejected" is not observable after the commit, so the call sits inside this
+    // `if`, unlike every other trigger).
+    if (wasRejected) {
+      await this.triggers.registrationResubmitted({
+        lineUserId: user.id,
+        person: updated,
+      });
+    }
 
     // Both paths land on PENDING with the reason cleared (REJECTED resubmit) or already null (edit).
     return this.toStatusDto(AppAccess.PENDING, updated, null);

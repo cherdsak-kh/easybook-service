@@ -158,6 +158,42 @@ describe('normaliseCreateInput (create() validation, AC-17)', () => {
     ).toThrow(/actionUrl/);
   });
 
+  // ── ADV-1 (`NOTIF-EVENTS-1` design §2.9, D-7): dot segments, encoded separators, malformed escapes ──
+  it.each([
+    ['/backend/..'],
+    ['/backend/../x'],
+    ['/backend/x/./y'],
+    ['/backend/%2e%2e/x'],
+    ['/backend/%2E./x'],
+    ['/backend/.%2e'],
+    ['/backend/x%2fy'],
+    ['/backend/x%5Cy'],
+    ['/backend/%252e%252e'], // double-encoded — still resolves to ".." within 3 decode passes
+    ['/backend/%zz'], // malformed escape (URIError on decodeURIComponent)
+  ])('ADV-1 rejects actionUrl %j', (actionUrl) => {
+    expect(() =>
+      normaliseCreateInput(input({ actionUrl, actionLabel: 'ดู' })),
+    ).toThrow(/actionUrl/);
+  });
+
+  it.each([
+    ['/backend/bookings/requests?status=PENDING'],
+    ['/backend/help/version'],
+    ['/backend/help/v0.8.0'], // a dot INSIDE a segment stays legal
+    ['/backend/settings/integrations'],
+    ['/backend/venues'],
+    ['/backend/feedback'],
+    ['/backend/reports/error-log'],
+    ['/backend/settings/booking'],
+    ['/backend/bookings/requests?status=EXPIRED'],
+    ['/backend/bookings/calendar'],
+    ['/backend/line-users'],
+  ])('ADV-1 accepts actionUrl %j (production URLs, B-4)', (actionUrl) => {
+    expect(() =>
+      normaliseCreateInput(input({ actionUrl, actionLabel: 'ดู' })),
+    ).not.toThrow();
+  });
+
   it.each([
     ['url without label', { actionUrl: '/backend/feedback' }],
     ['label without url', { actionLabel: 'ดู' }],

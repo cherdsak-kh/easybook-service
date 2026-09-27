@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../auth/auth.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { StorageModule } from '../storage/storage.module';
 import { VenuePhotoUploadService } from './venue-photo-upload.service';
 import { VenuesController } from './venues.controller';
@@ -21,7 +22,9 @@ import { VenuesService } from './venues.service';
  * those services.
  */
 @Module({
-  imports: [AuthModule, StorageModule],
+  // `NotificationsModule` — `NOTIF-EVENTS-1` (C3): `VenuesService` injects `AdminNotificationTriggers`.
+  // A DI sink, so still acyclic.
+  imports: [AuthModule, StorageModule, NotificationsModule],
   controllers: [VenuesController],
   providers: [VenuesService, VenuePhotoUploadService],
   exports: [VenuesService],

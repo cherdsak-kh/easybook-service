@@ -6,6 +6,10 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
+import {
+  AdminNotificationTriggers,
+  type NotificationActor,
+} from '../notifications/triggers/admin-notification-triggers.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { RedisService } from '../redis/redis.service';
 import { VENUE_WRITE_CACHE_KEYS } from '../redis/cache-keys';
@@ -129,6 +133,7 @@ export class VenuesService {
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
     private readonly storage: R2StorageService,
+    private readonly triggers: AdminNotificationTriggers,
   ) {}
 
   /**
@@ -369,7 +374,11 @@ export class VenuesService {
    * READ BY THE PEOPLE IT AFFECTS — it prints on the card and, once LIFF exists, in front of anybody
    * who tries to book the room.
    */
-  async close(id: string, reason: string): Promise<VenueResponseDto> {
+  async close(
+    id: string,
+    reason: string,
+    actor: NotificationActor,
+  ): Promise<VenueResponseDto> {
     const trimmed = reason.trim();
     // Belt to the DTO's braces: `@IsNotEmpty` runs after `@Transform(trim)`, so this is unreachable
     // through the HTTP path. It stays because the invariant "closed implies a reason" is this
@@ -396,6 +405,13 @@ export class VenuesService {
     // The status filter and nothing else — but the keys are dropped anyway, because "which write
     // moves which count" is precisely the thing this repo has decided not to reason about per call.
     await this.redis.del(...VENUE_WRITE_CACHE_KEYS);
+    // C3 (`NOTIF-EVENTS-1`) — after the cache drop, fail-safe, never rejects.
+    await this.triggers.venueClosed({
+      venueId: id,
+      venueName: updated.name,
+      reason: trimmed,
+      actor,
+    });
     return toDto(updated);
   }
 
