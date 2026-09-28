@@ -25,6 +25,7 @@ import { HealthModule } from './health/health.module';
 import { LineModule } from './line/line.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { OptionsModule } from './options/options.module';
+import { ReportsModule } from './reports/reports.module';
 import { VenueTypesModule } from './venue-types/venue-types.module';
 import { AmenitiesModule } from './amenities/amenities.module';
 import { VenuesModule } from './venues/venues.module';
@@ -125,6 +126,10 @@ const throttlerModule: DynamicModule = {
     // controller uses.
     NotificationsModule,
     SystemModule,
+    // Reports Phase 1 — Hub 7 (ภาพรวมระบบ) + Hub 1 (ภาพรวมสถิติเชิงบริหาร). Read-only: `/dashboard/*`
+    // and `/reports/*`, a first segment neither controller above uses. Deliberately isolated from
+    // `BookingsModule` (design §2.1) — see `reports.module.ts`.
+    ReportsModule,
     // Still future tasks: the admin approval + direct-booking surface (`SessionGuard`), the
     // `/client` realtime namespace, and LINE chat notifications.
   ],

@@ -335,6 +335,56 @@ export class R2StorageService {
     return { ok: read && write, latencyMs: Date.now() - started, read, write };
   }
 
+  /**
+   * `การเชื่อมต่อระบบ`'s READ-ONLY storage probe for `GET /system/health` (Reports Phase 1, D-8).
+   *
+   * ⚠️ NEVER WRITES. {@link probe} above is the OLD probe `การเชื่อมต่อระบบ`'s manual "ทดสอบ" button
+   * uses, and it Puts-then-Deletes a two-byte object — proving the avatar/venue-photo upload
+   * permission is exactly its job. This one exists because `GET /system/health` is polled every
+   * 60 s by every open dashboard tab; writing an object on every poll would mean a slow drip of
+   * throwaway R2 requests for a chip nobody asked to re-verify the write permission on. `ok` here
+   * proves only that the endpoint, the credentials and the bucket name resolve — which is what the
+   * dashboard's "R2 reachable" question actually is.
+   *
+   * NEVER THROWS, same contract as {@link probe}: a probe that answers "no" is a result, not a
+   * server error. Unconfigured → `configured: false`, `ok: false`, latency 0, no S3 client built.
+   */
+  async probeRead(
+    timeoutMs = PROBE_STEP_TIMEOUT_MS,
+  ): Promise<{ configured: boolean; ok: boolean; latencyMs: number }> {
+    if (!this.isConfigured()) {
+      return { configured: false, ok: false, latencyMs: 0 };
+    }
+    const bucket = this.config.getOrThrow<string>('R2_BUCKET');
+    const started = Date.now();
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.s3().send(
+          new ListObjectsV2Command({
+            Bucket: bucket,
+            Prefix: HEALTHCHECK_PREFIX,
+            MaxKeys: 1,
+          }),
+        ),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error('probeRead timed out')),
+            timeoutMs,
+          );
+        }),
+      ]);
+      return { configured: true, ok: true, latencyMs: Date.now() - started };
+    } catch (error) {
+      this.logger.warn(
+        `R2 probeRead failed. reason=${error instanceof Error ? error.name : 'unknown'}`,
+      );
+      return { configured: true, ok: false, latencyMs: Date.now() - started };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** The durable, public https URL for a key. */
   publicUrlFor(key: string): string {
     return `${this.config.getOrThrow<string>('R2_PUBLIC_BASE_URL')}/${key}`;

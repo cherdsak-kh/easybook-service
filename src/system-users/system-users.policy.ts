@@ -199,3 +199,15 @@ export function canResetPassword(actor: Actor, target: Target): PolicyResult {
   if (actor.role !== SystemRole.SUPER_ADMIN) return deny(INSUFFICIENT_ROLE);
   return allow();
 }
+
+/**
+ * `GET /system/health` (Reports Phase 1, D-15/DV-3). May the caller see the NUMERIC telemetry —
+ * DB latency, LINE quota, R2 probe latency — rather than the one-word SUMMARY every role gets?
+ *
+ * A raw boolean, same shape as `mayUseSystemReservedOptions` and for the same reason: the caller
+ * (`SystemHealthService`) uses it to CHOOSE which DTO fields to build, not to reject a request —
+ * every role gets a 200 (AC-D19), so there is no `PolicyResult`/403 here to return.
+ */
+export function mayReadSystemTelemetry(actor: Actor): boolean {
+  return actor.role === SystemRole.SUPER_ADMIN;
+}

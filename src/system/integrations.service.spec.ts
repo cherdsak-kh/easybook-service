@@ -55,7 +55,10 @@ function build(
   const prisma = {
     $queryRaw: jest.fn().mockResolvedValue([{ '?column?': 1 }]),
   };
-  const redis = { isHealthy: jest.fn().mockResolvedValue(true) };
+  const redis = {
+    isHealthy: jest.fn().mockResolvedValue(true),
+    del: jest.fn().mockResolvedValue(undefined),
+  };
   const env: Record<string, string | number | undefined> = {
     R2_BUCKET: 'easybook-dev',
     ...over.env,
@@ -272,6 +275,12 @@ describe('IntegrationsService', () => {
         channelSecret: undefined,
         channelAccessToken: undefined,
       });
+    });
+
+    it('drops the cached LINE health probe (Reports Phase 1, D-8/AC-D20)', async () => {
+      const { svc, redis } = build();
+      await svc.updateLine({ channelId: '2006123442' });
+      expect(redis.del).toHaveBeenCalledWith('health:line');
     });
   });
 

@@ -161,3 +161,23 @@ export const lineProfileSyncKey = (lineSub: string): string =>
 
 /** How long the marker above suppresses another `getProfile` for the same follower. */
 export const LINE_PROFILE_SYNC_TTL_SECONDS = 6 * 60 * 60;
+
+/**
+ * `GET /system/health`'s two upstream probe caches (Reports Phase 1, D-8/AC-D20). ONE key each —
+ * the payload is role-agnostic (see `system-health.service.ts`: trimming happens when the response
+ * is BUILT, never in the key), so there is no dimension to add the way `optionListKey` needs one.
+ *
+ * ⚠️ `HEALTH_LINE_KEY` IS DROPPED BY `IntegrationsService.updateLine()`. A SUPER_ADMIN who just
+ * pasted a new channel access token must not keep seeing the OLD token's cached quota/status for
+ * up to five more minutes — that is a materially wrong "is LINE healthy" answer on the exact screen
+ * the admin is using to verify the change worked.
+ */
+export const HEALTH_LINE_KEY = 'health:line';
+export const HEALTH_R2_KEY = 'health:r2';
+
+/**
+ * TTL for a FAILED probe result (E-20). Short on purpose, and shorter than `CACHE_TTL_SECONDS`
+ * (300 s, the success TTL): a dead LINE token or an unreachable bucket must not sit "cached" for
+ * five minutes while an operator is actively trying to fix it and refreshing the page to check.
+ */
+export const HEALTH_FAILURE_TTL_SECONDS = 60;

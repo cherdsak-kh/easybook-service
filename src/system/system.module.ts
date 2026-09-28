@@ -6,21 +6,33 @@ import { IntegrationsController } from './integrations.controller';
 import { IntegrationsService } from './integrations.service';
 import { SwaggerGateService } from './swagger-gate.service';
 import { SystemController } from './system.controller';
+import { SystemHealthController } from './system-health.controller';
+import { SystemHealthService } from './system-health.service';
 
 /**
- * Build metadata for the version screen, and การเชื่อมต่อระบบ (`INTEGRATIONS-API-1`).
+ * Build metadata for the version screen, การเชื่อมต่อระบบ (`INTEGRATIONS-API-1`), and — Reports
+ * Phase 1 — role-shaped infrastructure health (`GET /system/health`, design §2.4).
  *
  * `AuthModule` for `SessionGuard` / `RolesGuard`. `LineModule` for its exported `LineService` and
  * `LineCredentialsService` — never re-provided here: there is ONE `LineService` in the app, and the
  * e2e suites replace its client at the module boundary. `StorageModule` for `R2StorageService`.
  * Prisma, Config and Redis are global. No cycle: nothing under Line or Storage imports this module.
  *
+ * `SystemHealthController` lives HERE rather than in `src/reports/` (which is otherwise the home of
+ * Reports Phase 1): it reuses exactly the same `LineModule`/`StorageModule` dependencies
+ * `IntegrationsService` already has, and `src/reports/` was designed to stay isolated from every
+ * write-heavy or infrastructure-probing module (design §2.1, §5).
+ *
  * `SwaggerGateService` is exported because `mountSwagger` resolves it from the app (`app.get`).
  */
 @Module({
   imports: [forwardRef(() => AuthModule), LineModule, StorageModule],
-  controllers: [SystemController, IntegrationsController],
-  providers: [SwaggerGateService, IntegrationsService],
+  controllers: [
+    SystemController,
+    IntegrationsController,
+    SystemHealthController,
+  ],
+  providers: [SwaggerGateService, IntegrationsService, SystemHealthService],
   exports: [SwaggerGateService],
 })
 export class SystemModule {}
