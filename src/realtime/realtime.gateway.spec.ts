@@ -1,18 +1,25 @@
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { BookingStatus, SystemRole } from '@prisma/client';
+import {
+  AdminNotificationTargetRole,
+  BookingStatus,
+  SystemRole,
+} from '@prisma/client';
 import type { Redis } from 'ioredis';
-import type { Namespace } from 'socket.io';
+import type { Namespace, Socket } from 'socket.io';
 import { SESSION_ABSOLUTE_MAX_AGE_MS } from '../auth/auth.constants';
 import type { AdminBookingRequestListItemDto } from '../bookings/dto/admin-booking-response.dto';
 import type { LineUserResponseDto } from '../line/dto/line-user-response.dto';
 import { PrismaService } from '../prisma/prisma.service';
 import {
+  ADMIN_SUPER_ROOM,
   DEFAULT_WS_REVALIDATE_INTERVAL_MS,
   REALTIME_EVENTS,
   SESSION_CLOSED_REASONS,
+  type AdminNotificationEventPayload,
 } from './realtime.constants';
 import {
+  audienceFor,
   RealtimeGateway,
   resolveRevalidateIntervalMs,
 } from './realtime.gateway';
@@ -98,23 +105,43 @@ const booking: AdminBookingRequestListItemDto = {
 };
 
 interface FakeSocket {
-  data: { sid?: string; systemUserId?: string; connectedAt?: number };
+  id: string;
+  data: {
+    sid?: string;
+    systemUserId?: string;
+    connectedAt?: number;
+    role?: SystemRole;
+  };
   emit: jest.Mock;
   disconnect: jest.Mock;
+  join: jest.Mock;
+  leave: jest.Mock;
 }
 
 let socketSeq = 0;
-const makeSocket = (sid: string, systemUserId: string): FakeSocket => ({
-  data: { sid, systemUserId, connectedAt: Date.now() },
+const makeSocket = (
+  sid: string,
+  systemUserId: string,
+  role: SystemRole = SystemRole.ADMIN,
+): FakeSocket => ({
+  id: `sock-${socketSeq++}`,
+  data: { sid, systemUserId, connectedAt: Date.now(), role },
   emit: jest.fn(),
   disconnect: jest.fn(),
+  join: jest.fn(),
+  leave: jest.fn(),
 });
 
-const makeNamespace = (sockets: FakeSocket[]) => ({
-  use: jest.fn(),
-  emit: jest.fn(),
-  sockets: new Map(sockets.map((socket) => [`sock-${socketSeq++}`, socket])),
-});
+const makeNamespace = (sockets: FakeSocket[]) => {
+  const roomEmit = jest.fn();
+  return {
+    use: jest.fn(),
+    emit: jest.fn(),
+    to: jest.fn(() => ({ emit: roomEmit })),
+    roomEmit,
+    sockets: new Map(sockets.map((socket) => [socket.id, socket])),
+  };
+};
 
 describe('resolveRevalidateIntervalMs', () => {
   it('defaults to 30s when unset or blank', () => {
@@ -202,7 +229,7 @@ describe('RealtimeGateway', () => {
 
   // ───────────────────────────── emit surface ─────────────────────────────
 
-  it('emits the three domain events on the namespace (no rooms — membership IS the boundary)', () => {
+  it('emits the three domain events on the namespace (membership IS the boundary)', () => {
     const namespace = boot();
 
     gateway.emitLineUserCreated(dto, ACTOR);
@@ -351,6 +378,190 @@ describe('RealtimeGateway', () => {
     warn.mockRestore();
   });
 
+  // ───────────────────────────── NOTIF-RT-1 — audience + room join ─────────────────────────────
+
+  const notifPayload = (
+    targetRole: AdminNotificationTargetRole,
+  ): AdminNotificationEventPayload => ({
+    id: 'notif-1',
+    targetRole,
+    createdAt: '2026-09-27T11:04:05.123Z',
+  });
+
+  describe('audienceFor', () => {
+    it.each([
+      [AdminNotificationTargetRole.ALL, { to: 'namespace' }],
+      [AdminNotificationTargetRole.ADMIN, { to: 'namespace' }],
+      [
+        AdminNotificationTargetRole.SUPER_ADMIN,
+        { to: 'room', room: ADMIN_SUPER_ROOM },
+      ],
+    ])('%s -> %o', (targetRole, expected) => {
+      expect(audienceFor(targetRole)).toEqual(expected);
+    });
+
+    it('an unknown targetRole at runtime -> undefined (fail closed)', () => {
+      expect(audienceFor('BOGUS' as never)).toBeUndefined();
+    });
+  });
+
+  describe('emitAdminNotificationCreated', () => {
+    it('ALL and ADMIN go to the namespace, never to a room', () => {
+      const namespace = boot();
+
+      gateway.emitAdminNotificationCreated(
+        notifPayload(AdminNotificationTargetRole.ALL),
+      );
+      gateway.emitAdminNotificationCreated(
+        notifPayload(AdminNotificationTargetRole.ADMIN),
+      );
+
+      expect(namespace.emit).toHaveBeenCalledTimes(2);
+      expect(namespace.emit).toHaveBeenNthCalledWith(
+        1,
+        REALTIME_EVENTS.adminNotificationCreated,
+        notifPayload(AdminNotificationTargetRole.ALL),
+      );
+      expect(namespace.to).not.toHaveBeenCalled();
+    });
+
+    it('SUPER_ADMIN goes to ADMIN_SUPER_ROOM only, never to the namespace', () => {
+      const namespace = boot();
+      const payload = notifPayload(AdminNotificationTargetRole.SUPER_ADMIN);
+
+      gateway.emitAdminNotificationCreated(payload);
+
+      expect(namespace.to).toHaveBeenCalledWith(ADMIN_SUPER_ROOM);
+      expect(namespace.roomEmit).toHaveBeenCalledWith(
+        REALTIME_EVENTS.adminNotificationCreated,
+        payload,
+      );
+      expect(namespace.emit).not.toHaveBeenCalled();
+    });
+
+    it('an unknown targetRole at runtime is skipped: neither emit nor to is called, and it warns with the id', () => {
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      const namespace = boot();
+
+      gateway.emitAdminNotificationCreated(
+        notifPayload('BOGUS' as AdminNotificationTargetRole),
+      );
+
+      expect(namespace.emit).not.toHaveBeenCalled();
+      expect(namespace.to).not.toHaveBeenCalled();
+      expect(String(warn.mock.calls[0][0])).toContain('id=notif-1');
+
+      warn.mockRestore();
+    });
+
+    it('an uninitialised gateway does not throw (warns "not initialised" with event=/id=)', () => {
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+
+      expect(() =>
+        gateway.emitAdminNotificationCreated(
+          notifPayload(AdminNotificationTargetRole.ALL),
+        ),
+      ).not.toThrow();
+      expect(String(warn.mock.calls[0][0])).toContain(
+        `event=${REALTIME_EVENTS.adminNotificationCreated}`,
+      );
+      expect(String(warn.mock.calls[0][0])).toContain('id=notif-1');
+
+      warn.mockRestore();
+    });
+
+    it('a throwing namespace.to (and separately a throwing roomEmit) is swallowed — never throws', () => {
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      const namespace = boot();
+      namespace.to.mockImplementationOnce(() => {
+        throw new Error('transport down');
+      });
+
+      expect(() =>
+        gateway.emitAdminNotificationCreated(
+          notifPayload(AdminNotificationTargetRole.SUPER_ADMIN),
+        ),
+      ).not.toThrow();
+      expect(warn).toHaveBeenCalled();
+
+      namespace.roomEmit.mockImplementationOnce(() => {
+        throw new Error('transport down');
+      });
+      expect(() =>
+        gateway.emitAdminNotificationCreated(
+          notifPayload(AdminNotificationTargetRole.SUPER_ADMIN),
+        ),
+      ).not.toThrow();
+
+      warn.mockRestore();
+    });
+
+    it('no log line carries anything but the event name and the id — the payload has no text', () => {
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      const namespace = boot();
+      namespace.to.mockImplementationOnce(() => {
+        throw new Error('transport down');
+      });
+
+      gateway.emitAdminNotificationCreated(
+        notifPayload(AdminNotificationTargetRole.SUPER_ADMIN),
+      );
+
+      expect(String(warn.mock.calls[0][0])).toMatch(
+        /^Realtime emit failed \(write already committed\)\. event=adminNotification\.created id=notif-1: /,
+      );
+
+      warn.mockRestore();
+    });
+  });
+
+  describe('handleConnection', () => {
+    it('a SUPER_ADMIN socket joins ADMIN_SUPER_ROOM exactly once', () => {
+      boot();
+      const socket = makeSocket('sid-1', 'user-1', SystemRole.SUPER_ADMIN);
+
+      gateway.handleConnection(socket as unknown as Socket);
+
+      expect(socket.join).toHaveBeenCalledTimes(1);
+      expect(socket.join).toHaveBeenCalledWith(ADMIN_SUPER_ROOM);
+      expect(socket.leave).not.toHaveBeenCalled();
+    });
+
+    it('an ADMIN socket never joins the room (it may be asked to leave, idempotently)', () => {
+      boot();
+      const socket = makeSocket('sid-1', 'user-1', SystemRole.ADMIN);
+
+      gateway.handleConnection(socket as unknown as Socket);
+
+      expect(socket.join).not.toHaveBeenCalledWith(ADMIN_SUPER_ROOM);
+    });
+
+    it('a socket with no role joins nothing, warns, and is NOT disconnected', () => {
+      const warn = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      boot();
+      const socket = makeSocket('sid-1', 'user-1');
+      socket.data.role = undefined;
+
+      gateway.handleConnection(socket as unknown as Socket);
+
+      expect(socket.join).not.toHaveBeenCalled();
+      expect(socket.disconnect).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalled();
+
+      warn.mockRestore();
+    });
+  });
+
   // ───────────────────────────── the revalidation sweep ─────────────────────────────
 
   it('does ZERO I/O when nobody is watching', async () => {
@@ -495,6 +706,78 @@ describe('RealtimeGateway', () => {
 
     expect(a.disconnect).toHaveBeenCalledWith(true);
     expect(b.disconnect).toHaveBeenCalledWith(true);
+  });
+
+  // ── NOTIF-RT-1: the sweep re-syncs `ADMIN_SUPER_ROOM` membership for every survivor ──
+
+  it('sweep: a SUPER_ADMIN->ADMIN demotion leaves the room, updates data.role, and does NOT disconnect', async () => {
+    const log = jest
+      .spyOn(Logger.prototype, 'log')
+      .mockImplementation(() => undefined);
+    const socket = makeSocket('sid-1', 'user-1', SystemRole.SUPER_ADMIN);
+    boot([socket]);
+    primeSession({ systemUserId: 'user-1', createdAt: Date.now() });
+    findUnique.mockResolvedValue({ ...liveRow, role: SystemRole.ADMIN });
+
+    await gateway.sweep();
+
+    expect(socket.leave).toHaveBeenCalledWith(ADMIN_SUPER_ROOM);
+    expect(socket.join).not.toHaveBeenCalledWith(ADMIN_SUPER_ROOM);
+    expect(socket.data.role).toBe(SystemRole.ADMIN);
+    expect(socket.disconnect).not.toHaveBeenCalled();
+    const logged = (log.mock.calls as unknown[][])
+      .map((c) => String(c[0]))
+      .join('\n');
+    expect(logged).toContain('re-synced');
+
+    log.mockRestore();
+  });
+
+  it('sweep: an ADMIN->SUPER_ADMIN promotion joins the room and updates data.role', async () => {
+    const socket = makeSocket('sid-1', 'user-1', SystemRole.ADMIN);
+    boot([socket]);
+    primeSession({ systemUserId: 'user-1', createdAt: Date.now() });
+    findUnique.mockResolvedValue({ ...liveRow, role: SystemRole.SUPER_ADMIN });
+
+    await gateway.sweep();
+
+    expect(socket.join).toHaveBeenCalledWith(ADMIN_SUPER_ROOM);
+    expect(socket.data.role).toBe(SystemRole.SUPER_ADMIN);
+  });
+
+  it('sweep: an unchanged role re-applies room membership but logs no "re-synced" line', async () => {
+    const log = jest
+      .spyOn(Logger.prototype, 'log')
+      .mockImplementation(() => undefined);
+    const socket = makeSocket('sid-1', 'user-1', SystemRole.ADMIN);
+    boot([socket]);
+    primeSession({ systemUserId: 'user-1', createdAt: Date.now() });
+    findUnique.mockResolvedValue({ ...liveRow, role: SystemRole.ADMIN });
+
+    await gateway.sweep();
+
+    const logged = (log.mock.calls as unknown[][])
+      .map((c) => String(c[0]))
+      .join('\n');
+    expect(logged).not.toContain('re-synced');
+
+    log.mockRestore();
+  });
+
+  it('sweep: a demotion to VIEWER still disconnects (regression guard, unaffected by the room re-sync)', async () => {
+    const socket = makeSocket('sid-1', 'user-1', SystemRole.SUPER_ADMIN);
+    boot([socket]);
+    primeSession({ systemUserId: 'user-1', createdAt: Date.now() });
+    findUnique.mockResolvedValue({ ...liveRow, role: SystemRole.VIEWER });
+
+    await gateway.sweep();
+
+    expect(socket.emit).toHaveBeenCalledWith(REALTIME_EVENTS.sessionClosed, {
+      reason: SESSION_CLOSED_REASONS.revoked,
+    });
+    expect(socket.disconnect).toHaveBeenCalledWith(true);
+    expect(socket.join).not.toHaveBeenCalled();
+    expect(socket.leave).not.toHaveBeenCalled();
   });
 
   it('is non-reentrant: a sweep still running when the timer fires again is SKIPPED', async () => {

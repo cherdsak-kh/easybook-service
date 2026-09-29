@@ -4,6 +4,10 @@ import { CronExpression, ScheduleModule } from '@nestjs/schedule';
 import { BookingStatus } from '@prisma/client';
 import { AppModule } from '../app.module';
 import { schedulingEnabled } from '../common/scheduling.constants';
+import {
+  disabledTriggers,
+  rejectingTriggers,
+} from '../notifications/triggers/triggers.test-kit';
 import type { PrismaService } from '../prisma/prisma.service';
 import type { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import type { RealtimeGateway } from '../realtime/realtime.gateway';
@@ -42,8 +46,13 @@ const isScheduleModule = (entry: unknown): boolean =>
 
 describe('BookingExpiryCron', () => {
   const updateManyAndReturn = jest.fn<Promise<{ id: string }[]>, [unknown]>();
+  // `findMany` is read by `AdminNotificationTriggers.bookingsExpired` (B3), not by the cron itself.
+  const bookingRequestFindMany = jest.fn<Promise<unknown[]>, [unknown]>();
   const prisma = {
-    bookingRequest: { updateManyAndReturn },
+    bookingRequest: {
+      updateManyAndReturn,
+      findMany: bookingRequestFindMany,
+    },
   } as unknown as PrismaService;
   const realtime = { name: 'admin-gateway' } as unknown as RealtimeGateway;
   const client = { name: 'client-gateway' } as unknown as ClientRealtimeGateway;
@@ -52,13 +61,20 @@ describe('BookingExpiryCron', () => {
   const notifier = { notifyDecisions } as unknown as BookingNotifier;
 
   const subject = () =>
-    new BookingExpiryCron(prisma, realtime, client, notifier);
+    new BookingExpiryCron(
+      prisma,
+      realtime,
+      client,
+      notifier,
+      disabledTriggers(),
+    );
 
   let logSpy: jest.SpyInstance;
   let errorSpy: jest.SpyInstance;
 
   beforeEach(() => {
     updateManyAndReturn.mockReset();
+    bookingRequestFindMany.mockReset();
     publish.mockReset();
     publish.mockResolvedValue(undefined);
     notifyDecisions.mockReset();
@@ -234,6 +250,30 @@ describe('BookingExpiryCron', () => {
       expect(chunks.map((chunk) => chunk.length)).toEqual([500, 500, 201]);
       expect(chunks.flat().map((n) => n.bookingId)).toEqual(all);
       expect(chunks.flat().every((n) => n.status === 'EXPIRED')).toBe(true);
+    });
+
+    it('B3 AC-2 — still returns the swept ids, invocation order write-before-trigger, when the trigger rejects', async () => {
+      updateManyAndReturn.mockResolvedValue([{ id: 'a' }, { id: 'b' }]);
+      bookingRequestFindMany.mockResolvedValue([
+        { code: 'BR-1', firstStartAt: NOW, venue: { name: 'ห้อง A' } },
+        { code: 'BR-2', firstStartAt: NOW, venue: { name: 'ห้อง B' } },
+      ]);
+      const { triggers, create, warn } = rejectingTriggers(prisma);
+      const cron = new BookingExpiryCron(
+        prisma,
+        realtime,
+        client,
+        notifier,
+        triggers,
+      );
+
+      await expect(cron.expireOverdue(NOW)).resolves.toEqual(['a', 'b']);
+
+      expect(updateManyAndReturn.mock.invocationCallOrder[0]).toBeLessThan(
+        create.mock.invocationCallOrder[0],
+      );
+      expect(create).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
     });
 
     it('the tick survives a notifier that broke its never-throw contract', async () => {

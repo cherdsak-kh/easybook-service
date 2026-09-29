@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { Feedback } from '@prisma/client';
 import { isCodeCollision } from '../bookings/booking-code';
+import { AdminNotificationTriggers } from '../notifications/triggers/admin-notification-triggers.service';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   FEEDBACK_PHOTO_PREFIX,
@@ -39,6 +40,7 @@ export class FeedbackService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: R2StorageService,
+    private readonly triggers: AdminNotificationTriggers,
   ) {}
 
   /**
@@ -81,6 +83,8 @@ export class FeedbackService {
       dto,
       photos,
     );
+    // F1/F2 (`NOTIF-EVENTS-1`) — split by `type` inside the trigger. Fail-safe, never rejects.
+    await this.triggers.feedbackSubmitted({ feedbackId: row.id });
     return toResponseDto(row, venue?.name ?? null);
   }
 

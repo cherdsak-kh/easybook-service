@@ -19,6 +19,7 @@ import {
 } from '../src/bookings/bookings.constants';
 import { API_BASE_PATH } from '../src/common/api.constants';
 import { LineService } from '../src/line/line.service';
+import { AdminNotificationTriggers } from '../src/notifications/triggers/admin-notification-triggers.service';
 import { PrismaService } from '../src/prisma/prisma.service';
 import { ClientRealtimeGateway } from '../src/realtime/client-realtime.gateway';
 import { RealtimeGateway } from '../src/realtime/realtime.gateway';
@@ -897,6 +898,7 @@ describe('Booking requests — admin surface (e2e)', () => {
         app.get(RealtimeGateway),
         app.get(ClientRealtimeGateway),
         app.get(BookingNotifier),
+        app.get(AdminNotificationTriggers),
       );
       const swept = await cron.expireOverdue();
       expect(swept).toContain(overdue.id);

@@ -7,6 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { AppAccess, BookingStatus, Prisma, SystemRole } from '@prisma/client';
+import { AdminNotificationTriggers } from '../notifications/triggers/admin-notification-triggers.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { ClientRealtimeGateway } from '../realtime/client-realtime.gateway';
 import type { RealtimeActor } from '../realtime/realtime.constants';
@@ -209,6 +210,7 @@ export class AdminBookingsService {
     private readonly realtime: RealtimeGateway,
     private readonly clientRealtime: ClientRealtimeGateway,
     private readonly notifier: BookingNotifier,
+    private readonly triggers: AdminNotificationTriggers,
   ) {}
 
   /**
@@ -436,6 +438,13 @@ export class AdminBookingsService {
         status: 'AUTO_REJECTED' as const,
       })),
     ]);
+    // B4 (`NOTIF-EVENTS-1`) — one row per decision, however many losers; the trigger returns without
+    // writing when there are none. After the commit, fail-safe, never rejects.
+    await this.triggers.bookingsAutoRejected({
+      approvedBookingId: bookingId,
+      losers: autoRejected,
+      actor,
+    });
     return response;
   }
 
@@ -658,6 +667,14 @@ export class AdminBookingsService {
             status: 'AUTO_REJECTED' as const,
           })),
         ]);
+        // B5 then B4 (`NOTIF-EVENTS-1`) — inside the `try`, after `notifyDecisions`, fail-safe. A
+        // code-collision retry throws from `runDecision` BEFORE this point, so neither fires twice.
+        await this.triggers.directBookingCreated({ bookingId, actor });
+        await this.triggers.bookingsAutoRejected({
+          approvedBookingId: bookingId,
+          losers: autoRejected,
+          actor,
+        });
         return response;
       } catch (err) {
         if (!isCodeCollision(err) || attempt === BOOKING_CODE_MAX_ATTEMPTS) {

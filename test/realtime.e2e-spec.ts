@@ -621,7 +621,7 @@ describe('Realtime gateway (e2e)', () => {
       expect(typeof adminPayload.actor?.id).toBe('string');
       expect(adminPayload.actor?.name).toBe('E2E ADMIN');
 
-      // X2: every admin in the namespace gets it — there are no rooms.
+      // X2: every admin in the namespace gets it — a namespace-wide event.
       expect(superPayload).toEqual(adminPayload);
 
       // AC-B13: the exact key set, so nothing that is not on the DTO can ever reach the wire.

@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { VenuesModule } from '../venues/venues.module';
 import { LineController } from './line.controller';
@@ -25,7 +26,10 @@ import { LineIdTokenGuard } from './guards/line-id-token.guard';
   // ⚠️ IMPORTING THE MODULE DOES NOT IMPORT ITS GUARD. `VenuesController` keeps its class-level
   // `@UseGuards(SessionGuard, RolesGuard)` and stays admin-only; what crosses this boundary is the
   // service, and the consumer routes put `LineIdTokenGuard` in front of it themselves.
-  imports: [RealtimeModule, VenuesModule],
+  // `NotificationsModule` — `NOTIF-EVENTS-1`: `LineService` (C1) and `LineUserService` (U1–U3) both
+  // inject `AdminNotificationTriggers`. Still acyclic: `NotificationsModule` is a DI sink (imports
+  // nothing), so this edge cannot close a cycle (design §2.2).
+  imports: [RealtimeModule, VenuesModule, NotificationsModule],
   // Route-order is LOAD-BEARING (SC-6): the client `LineRegistrationController` MUST precede the
   // admin `LineUsersController` so its literal `PATCH /line-users/registration` route is registered
   // before — and therefore wins over — the admin `PATCH /line-users/:id`. A real cuid still falls

@@ -2,6 +2,12 @@ import { HTTPFetchError, messagingApi } from '@line/bot-sdk';
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
+import { AdminNotificationTriggers } from '../notifications/triggers/admin-notification-triggers.service';
+import {
+  disabledTriggers,
+  rejectingTriggers,
+} from '../notifications/triggers/triggers.test-kit';
+import type { PrismaService } from '../prisma/prisma.service';
 import { LineCallError } from './line-call-error';
 import {
   LINE_MESSAGING_CLIENT,
@@ -73,6 +79,7 @@ describe('LineService — multicast / getBotInfo', () => {
     service = new LineService(
       config,
       fake as unknown as messagingApi.MessagingApiClient,
+      disabledTriggers(),
     );
   });
 
@@ -413,6 +420,7 @@ describe('LineService — no Messaging client (design S-1)', () => {
         lineMessagingClientProvider,
         LineService,
         { provide: ConfigService, useValue: config },
+        { provide: AdminNotificationTriggers, useValue: disabledTriggers() },
       ],
     }).compile();
 
@@ -437,7 +445,7 @@ describe('LineService — no Messaging client (design S-1)', () => {
   });
 
   it('legacy methods REJECT (never throw synchronously) with NOT_CONFIGURED', async () => {
-    const service = new LineService(config, null);
+    const service = new LineService(config, null, disabledTriggers());
     const pushed = service.push('U', [TEXT]);
     expect(pushed).toBeInstanceOf(Promise);
     await expect(pushed).rejects.toMatchObject({ kind: 'NOT_CONFIGURED' });
@@ -458,5 +466,64 @@ describe('LineService — no Messaging client (design S-1)', () => {
     } as unknown as ConfigService;
     const client = lineMessagingClientProvider.useFactory(withToken);
     expect(client).toBeInstanceOf(messagingApi.MessagingApiClient);
+  });
+});
+
+describe('LineService — C1 (NOTIF-EVENTS-1)', () => {
+  const fake = { pushMessage: jest.fn(), multicast: jest.fn() };
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it('push() rethrows the IDENTICAL error object after firing the trigger', async () => {
+    const err = new LineCallError('RATE_LIMITED', 429);
+    fake.pushMessage.mockRejectedValue(err);
+    const lineDeliveryFailed = jest.fn().mockResolvedValue(undefined);
+    const service = new LineService(
+      config,
+      fake as unknown as messagingApi.MessagingApiClient,
+      { lineDeliveryFailed } as unknown as AdminNotificationTriggers,
+    );
+
+    await expect(service.push('U', [TEXT])).rejects.toBe(err);
+    expect(lineDeliveryFailed).toHaveBeenCalledWith({
+      operation: 'push',
+      kind: 'RATE_LIMITED',
+      status: 429,
+    });
+  });
+
+  it('push() AC-2 — still rejects with the SAME object when the trigger itself rejects (fail-safe)', async () => {
+    const err = new LineCallError('TRANSIENT', 500);
+    fake.pushMessage.mockRejectedValue(err);
+    const { triggers, create, warn } = rejectingTriggers(
+      {} as unknown as PrismaService,
+    );
+    const service = new LineService(
+      config,
+      fake as unknown as messagingApi.MessagingApiClient,
+      triggers,
+    );
+
+    await expect(service.push('U', [TEXT])).rejects.toBe(err);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('multicast() still resolves its outcome when the trigger rejects (fail-safe)', async () => {
+    fake.multicast.mockRejectedValue(httpError(500));
+    const { triggers, create } = rejectingTriggers(
+      {} as unknown as PrismaService,
+    );
+    const service = new LineService(
+      config,
+      fake as unknown as messagingApi.MessagingApiClient,
+      triggers,
+    );
+
+    const outcome = await service.multicast([`U${'a'.repeat(32)}`], [TEXT], {
+      retryKeySeed: SEED,
+    });
+    expect(outcome.failure).toMatchObject({ kind: 'TRANSIENT' });
+    expect(create).toHaveBeenCalledTimes(1);
   });
 });

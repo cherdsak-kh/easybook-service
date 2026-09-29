@@ -64,9 +64,12 @@ nothing else. Only the names in `REALTIME_NAMESPACE_ALLOWLIST` are served — in
 unconditionally-created default `/`, which is refused there; adding a `@WebSocketGateway` is *not*
 enough to make a namespace reachable, and that trip-wire is deliberate.
 - **`/admin`** (`RealtimeGateway`) — server→client only (**zero `@SubscribeMessage`**):
-  `lineUser.created` / `.updated` / `.deleted`, `bookingRequest.created` / `.updated`, plus
-  `session.closed`. Its handshake reuses the express session (`SessionIoAdapter`, installed in
-  `configureApp`) and namespace membership *is* the `SUPER_ADMIN|ADMIN` boundary — there are no rooms.
+  `lineUser.created` / `.updated` / `.deleted`, `bookingRequest.created` / `.updated`,
+  `adminNotification.created` (`NOTIF-RT-1`), plus `session.closed`. Its handshake reuses the express
+  session (`SessionIoAdapter`, installed in `configureApp`) and namespace membership *is* the
+  `SUPER_ADMIN|ADMIN` boundary for every event except `adminNotification.created` targeted at
+  `SUPER_ADMIN`: that one goes to one role room, `role:SUPER_ADMIN` (`ADMIN_SUPER_ROOM`), joined in
+  `handleConnection` and re-synced by the sweep — no other room exists.
 - **`/client`** (`ClientRealtimeGateway`, `CLIENT-REALTIME-1`) — the LIFF end-user side, which inverts
   every one of those choices on purpose. A LINE end-user has no session and no cookie, so the
   handshake verifies a **LINE ID token** through the *same* `verifyLineIdToken` the REST guard uses
@@ -269,14 +272,14 @@ two domains share **no session and no authentication surface**.
   duplicate the matrix into a guard. (Option-id *existence* checks are **validation**, not authz, and
   stay in the service: the policy has no Prisma and no I/O by design.)
 - **`PersonnelRole` is NOT `SystemRole`, and this is now sharper than it used to be.** A `SystemUser`
-  carries **BOTH**: `role: SystemRole` (the `SUPER_ADMIN | ADMIN | STAFF` RBAC **enum** — the *only*
+  carries **BOTH**: `role: SystemRole` (the `SUPER_ADMIN | ADMIN | VIEWER` RBAC **enum** — the *only*
   thing that grants privilege, read only by `RolesGuard` and `system-users.policy.ts`) **and**
   `personnelRole: PersonnelRole` (an admin-curated **job title row** that grants **nothing**, read only
   by a `select` that reaches a DTO). They are adjacent fields on one model, so the mistake is now
   *typeable*: **`PersonnelRole.name` must never appear in an authorization expression.** A
-  `PersonnelRole` named `"ADMIN"` is a string on a STAFF user who still gets 403 everywhere. Any future
+  `PersonnelRole` named `"ADMIN"` is a string on a VIEWER user who still gets 403 everywhere. Any future
   `if (user.personnelRole.name === 'ADMIN')` is a privilege-escalation bug — the AC-X3 cross-check in
-  `test/options.e2e-spec.ts` fails the build if one appears, and asserts `role: "STAFF"` and
+  `test/options.e2e-spec.ts` fails the build if one appears, and asserts `role: "VIEWER"` and
   `personnelRole.name: "ADMIN"` coexisting in one `/auth/system/me` body with RBAC winning.
 - **Staff avatars live in Cloudflare R2** (`src/storage/`), the **only** place `@aws-sdk/client-s3` is
   imported — mock `R2StorageService` in tests, never the SDK, and never hit real R2. Upload is a

@@ -1,5 +1,9 @@
 import { BadRequestException, ForbiddenException } from '@nestjs/common';
 import { AppAccess, FeedbackType, Prisma } from '@prisma/client';
+import {
+  disabledTriggers,
+  rejectingTriggers,
+} from '../notifications/triggers/triggers.test-kit';
 import { PrismaService } from '../prisma/prisma.service';
 import { R2StorageService } from '../storage/r2-storage.service';
 import type { CreateFeedbackDto } from './dto/feedback.dto';
@@ -72,6 +76,8 @@ describe('FeedbackService', () => {
   const feedback = {
     count: jest.fn<any, [CountArgs]>(),
     create: jest.fn<any, [CreateArgs]>(),
+    // Read by `AdminNotificationTriggers.feedbackSubmitted` (F1/F2), not by `FeedbackService` itself.
+    findUnique: jest.fn<any, [any]>(),
   };
   // The interactive form runs the callback against the same mocks, so the assertions below see the
   // statements the transaction would actually issue.
@@ -110,7 +116,7 @@ describe('FeedbackService', () => {
       Promise.resolve(createdRow(args)),
     );
     publicBaseUrl.mockReturnValue(BASE);
-    service = new FeedbackService(prisma, storage);
+    service = new FeedbackService(prisma, storage, disabledTriggers());
   });
 
   // ───────────────────────── who: the 403 ladder (AC-34, AC-35) ─────────────────────────
@@ -124,6 +130,25 @@ describe('FeedbackService', () => {
     // strings, so the wrong one type-checks perfectly and fails only at runtime, forever.
     expect(feedback.create.mock.calls[0][0].data.lineUserId).toBe(LINE_USER_ID);
     expect(feedback.create.mock.calls[0][0].data.lineUserId).not.toBe(SUB);
+  });
+
+  it('F1/F2 AC-2 — still resolves 201-shaped and the write still committed when the trigger rejects', async () => {
+    feedback.findUnique.mockResolvedValue({
+      code: 'ISS-20260920-001',
+      type: FeedbackType.ISSUE,
+      subject: dto().subject,
+      venue: null,
+      lineUser: { registration: null },
+    });
+    const { triggers, create, warn } = rejectingTriggers(prisma);
+    const svc = new FeedbackService(prisma, storage, triggers);
+
+    const result = await svc.create(SUB, dto());
+
+    expect(result.code).toMatch(/^ISS-/);
+    expect(feedback.create).toHaveBeenCalled();
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 
   it('treats a soft-deleted (unfollowed) user as absent — it is part of the `where`', async () => {

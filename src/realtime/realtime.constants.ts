@@ -3,7 +3,10 @@
  * the adapter and the specs can never disagree about a string.
  */
 
-import type { BookingStatus } from '@prisma/client';
+import type {
+  AdminNotificationTargetRole,
+  BookingStatus,
+} from '@prisma/client';
 
 /**
  * The admin fan-out namespace. Full connect target: `<backend origin>/admin`.
@@ -18,8 +21,9 @@ import type { BookingStatus } from '@prisma/client';
  * is `REALTIME_NAMESPACE_ALLOWLIST` below, sealed in `SessionIoAdapter`. AC B1 is that seal, not an
  * absence.
  *
- * There are **no rooms**: every socket here passed the same `SUPER_ADMIN|ADMIN` gate as
- * `GET /line-users`, so namespace membership IS the authorization boundary.
+ * Namespace membership is the authorization boundary for every event EXCEPT a SUPER_ADMIN-targeted
+ * `adminNotification.created`, which goes to {@link ADMIN_SUPER_ROOM} because an ADMIN socket passed
+ * the same gate but may not see it (`NOTIF-RT-1`).
  */
 export const REALTIME_ADMIN_NAMESPACE = '/admin';
 
@@ -42,7 +46,8 @@ export const REALTIME_ADMIN_NAMESPACE = '/admin';
  * on the handshake — and a LINE end-user has neither session nor cookie. Nothing about `/admin`,
  * `isRealtimeEligible` or `SessionIoAdapter`'s session chain changes to accommodate this.
  *
- * ⚠️ UNLIKE `/admin`, THIS NAMESPACE HAS ROOMS AND NEEDS THEM. Namespace membership here means only
+ * ⚠️ UNLIKE `/admin`, whose one role room serves a single event, THIS NAMESPACE'S ROOMS CARRY ITS
+ * WHOLE AUTHORIZATION. Namespace membership here means only
  * "an `ALLOWED` LINE user", which is nearly everybody — so it is NOT an authorization boundary.
  * `D-C13` (no request details on a shared channel) is enforced by {@link clientUserRoom} /
  * {@link clientVenueRoom} instead. See {@link CLIENT_SCHEDULE_ROOM} for the one shared room and the
@@ -107,7 +112,32 @@ export const REALTIME_EVENTS = {
   bookingRequestUpdated: 'bookingRequest.updated',
   /** Control plane — emitted immediately before the sweeper disconnects a socket. */
   sessionClosed: 'session.closed',
+  /**
+   * `NOTIF-RT-1` — a committed `AdminNotification` this socket's role may see. Payload:
+   * {@link AdminNotificationEventPayload}. Audience: see `audienceFor` in `realtime.gateway.ts` —
+   * `SUPER_ADMIN` targets go to {@link ADMIN_SUPER_ROOM} only.
+   */
+  adminNotificationCreated: 'adminNotification.created',
 } as const;
+
+/**
+ * The ONE room on `/admin`. It exists for one event only: a SUPER_ADMIN-targeted notification pulse
+ * (`NOTIF-RT-1`). Joined in `RealtimeGateway.handleConnection` and re-synced by the sweep. Do not add
+ * a second room without a design review.
+ */
+export const ADMIN_SUPER_ROOM = 'role:SUPER_ADMIN';
+
+/**
+ * `adminNotification.created`'s payload — a "refetch" pulse, NOT the notification.
+ * 🔴 NO title, body, code, tone, category, actionUrl or name. Ever. Titles and bodies carry names and
+ * phone numbers (PDPA); the REST feed is the only source of content, visibility and read state.
+ */
+export interface AdminNotificationEventPayload {
+  id: string;
+  targetRole: AdminNotificationTargetRole;
+  /** ISO-8601, `row.createdAt.toISOString()`. */
+  createdAt: string;
+}
 
 // ───────────────────────────── /client (CLIENT-REALTIME-1) ─────────────────────────────
 

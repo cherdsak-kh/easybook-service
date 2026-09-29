@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { SCHEDULING_ENABLED } from '../common/scheduling.constants';
 import { LineIdTokenGuard } from '../line/guards/line-id-token.guard';
 import { LineModule } from '../line/line.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { AdminBookingsService } from './admin-bookings.service';
 import { BookingExpiryCron } from './booking-expiry.cron';
@@ -70,7 +71,9 @@ import { LineBookingsController } from './line-bookings.controller';
  * because nothing outside the admin controller has any business approving a booking.
  */
 @Module({
-  imports: [RealtimeModule, LineModule],
+  // `NotificationsModule` — `NOTIF-EVENTS-1` (B1–B5): `BookingsService`, `AdminBookingsService` and
+  // `BookingExpiryCron` all inject `AdminNotificationTriggers`. A DI sink, so still acyclic.
+  imports: [RealtimeModule, LineModule, NotificationsModule],
   controllers: [LineBookingsController, BookingRequestsController],
   providers: [
     BookingsService,

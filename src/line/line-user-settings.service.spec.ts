@@ -1,5 +1,7 @@
 import { ConfigService } from '@nestjs/config';
 import { Test, TestingModule } from '@nestjs/testing';
+import { AdminNotificationTriggers } from '../notifications/triggers/admin-notification-triggers.service';
+import { disabledTriggers } from '../notifications/triggers/triggers.test-kit';
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { RedisService } from '../redis/redis.service';
@@ -79,6 +81,7 @@ describe('LineUserService — settings (Q-C9)', () => {
           provide: ConfigService,
           useValue: { get: jest.fn().mockReturnValue(null) },
         },
+        { provide: AdminNotificationTriggers, useValue: disabledTriggers() },
       ],
     }).compile();
     service = module.get<LineUserService>(LineUserService);

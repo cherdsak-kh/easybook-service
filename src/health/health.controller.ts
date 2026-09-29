@@ -5,6 +5,7 @@ import {
   ApiServiceUnavailableResponse,
   ApiTags,
 } from '@nestjs/swagger';
+import { NoErrorNotification } from '../notifications/triggers/no-error-notification.decorator';
 import { HealthResponseDto } from './dto/health-response.dto';
 import { HealthService } from './health.service';
 
@@ -18,6 +19,7 @@ import { HealthService } from './health.service';
  * the Redis session store.
  */
 @ApiTags('Health')
+@NoErrorNotification()
 @Controller('health')
 export class HealthController {
   constructor(private readonly health: HealthService) {}

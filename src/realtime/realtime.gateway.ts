@@ -1,6 +1,11 @@
 import { Inject, Logger, type OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { WebSocketGateway, type OnGatewayInit } from '@nestjs/websockets';
+import {
+  WebSocketGateway,
+  type OnGatewayConnection,
+  type OnGatewayInit,
+} from '@nestjs/websockets';
+import { SystemRole, type AdminNotificationTargetRole } from '@prisma/client';
 import { RedisStore } from 'connect-redis';
 import cookieParser from 'cookie-parser';
 import type { SessionData } from 'express-session';
@@ -14,9 +19,11 @@ import { PrismaService } from '../prisma/prisma.service';
 import { REDIS_CLIENT, SESSION_KEY_PREFIX } from '../redis/redis.constants';
 import { createSessionMiddleware } from '../session/session.middleware';
 import {
+  ADMIN_SUPER_ROOM,
   DEFAULT_WS_REVALIDATE_INTERVAL_MS,
   REALTIME_ADMIN_NAMESPACE,
   REALTIME_EVENTS,
+  type AdminNotificationEventPayload,
   type RealtimeActor,
   SESSION_CLOSED_REASONS,
   WS_SWEEP_BUDGET_MS,
@@ -49,6 +56,30 @@ export function resolveRevalidateIntervalMs(raw: string | undefined): number {
   return parsed;
 }
 
+/** Where an `adminNotification.created` pulse goes (`NOTIF-RT-1`). */
+export type AdminNotificationAudience =
+  { to: 'namespace' } | { to: 'room'; room: string };
+
+/** A `Record` over the enum, so a new `AdminNotificationTargetRole` member fails the BUILD here. */
+const ADMIN_NOTIFICATION_AUDIENCE: Record<
+  AdminNotificationTargetRole,
+  AdminNotificationAudience
+> = {
+  ALL: { to: 'namespace' },
+  ADMIN: { to: 'namespace' },
+  SUPER_ADMIN: { to: 'room', room: ADMIN_SUPER_ROOM },
+};
+
+/**
+ * `undefined` for a value outside the enum at RUNTIME, which the caller treats as "emit nothing"
+ * (fail closed). 🔴 There must be no default branch that broadcasts.
+ */
+export function audienceFor(
+  targetRole: AdminNotificationTargetRole,
+): AdminNotificationAudience | undefined {
+  return ADMIN_NOTIFICATION_AUDIENCE[targetRole];
+}
+
 /**
  * The back-office realtime fan-out.
  *
@@ -58,13 +89,13 @@ export function resolveRevalidateIntervalMs(raw: string | undefined): number {
  * is added and `CSRF_EXEMPT_PATHS` is untouched. The socket-shaped version of that threat (CSWSH)
  * gets its own control in `SessionIoAdapter`'s `allowRequest`.
  *
- * **No rooms.** Every socket in `/admin` cleared the same `SUPER_ADMIN|ADMIN` gate as
- * `GET /line-users`, so namespace membership IS the authorization boundary and every socket is
- * entitled to every event.
+ * **One room.** Namespace membership is the authorization boundary for every event except a
+ * SUPER_ADMIN-targeted `adminNotification.created`. That one goes to `ADMIN_SUPER_ROOM`, joined in
+ * `handleConnection` and kept true by the sweep (≤ 35 s after a role change) — `NOTIF-RT-1`.
  */
 @WebSocketGateway({ namespace: REALTIME_ADMIN_NAMESPACE })
 export class RealtimeGateway
-  implements OnGatewayInit<Namespace>, OnModuleDestroy
+  implements OnGatewayInit<Namespace>, OnGatewayConnection, OnModuleDestroy
 {
   private readonly logger = new Logger(RealtimeGateway.name);
 
@@ -119,6 +150,35 @@ export class RealtimeGateway
       clearInterval(this.sweepTimer);
       this.sweepTimer = undefined;
     }
+  }
+
+  /**
+   * Joins `ADMIN_SUPER_ROOM` when the connecting socket's role is SUPER_ADMIN (`NOTIF-RT-1`).
+   *
+   * 🔴 MUST STAY SYNCHRONOUS, NO `await` BEFORE THE JOIN. `Namespace._doConnect` runs
+   * `sockets.set(id)` → `socket._onconnect()` → the `connection` event SYNCHRONOUSLY, so the join
+   * happens in the same tick the socket becomes addressable — no emit (every emit runs from another
+   * async continuation) can interleave and reach a not-yet-joined socket. Follows the `/client`
+   * precedent (`client-realtime.gateway.ts`, rooms joined in `handleConnection`, not middleware).
+   */
+  handleConnection(socket: Socket): void {
+    const role = socketData(socket).role;
+    if (!role) {
+      // Unreachable (the middleware pins it with systemUserId). Fail CLOSED: no room; the next
+      // sweep re-syncs from the DB.
+      this.logger.warn(
+        `/admin socket connected without a role; not joining ${ADMIN_SUPER_ROOM}. socket=${socket.id}`,
+      );
+      return;
+    }
+    this.applyRoleRoom(socket, role);
+  }
+
+  /** SUPER_ADMIN → in the room; anything else → out. Idempotent. The ONLY writer of room membership. */
+  private applyRoleRoom(socket: Socket, role: SystemRole): void {
+    (socket.data as { role: SystemRole }).role = role;
+    if (role === SystemRole.SUPER_ADMIN) void socket.join(ADMIN_SUPER_ROOM);
+    else void socket.leave(ADMIN_SUPER_ROOM);
   }
 
   // ───────────────────────────────── emit surface ─────────────────────────────────
@@ -200,8 +260,17 @@ export class RealtimeGateway
    *
    * PII discipline: the log line carries the event name and `id=` only — never the DTO, never a
    * name or phone number.
+   *
+   * `room` is optional (`NOTIF-RT-1`): when given, the event goes to `namespace.to(room).emit(...)`
+   * instead of the whole namespace. The five pre-existing call sites never pass it, so they are
+   * unaffected by construction.
    */
-  private emit(event: string, payload: unknown, id: string): void {
+  private emit(
+    event: string,
+    payload: unknown,
+    id: string,
+    room?: string,
+  ): void {
     try {
       if (!this.namespace) {
         this.logger.warn(
@@ -209,7 +278,8 @@ export class RealtimeGateway
         );
         return;
       }
-      this.namespace.emit(event, payload);
+      if (room) this.namespace.to(room).emit(event, payload);
+      else this.namespace.emit(event, payload);
     } catch (error) {
       this.logger.warn(
         `Realtime emit failed (write already committed). event=${event} id=${id}: ${
@@ -217,6 +287,27 @@ export class RealtimeGateway
         }`,
       );
     }
+  }
+
+  /**
+   * `NOTIF-RT-1` — a "refetch" pulse for a committed `AdminNotification`. Sync, `void`, NEVER
+   * throws. `SUPER_ADMIN` targets go to `ADMIN_SUPER_ROOM` only (D-1); the payload carries no text
+   * (D-2/X-1).
+   */
+  emitAdminNotificationCreated(payload: AdminNotificationEventPayload): void {
+    const audience = audienceFor(payload.targetRole);
+    if (!audience) {
+      this.logger.warn(
+        `Realtime emit skipped (no audience for targetRole). event=${REALTIME_EVENTS.adminNotificationCreated} id=${payload.id}`,
+      );
+      return;
+    }
+    this.emit(
+      REALTIME_EVENTS.adminNotificationCreated,
+      payload,
+      payload.id,
+      audience.to === 'room' ? audience.room : undefined,
+    );
   }
 
   // ─────────────────────────── the revalidation sweep ───────────────────────────
@@ -233,7 +324,8 @@ export class RealtimeGateway
    *
    * **Stated maximum exposure window after a revoking write commits: 35 seconds** — a 30 s period
    * plus a 5 s execution budget. Applies uniformly to deletion, suspension, demotion, forced reset
-   * and logout.
+   * and logout. It also bounds how long a demoted SUPER_ADMIN stays in `ADMIN_SUPER_ROOM`
+   * (`NOTIF-RT-1`).
    *
    * `.unref()` so Jest never hangs on an open handle and `app.close()` always resolves.
    */
@@ -340,6 +432,10 @@ export class RealtimeGateway
    * Step 3 — dedupe by `systemUserId` and re-read the DATABASE: one indexed PK read per distinct
    * surviving user, never one per socket. Covers deletion, suspension, a forced password reset and
    * a demotion out of `{SUPER_ADMIN, ADMIN}` — the same predicate the handshake applied.
+   *
+   * `NOTIF-RT-1`: for every survivor it also re-syncs `socket.data.role` and `ADMIN_SUPER_ROOM`
+   * membership from the SAME read (no extra query), so a SUPER_ADMIN→ADMIN demotion leaves the room
+   * within the same 35 s window and an ADMIN→SUPER_ADMIN promotion joins it.
    */
   private async sweepByUser(sockets: Socket[]): Promise<void> {
     const byUser = groupBy(
@@ -356,6 +452,18 @@ export class RealtimeGateway
       const result = await resolveSystemUserById(this.prisma, systemUserId);
       if (!result.ok || !isRealtimeEligible(result.user)) {
         this.closeAll(group, SESSION_CLOSED_REASONS.revoked);
+        continue;
+      }
+
+      const role = result.user.role;
+      const changed = group.filter(
+        (socket) => socketData(socket).role !== role,
+      ).length;
+      for (const socket of group) this.applyRoleRoom(socket, role);
+      if (changed > 0) {
+        this.logger.log(
+          `Realtime role room re-synced. user=${systemUserId} role=${role} sockets=${changed}`,
+        );
       }
     }
   }

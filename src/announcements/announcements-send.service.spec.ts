@@ -16,6 +16,7 @@ import {
 } from '@prisma/client';
 import { bangkokClock, thaiShortDate } from '../bookings/booking-notifier';
 import * as announcementCard from '../line/announcement-card';
+import { disabledTriggers } from '../notifications/triggers/triggers.test-kit';
 import { LineCallError, type LineErrorKind } from '../line/line-call-error';
 import { LineService, type MulticastOutcome } from '../line/line.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -461,6 +462,7 @@ describe('AnnouncementsService — send / getLineBotInfo (ANNOUNCE-API-2)', () =
       const unconfigured = new LineService(
         { get: () => '' } as unknown as ConfigService,
         null,
+        disabledTriggers(),
       );
       const multicast = jest.spyOn(unconfigured, 'multicast');
       const svc = new AnnouncementsService(

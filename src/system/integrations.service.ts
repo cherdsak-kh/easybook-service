@@ -10,6 +10,7 @@ import { LineCredentialsService } from '../line/line-credentials.service';
 import { LineCallError } from '../line/line-call-error';
 import { LineService, type LineBotInfo } from '../line/line.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { HEALTH_LINE_KEY } from '../redis/cache-keys';
 import { RedisService } from '../redis/redis.service';
 import { R2StorageService } from '../storage/r2-storage.service';
 import type {
@@ -160,6 +161,10 @@ export class IntegrationsService {
       channelSecret,
       channelAccessToken,
     });
+    // Reports Phase 1 (D-8/AC-D20): `GET /system/health` caches the LINE probe for up to 300 s.
+    // Without this, a SUPER_ADMIN who just fixed a broken token would keep seeing the OLD token's
+    // cached DOWN status on the dashboard for up to five more minutes.
+    await this.redis.del(HEALTH_LINE_KEY);
     return {
       success: true,
       maskedChannelId: this.credentials.maskedChannelId(),

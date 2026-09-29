@@ -35,6 +35,8 @@ import {
   ApiTags,
   ApiUnauthorizedResponse,
 } from '@nestjs/swagger';
+import type { AuthenticatedSystemUser } from '../auth/auth.types';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { SessionGuard } from '../auth/guards/session.guard';
@@ -301,8 +303,14 @@ export class VenuesController {
   close(
     @Param('id') id: string,
     @Body() dto: CloseVenueDto,
+    @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<VenueResponseDto> {
-    return this.venues.close(id, dto.reason);
+    // C3 (`NOTIF-EVENTS-1`) — the acting operator, from the session `SessionGuard` already attached.
+    // No new query and no new role (design §2.4).
+    return this.venues.close(id, dto.reason, {
+      id: user.id,
+      name: `${user.firstName} ${user.lastName}`.trim(),
+    });
   }
 
   @Post(':id/reopen')
