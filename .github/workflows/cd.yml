@@ -123,5 +123,6 @@ jobs:
             done
             echo "Health check passed after ~${elapsed}s. Deploy of ${IMAGE_TAG} successful."
 
-            echo "== Image retention: prune dangling images only (never the running/rollback tag) =="
-            docker image prune -f
+            echo "== Image retention: prune unused images older than 72h + build cache =="
+            docker image prune -a -f --filter "until=72h"
+            docker builder prune -f

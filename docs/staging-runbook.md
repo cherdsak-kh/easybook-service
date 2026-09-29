@@ -279,11 +279,10 @@ green checkmark on a broken deploy. Possible states the server can be left in, a
 
 ## 5. Image retention / disk hygiene
 
-- **Server-side:** `cd.yml`'s deploy step ends with `docker image prune -f`,
-  which only removes dangling images (safe — never removes an image with a running container attached,
-  and does not touch the just-deployed or previous tag since both are referenced by a container or
-  a `docker pull`-ed, non-dangling tag). It intentionally does **not** run `docker image prune -a`,
-  which would happily delete the immediate rollback candidate.
+- **Server-side:** `cd.yml`'s deploy step ends with `docker image prune -a -f --filter "until=72h"`
+  and `docker builder prune -f`. This safely removes unused tagged images and build cache older
+  than 72 hours while preserving the currently running container and recent tags for immediate
+  rollback capability.
 - **GHCR-side:** GHCR has no automatic retention by default; images accumulate one per commit to
   `master` forever unless pruned. Recommended approach (not yet automated in this repo — flagging
   as a follow-up, not silently skipping it): a scheduled workflow using
