@@ -124,6 +124,12 @@ function weekdayOf({ year, month, day }: DateParts): number {
   return new Date(Date.UTC(year, month - 1, day)).getUTCDay();
 }
 
+/** ISO weekday, `1` = Monday … `7` = Sunday (Phase 2, design §2.1.2: heatmap cell indexing). */
+export function isoWeekdayOf(dateStr: string): number {
+  const dow = weekdayOf(requireDate(dateStr));
+  return dow === 0 ? 7 : dow;
+}
+
 /**
  * Mon–Fri, excluding the fixed summer break (D-10's `isSchoolDay`: 1 Apr – 15 May inclusive, every
  * year, month/day only — no admin-editable school calendar exists yet, OQ-6).
@@ -169,30 +175,53 @@ function windowInstant(
   );
 }
 
+/** Milliseconds per hour (Phase 2, design §2.1.2 — integer-ms accumulation). */
+export const HOUR_MS = 3_600_000;
+
+/** The real UTC instant of `dateStr`'s school-window START (08:30 Bangkok). Phase 2 heatmap cells. */
+export function schoolWindowStartMs(dateStr: string): number {
+  return windowInstant(dateStr, SCHOOL_WINDOW_START).getTime();
+}
+
 /**
- * The `slot`'s held hours inside `[fromStr, toStr]`, split per Bangkok day and clipped to
- * 08:30–16:30 on school days only (D-10, AC-R6). A slot fully or partly outside a school day, or
- * outside `[fromStr, toStr]`, contributes `0` for those days — never negative, never counted twice.
+ * One clipped, in-window segment of a slot on a single Bangkok school day (design §2.1.5). Only
+ * ever produced for a day inside `[fromStr, toStr]` that `isSchoolDay`, with `endMs > startMs`.
+ */
+export interface ClippedSegment {
+  date: string;
+  /** 1 (Monday) … 5 (Friday) — school days are never Sat/Sun, so this range is guaranteed. */
+  isoWeekday: number;
+  startMs: number;
+  endMs: number;
+}
+
+/**
+ * The `slot`'s clipped segments inside `[fromStr, toStr]`, one per Bangkok day it touches that is a
+ * school day, each clipped to 08:30–16:30 (D-10, AC-R6, AC-V9). A slot fully or partly outside a
+ * school day, or outside `[fromStr, toStr]`, contributes no segment for those days — never negative,
+ * never counted twice. `splitAndClip`/`splitAndClipMs` are both expressed on top of this (§2.1.2).
  *
  * Cross-midnight slots (E-6) are handled by construction: the loop walks every Bangkok day the slot
  * TOUCHES, from `bangkokDate(startAt)` to `bangkokDate(endAt − 1ms)` (half-open — an instant exactly
  * at `endAt` is not "in" the slot), and each day's contribution is clipped independently.
  */
-export function splitAndClip(
+export function clipToSchoolWindow(
   slot: { startAt: Date; endAt: Date },
   fromStr: string,
   toStr: string,
-): number {
-  if (compareDate(fromStr, toStr) > 0) return 0;
-  if (slot.endAt.getTime() <= slot.startAt.getTime()) return 0;
+): ClippedSegment[] {
+  if (compareDate(fromStr, toStr) > 0) return [];
+  if (slot.endAt.getTime() <= slot.startAt.getTime()) return [];
 
   const startDay = bangkokDate(slot.startAt);
   const endDay = bangkokDate(new Date(slot.endAt.getTime() - 1));
   if (inclusiveDays(startDay, endDay) > MAX_SPAN_DAYS) {
-    throw new Error('splitAndClip: slot spans an implausible number of days.');
+    throw new Error(
+      'clipToSchoolWindow: slot spans an implausible number of days.',
+    );
   }
 
-  let totalMs = 0;
+  const segments: ClippedSegment[] = [];
   let cur = startDay;
   while (compareDate(cur, endDay) <= 0) {
     if (
@@ -200,15 +229,69 @@ export function splitAndClip(
       compareDate(cur, toStr) <= 0 &&
       isSchoolDay(cur)
     ) {
-      const winStart = windowInstant(cur, SCHOOL_WINDOW_START).getTime();
+      const winStart = schoolWindowStartMs(cur);
       const winEnd = windowInstant(cur, SCHOOL_WINDOW_END).getTime();
       const clipStart = Math.max(slot.startAt.getTime(), winStart);
       const clipEnd = Math.min(slot.endAt.getTime(), winEnd);
-      if (clipEnd > clipStart) totalMs += clipEnd - clipStart;
+      if (clipEnd > clipStart) {
+        segments.push({
+          date: cur,
+          isoWeekday: isoWeekdayOf(cur),
+          startMs: clipStart,
+          endMs: clipEnd,
+        });
+      }
     }
     cur = addDays(cur, 1);
   }
-  return totalMs / 3_600_000;
+  return segments;
+}
+
+/** Integer-millisecond total of {@link clipToSchoolWindow}'s segments (design §2.1.2, §2.1.5). */
+export function splitAndClipMs(
+  slot: { startAt: Date; endAt: Date },
+  fromStr: string,
+  toStr: string,
+): number {
+  let totalMs = 0;
+  for (const seg of clipToSchoolWindow(slot, fromStr, toStr)) {
+    totalMs += seg.endMs - seg.startMs;
+  }
+  return totalMs;
+}
+
+/**
+ * The `slot`'s held HOURS inside `[fromStr, toStr]` (D-10, AC-R6). Re-expressed on top of
+ * {@link splitAndClipMs} (Phase 2, design §2.1.2) — signature and contract unchanged.
+ */
+export function splitAndClip(
+  slot: { startAt: Date; endAt: Date },
+  fromStr: string,
+  toStr: string,
+): number {
+  return splitAndClipMs(slot, fromStr, toStr) / HOUR_MS;
+}
+
+/**
+ * School-day counts per weekday Mon…Fri within `[fromStr, toStr]` inclusive (design §2.2, AC-V8).
+ * `schoolDaysByWeekday(...)[0]` is Monday, `[4]` is Friday. Σ = `schoolDaysIn(fromStr, toStr)`.
+ */
+export function schoolDaysByWeekday(fromStr: string, toStr: string): number[] {
+  const counts = [0, 0, 0, 0, 0];
+  if (compareDate(fromStr, toStr) > 0) return counts;
+  if (inclusiveDays(fromStr, toStr) > MAX_SPAN_DAYS) {
+    throw new Error(
+      'schoolDaysByWeekday: range too wide — caller must enforce REPORT_MAX_DAYS first.',
+    );
+  }
+  let cur = fromStr;
+  while (compareDate(cur, toStr) <= 0) {
+    if (isSchoolDay(cur)) {
+      counts[isoWeekdayOf(cur) - 1] += 1;
+    }
+    cur = addDays(cur, 1);
+  }
+  return counts;
 }
 
 /** One clipped calendar bucket. `partial` = the bucket's natural span was cut by `[fromStr, toStr]`. */

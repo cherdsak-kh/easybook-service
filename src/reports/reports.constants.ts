@@ -69,3 +69,16 @@ export const REPORT_VENUE_INVALID_MESSAGE =
   'The selected venue is not available.';
 export const REPORT_DEPARTMENT_INVALID_MESSAGE =
   'The selected department is not available.';
+
+/**
+ * Hub 2's 8×5 heatmap (design §2.1, D-15): 8 one-hour rows (08:30…15:30) × 5 weekday columns
+ * (Mon…Fri) = 40 cells, index `i = (isoWeekday - 1) * HEAT_SLOT_COUNT + j`, `j` = 0…7.
+ */
+export const HEAT_SLOT_COUNT = 8;
+export const HEAT_CELL_COUNT = 40;
+
+/** Hub 3's approval SLA (D-23/D-24): 24h, exactly-24h counts as WITHIN. */
+export const SLA_HOURS = 24;
+
+/** SLA bucket boundaries in hours: `< 2`, `2–<12`, `12–≤24`, `>24` (D-24). */
+export const SLA_BUCKET_BOUNDS_HOURS = [2, 12, 24] as const;

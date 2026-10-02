@@ -6,6 +6,7 @@ import type { App } from 'supertest/types';
 import { PasswordService } from '../src/auth/password.service';
 import { API_BASE_PATH } from '../src/common/api.constants';
 import { PrismaService } from '../src/prisma/prisma.service';
+import { bangkokMinutesOfDay } from '../src/reports/report-calendar';
 import {
   clearThrottleCounters,
   createE2eApp,
@@ -297,49 +298,83 @@ describe('Dashboard (e2e)', () => {
       expect(ours?.current?.remainingMinutes).toBeGreaterThanOrEqual(1);
     });
 
-    it('AC-D8: a FREE venue with a later slot today reports UNTIL_NEXT', async () => {
-      await purgeRows();
-      // re-create the two venues purged along with the booking rows above.
-      const typeId = (
-        await prisma.venueType.create({
-          data: { name: `${ROW_PREFIX}hall` },
-          select: { id: true },
-        })
-      ).id;
-      venueId = (
-        await prisma.venue.create({
-          data: {
-            name: `${ROW_PREFIX}main`,
-            venueTypeId: typeId,
-            capacity: 50,
-          },
-          select: { id: true },
-        })
-      ).id;
-      closedVenueId = (
-        await prisma.venue.create({
-          data: {
-            name: `${ROW_PREFIX}closed`,
-            venueTypeId: typeId,
-            capacity: 20,
-            isOpen: false,
-            closedReason: `${ROW_PREFIX}closed reason`,
-          },
-          select: { id: true },
-        })
-      ).id;
+    // AC-D8 needs a slot that is BOTH later than "now" AND still inside today's Bangkok day. The
+    // original fixture used a fixed `now + 2h .. now + 3h` offset, which crosses midnight once
+    // "now" is within ~2 hours of it (i.e. after ~22:00 Bangkok): the slot then starts TOMORROW,
+    // the service's today-only DB query (`startAt < todayEnd`) excludes it entirely, and
+    // REST_OF_DAY becomes the CORRECT answer for a venue that genuinely has no slot left today —
+    // not a product bug, a time-of-day-dependent fixture bug (the suite historically only ran
+    // around 15:00 Bangkok, which hid it). The fix scales the offset/duration to whatever is
+    // actually left of today, computed ONCE here (not re-derived inside the `it`, so the skip
+    // decision and the fixture agree): the slot always starts after "now" and ends well before
+    // midnight, at any wall-clock time. When there genuinely is not enough of today left to build
+    // one (< 10 minutes to Bangkok midnight — a ~0.7%-of-the-day window), the test is skipped with
+    // an explicit reason rather than silently faking a "later today" moment that cannot exist.
+    const minutesToBangkokMidnight = 24 * 60 - bangkokMinutesOfDay(new Date());
+    const runAcD8 = minutesToBangkokMidnight >= 10 ? it : it.skip;
+    const acD8OffsetMinutes = Math.max(
+      1,
+      Math.min(120, Math.floor(minutesToBangkokMidnight * 0.3)),
+    );
+    const acD8DurationMinutes = Math.max(
+      1,
+      Math.min(60, Math.floor(minutesToBangkokMidnight * 0.2)),
+    );
 
-      await seedBooking({
-        status: BookingStatus.APPROVED,
-        spans: [[2 * HOUR, 3 * HOUR]],
-      });
-      const body = (await get(ADMIN, '/dashboard/venues-live').expect(200))
-        .body as VenuesLiveBody;
-      const ours = body.venues.find((v) => v.id === venueId);
-      expect(ours?.state).toBe('FREE');
-      expect(ours?.freeWindow).toBe('UNTIL_NEXT');
-      expect(ours?.next?.startAt).toBeTruthy();
-    });
+    runAcD8(
+      'AC-D8: a FREE venue with a later slot today reports UNTIL_NEXT' +
+        (minutesToBangkokMidnight < 10
+          ? ' [SKIPPED: <10 minutes left before Bangkok midnight]'
+          : ''),
+      async () => {
+        await purgeRows();
+        // re-create the two venues purged along with the booking rows above.
+        const typeId = (
+          await prisma.venueType.create({
+            data: { name: `${ROW_PREFIX}hall` },
+            select: { id: true },
+          })
+        ).id;
+        venueId = (
+          await prisma.venue.create({
+            data: {
+              name: `${ROW_PREFIX}main`,
+              venueTypeId: typeId,
+              capacity: 50,
+            },
+            select: { id: true },
+          })
+        ).id;
+        closedVenueId = (
+          await prisma.venue.create({
+            data: {
+              name: `${ROW_PREFIX}closed`,
+              venueTypeId: typeId,
+              capacity: 20,
+              isOpen: false,
+              closedReason: `${ROW_PREFIX}closed reason`,
+            },
+            select: { id: true },
+          })
+        ).id;
+
+        await seedBooking({
+          status: BookingStatus.APPROVED,
+          spans: [
+            [
+              acD8OffsetMinutes * MINUTE,
+              (acD8OffsetMinutes + acD8DurationMinutes) * MINUTE,
+            ],
+          ],
+        });
+        const body = (await get(ADMIN, '/dashboard/venues-live').expect(200))
+          .body as VenuesLiveBody;
+        const ours = body.venues.find((v) => v.id === venueId);
+        expect(ours?.state).toBe('FREE');
+        expect(ours?.freeWindow).toBe('UNTIL_NEXT');
+        expect(ours?.next?.startAt).toBeTruthy();
+      },
+    );
   });
 
   describe('GET /dashboard/vitals — queue ordering (D-6, AC-D12)', () => {
