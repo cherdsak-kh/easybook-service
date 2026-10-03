@@ -17,17 +17,20 @@ test
 **/*.spec.ts
 **/*.e2e-spec.ts
 
-# Planning / docs / repo metadata — not part of the runtime artifact.
-claude_planning
+# Planning / docs / repo metadata — not part of the runtime artifact. `**/` is required for
+# nested files: .dockerignore globs do not recurse, so a bare `*.md` only matched the root.
+claude_planning/**
+docs/**
 .git
 .github
+.husky
 .claude
 .agents
-*.md
+**/*.md
 !README.md
 
 # Editor / OS cruft
-.vscode
+.vscode/**
 .idea
 *.log
 .DS_Store
