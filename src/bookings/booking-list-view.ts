@@ -137,6 +137,21 @@ export function requesterOf(row: {
   };
 }
 
+/**
+ * The id-level twin of `requesterOf()` above — the SAME "registration wins" branch, returning the
+ * effective `Department.id` instead of a display name (Reports Phase 2, design §2.3.1). Placed
+ * directly under `requesterOf()` so the two rules stay adjacent: a request's Hub 3 department row,
+ * its detail-dialog department name, and Hub 1's `?departmentId=` bucket can never disagree, because
+ * all three resolve through this one "registration first, else the override" rule.
+ */
+export function effectiveDepartmentIdOf(row: {
+  departmentId: number | null;
+  lineUser: { registration: { departmentId: number } | null } | null;
+}): number | null {
+  const reg = row.lineUser?.registration;
+  return reg ? reg.departmentId : row.departmentId;
+}
+
 function toSlotDto(slot: {
   id: string;
   startAt: Date;

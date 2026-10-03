@@ -61,6 +61,7 @@
     "connect-redis": "^8.1.0",
     "cookie-parser": "^1.4.7",
     "csrf-csrf": "^3.2.2",
+    "exceljs": "^4.4.0",
     "express-session": "^1.19.0",
     "ioredis": "^5.11.1",
     "morgan": "^1.11.0",
