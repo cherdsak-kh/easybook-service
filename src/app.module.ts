@@ -22,6 +22,7 @@ import { validateEnv } from './config/env.validation';
 import { CsrfModule } from './csrf/csrf.module';
 import { FeedbackModule } from './feedback/feedback.module';
 import { HealthModule } from './health/health.module';
+import { IncidentsModule } from './incidents/incidents.module';
 import { LineModule } from './line/line.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { OptionsModule } from './options/options.module';
@@ -82,6 +83,9 @@ const throttlerModule: DynamicModule = {
     }),
     PrismaModule,
     RedisModule,
+    // Hub 6 (Reports Phase 3): trace ids, incident capture, the Redis store. `@Global`, and right after
+    // `RedisModule` because it reads the shared client.
+    IncidentsModule,
     CsrfModule,
     throttlerModule,
     // One `forRoot()` per app, registered only outside jest — see `common/scheduling.constants.ts`.

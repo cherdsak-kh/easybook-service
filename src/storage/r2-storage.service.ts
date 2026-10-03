@@ -4,6 +4,7 @@ import {
   Injectable,
   InternalServerErrorException,
   Logger,
+  Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -14,6 +15,8 @@ import {
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
+import { IncidentRecorder } from '../incidents/incident-recorder.service';
+import { IncidentComponent } from '../incidents/incident.types';
 import {
   IMAGE_UPLOAD_FAILED,
   STORAGE_NOT_CONFIGURED,
@@ -105,7 +108,30 @@ export class R2StorageService {
   private readonly logger = new Logger(R2StorageService.name);
   private client?: S3Client;
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(
+    private readonly config: ConfigService,
+    // Hub 6. LAST and `@Optional()` so the existing spec (one argument) constructs unchanged.
+    @Optional() private readonly incidents?: IncidentRecorder,
+  ) {}
+
+  /**
+   * Hub 6: reports a failed R2 call, INCLUDING the ones this class swallows (`copyObject`,
+   * `deleteObject`). Names the operation and the first path segment of the key only (never the key,
+   * which is bucket content). Never throws and never changes what the caller sees.
+   */
+  private reportFailure(operation: string, error: unknown, key?: string): void {
+    // `s3()` throws this when R2 is simply not configured: a configuration state, not an outage.
+    if (error instanceof InternalServerErrorException) return;
+    this.incidents?.external({
+      component: IncidentComponent.CLOUDFLARE_R2,
+      operation,
+      error,
+      context: {
+        bucket: this.config.get<string>('R2_BUCKET'),
+        keyPrefix: key ? `${key.split('/')[0]}/` : undefined,
+      },
+    });
+  }
 
   /** True when all five R2 vars are set (env validation guarantees all-or-nothing). */
   isConfigured(): boolean {
@@ -250,6 +276,7 @@ export class R2StorageService {
       );
       return true;
     } catch (error) {
+      this.reportFailure('copyObject', error, toKey);
       this.logger.warn(
         `R2 copyObject failed (ignored). from=${fromKey} to=${toKey} reason=${error instanceof Error ? error.message : String(error)}`,
       );
@@ -418,6 +445,7 @@ export class R2StorageService {
       );
     } catch (error) {
       if (error instanceof InternalServerErrorException) throw error;
+      this.reportFailure('putImage', error, key);
       this.logger.error(
         `R2 putObject failed. key=${key} reason=${error instanceof Error ? error.message : String(error)}`,
       );
@@ -439,6 +467,7 @@ export class R2StorageService {
       );
       return true;
     } catch (error) {
+      this.reportFailure('deleteObject', error, key);
       this.logger.warn(
         `R2 deleteObject failed (ignored). key=${key} reason=${error instanceof Error ? error.message : String(error)}`,
       );
@@ -574,6 +603,7 @@ export class R2StorageService {
         dryRun,
       };
     } catch (error) {
+      this.reportFailure('sweepStagedPhotos', error);
       this.logger.error(
         `R2 staged-photo sweep failed after scanning ${scannedCount} object(s). reason=${error instanceof Error ? error.message : String(error)}`,
       );

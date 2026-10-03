@@ -1,5 +1,13 @@
-import { Inject, Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  Optional,
+} from '@nestjs/common';
 import type { Redis } from 'ioredis';
+import { IncidentRecorder } from '../incidents/incident-recorder.service';
+import { IncidentComponent } from '../incidents/incident.types';
 import {
   CACHE_KEY_PREFIX,
   CACHE_TTL_SECONDS,
@@ -42,7 +50,22 @@ export class RedisService implements OnModuleDestroy {
    */
   private readonly localClaims = new Map<string, number>();
 
-  constructor(@Inject(REDIS_CLIENT) private readonly client: Redis) {}
+  constructor(
+    @Inject(REDIS_CLIENT) private readonly client: Redis,
+    // Hub 6. LAST and `@Optional()` so the existing spec (one argument) constructs unchanged. Reports
+    // only; it never changes what any method here returns or throws.
+    @Optional() private readonly incidents?: IncidentRecorder,
+  ) {}
+
+  /** Hub 6: a command that FAILED while the client was `ready`. The key family only, never the key. */
+  private reportFailure(operation: string, error: unknown, key?: string): void {
+    this.incidents?.external({
+      component: IncidentComponent.REDIS,
+      operation,
+      error,
+      context: { keyPrefix: key ? key.split(':')[0] : undefined },
+    });
+  }
 
   async onModuleDestroy(): Promise<void> {
     try {
@@ -91,6 +114,7 @@ export class RedisService implements OnModuleDestroy {
       const raw = await this.client.get(CACHE_KEY_PREFIX + key);
       return raw === null ? null : (JSON.parse(raw) as T);
     } catch (error) {
+      this.reportFailure('getJson', error, key);
       // debug, not warn: this fires once per request for the whole outage, and the client has
       // already said so loudly at `error` level exactly once per retry.
       this.logger.debug(
@@ -122,6 +146,7 @@ export class RedisService implements OnModuleDestroy {
         ttlSeconds,
       );
     } catch (error) {
+      this.reportFailure('setJson', error, key);
       this.logger.debug(
         `Cache fill skipped. key=${key} reason=${error instanceof Error ? error.message : String(error)}`,
       );
@@ -146,6 +171,7 @@ export class RedisService implements OnModuleDestroy {
     try {
       await this.client.del(...keys.map((k) => CACHE_KEY_PREFIX + k));
     } catch (error) {
+      this.reportFailure('del', error, keys[0]);
       // warn, not debug: a stale key now outlives its invalidation by up to the full TTL, and
       // that is the shape of every "why does it still show the old name" report.
       this.logger.warn(
@@ -176,6 +202,7 @@ export class RedisService implements OnModuleDestroy {
         );
         return result === 'OK';
       } catch (error) {
+        this.reportFailure('claimOnce', error, key);
         this.logger.debug(
           `Notification claim fell back to memory. key=${key} reason=${error instanceof Error ? error.message : String(error)}`,
         );

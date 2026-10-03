@@ -1,6 +1,9 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { messagingApi } from '@line/bot-sdk';
+import { IncidentRecorder } from '../incidents/incident-recorder.service';
+import { LINE_SLOW_MS } from '../incidents/incidents.constants';
+import { IncidentComponent } from '../incidents/incident.types';
 import { AdminNotificationTriggers } from '../notifications/triggers/admin-notification-triggers.service';
 import {
   classifyLineError,
@@ -85,6 +88,9 @@ export class LineService {
     @Inject(LINE_MESSAGING_CLIENT)
     client: messagingApi.MessagingApiClient | null,
     private readonly triggers: AdminNotificationTriggers,
+    // Hub 6. LAST and `@Optional()` so the existing specs (1-3 arguments) construct unchanged; with it
+    // undefined every `observe` below is a plain call.
+    @Optional() private readonly incidents?: IncidentRecorder,
   ) {
     this.client = client;
     if (client === null) {
@@ -129,13 +135,30 @@ export class LineService {
     return this.client;
   }
 
+  /**
+   * Hub 6: runs one LINE call and reports a failure or a slow success to the incident recorder. It
+   * returns the same value and rethrows the SAME error object; with no recorder it is just `run()`.
+   */
+  private observe<T>(operation: string, run: () => Promise<T>): Promise<T> {
+    return this.incidents
+      ? this.incidents.track(
+          IncidentComponent.LINE_OA,
+          operation,
+          LINE_SLOW_MS,
+          run,
+        )
+      : run();
+  }
+
   // --- Messaging ---------------------------------------------------------
 
   async reply(
     replyToken: string,
     messages: messagingApi.Message[],
   ): Promise<unknown> {
-    return this.requireClient().replyMessage({ replyToken, messages });
+    return this.observe('reply', () =>
+      this.requireClient().replyMessage({ replyToken, messages }),
+    );
   }
 
   /**
@@ -145,7 +168,9 @@ export class LineService {
    */
   async push(to: string, messages: messagingApi.Message[]): Promise<unknown> {
     try {
-      return await this.requireClient().pushMessage({ to, messages });
+      return await this.observe('push', () =>
+        this.requireClient().pushMessage({ to, messages }),
+      );
     } catch (err) {
       const c = classifyLineError(err);
       // C1 (`NOTIF-EVENTS-1`) — fail-safe and deduped inside the trigger; never rejects.
@@ -217,6 +242,10 @@ export class LineService {
       const chunk = chunks[i];
       const key = lineRetryKey(options.retryKeySeed, chunk);
       let failure: MulticastFailure | null = null;
+      // Only read the clock when a recorder will use it: the existing specs pin `Date.now` call by call.
+      const chunkStartedAt = this.incidents ? Date.now() : 0;
+      let lastAttempt = 0;
+      let lastError: unknown;
 
       for (let attempt = 1; ; attempt++) {
         if (
@@ -232,15 +261,32 @@ export class LineService {
             client.multicast({ to: chunk, messages }, key),
             LINE_CALL_TIMEOUT_MS,
           );
+          lastAttempt = attempt;
           break;
         } catch (err) {
           const e = classifyLineError(err);
+          lastAttempt = attempt;
+          lastError = err;
           if (e.kind === 'ALREADY_ACCEPTED') break;
           if (e.kind === 'TRANSIENT' && attempt < 2) continue;
           failure = { chunkIndex: i, kind: e.kind, status: e.status };
           break;
         }
       }
+
+      // Hub 6: ONE report per logical chunk (attempts and total latency), after the chunk resolved. The
+      // recorder never throws, so it cannot change the outcome.
+      this.incidents?.external({
+        component: IncidentComponent.LINE_OA,
+        operation: 'multicast',
+        error:
+          failure !== null
+            ? (lastError ?? new Error('LINE multicast deadline exceeded'))
+            : undefined,
+        attempts: lastAttempt,
+        latencyMs: Date.now() - chunkStartedAt,
+        budgetMs: LINE_SLOW_MS,
+      });
 
       if (failure !== null) {
         this.logger.warn(
@@ -339,7 +385,9 @@ export class LineService {
   }
 
   async getProfile(userId: string): Promise<messagingApi.UserProfileResponse> {
-    return this.requireClient().getProfile(userId);
+    return this.observe('getProfile', () =>
+      this.requireClient().getProfile(userId),
+    );
   }
 
   // --- Rich menu management ---------------------------------------------
@@ -347,7 +395,9 @@ export class LineService {
   async createRichMenu(
     richMenu: messagingApi.RichMenuRequest,
   ): Promise<string> {
-    const { richMenuId } = await this.requireClient().createRichMenu(richMenu);
+    const { richMenuId } = await this.observe('createRichMenu', () =>
+      this.requireClient().createRichMenu(richMenu),
+    );
     return richMenuId;
   }
 
@@ -357,18 +407,24 @@ export class LineService {
     contentType = 'image/png',
   ): Promise<void> {
     const blob = new Blob([new Uint8Array(image)], { type: contentType });
-    await this.blobClient.setRichMenuImage(richMenuId, blob);
+    await this.observe('setRichMenuImage', () =>
+      this.blobClient.setRichMenuImage(richMenuId, blob),
+    );
   }
 
   async setDefaultRichMenu(richMenuId: string): Promise<unknown> {
-    return this.requireClient().setDefaultRichMenu(richMenuId);
+    return this.observe('setDefaultRichMenu', () =>
+      this.requireClient().setDefaultRichMenu(richMenuId),
+    );
   }
 
   async linkRichMenuToUser(
     userId: string,
     richMenuId: string,
   ): Promise<unknown> {
-    return this.requireClient().linkRichMenuIdToUser(userId, richMenuId);
+    return this.observe('linkRichMenuToUser', () =>
+      this.requireClient().linkRichMenuIdToUser(userId, richMenuId),
+    );
   }
 
   /**
@@ -384,11 +440,15 @@ export class LineService {
     richMenuId: string,
     userIds: string[],
   ): Promise<unknown> {
-    return this.requireClient().linkRichMenuIdToUsers({ richMenuId, userIds });
+    return this.observe('linkRichMenuToUsers', () =>
+      this.requireClient().linkRichMenuIdToUsers({ richMenuId, userIds }),
+    );
   }
 
   async listRichMenus(): Promise<messagingApi.RichMenuResponse[]> {
-    const { richmenus } = await this.requireClient().getRichMenuList();
+    const { richmenus } = await this.observe('listRichMenus', () =>
+      this.requireClient().getRichMenuList(),
+    );
     return richmenus;
   }
 
@@ -409,6 +469,8 @@ export class LineService {
   }
 
   async deleteRichMenu(richMenuId: string): Promise<unknown> {
-    return this.requireClient().deleteRichMenu(richMenuId);
+    return this.observe('deleteRichMenu', () =>
+      this.requireClient().deleteRichMenu(richMenuId),
+    );
   }
 }

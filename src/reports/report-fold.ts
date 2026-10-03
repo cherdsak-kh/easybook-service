@@ -393,3 +393,21 @@ export function occupancyOf(
     occupancyPercent: denominator > 0 ? (heldHours / denominator) * 100 : null,
   };
 }
+
+/** design §1.3's `effectiveDepartmentWhere` — mirrors `requesterOf()`'s "registration wins" rule exactly. */
+export function effectiveDepartmentWhere(
+  departmentId: number,
+): Prisma.BookingRequestWhereInput {
+  return {
+    OR: [
+      { lineUser: { is: { registration: { is: { departmentId } } } } },
+      {
+        departmentId,
+        OR: [
+          { lineUserId: null },
+          { lineUser: { is: { registration: { is: null } } } },
+        ],
+      },
+    ],
+  };
+}

@@ -9,6 +9,9 @@ import type { Redis } from 'ioredis';
 import { API_BASE_PATH } from './common/api.constants';
 import { resolveCorsOrigin } from './config/cors';
 import { CsrfService, csrfErrorHandler } from './csrf/csrf.service';
+import { IncidentRecorder } from './incidents/incident-recorder.service';
+import { createTraceMiddleware } from './incidents/trace.middleware';
+import { RequestMetrics } from './incidents/request-metrics';
 import { SessionIoAdapter } from './realtime/session-io.adapter';
 import { REDIS_CLIENT } from './redis/redis.constants';
 import {
@@ -34,6 +37,13 @@ export function configureApp(app: INestApplication): void {
   const config = app.get(ConfigService);
   const redis = app.get<Redis>(REDIS_CLIENT);
   const csrf = app.get(CsrfService);
+
+  // 0. Trace id, BEFORE CORS (Hub 6): every response, even a preflight, a session 503 or a CSRF 403,
+  //    carries `X-Request-Id`, and the trace context exists before every guard. Header-only: it never
+  //    writes, ends, delays or reads a response or a body.
+  app.use(
+    createTraceMiddleware(app.get(IncidentRecorder), app.get(RequestMetrics)),
+  );
 
   // 1. CORS first: preflight must not be intercepted, and error responses must carry CORS headers.
   //    With cookie sessions + `credentials: true` the allowlist is a security control, never `*`.

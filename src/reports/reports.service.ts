@@ -21,6 +21,7 @@ import {
   codedError,
   compareDate,
   disciplineOf,
+  effectiveDepartmentWhere,
   foldDiscipline,
   foldHeldMs,
   foldStatusCounts,
@@ -73,24 +74,6 @@ import {
   SCHOOL_DAY_HOURS,
 } from './reports.constants';
 import { weekBuckets } from './report-calendar';
-
-/** design §1.3's `effectiveDepartmentWhere` — mirrors `requesterOf()`'s "registration wins" rule exactly. */
-function effectiveDepartmentWhere(
-  departmentId: number,
-): Prisma.BookingRequestWhereInput {
-  return {
-    OR: [
-      { lineUser: { is: { registration: { is: { departmentId } } } } },
-      {
-        departmentId,
-        OR: [
-          { lineUserId: null },
-          { lineUser: { is: { registration: { is: null } } } },
-        ],
-      },
-    ],
-  };
-}
 
 // ── Hub 1 (unchanged selects — the R1/R2 read is the same read Hub 2/3 make via heldSlotWhere) ────
 

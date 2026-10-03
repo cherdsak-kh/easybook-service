@@ -139,6 +139,8 @@ async function bootstrap() {
           colorizeStatus(tokens.status(req, res)),
           pc.yellow(`${time} ms`),
           pc.dim(`- IP: ${ip}`),
+          // The trace id (`X-Request-Id`), so a log line joins its Hub 6 incident.
+          pc.dim(`rid=${String(res.getHeader('X-Request-Id') ?? '-')}`),
         ].join(' ');
       },
       {
