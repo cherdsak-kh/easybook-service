@@ -6,6 +6,10 @@ run-name: CI - ${{ github.ref_name }} staging (by @${{ github.actor }}) -- ${{ g
 on:
   push:
     branches: [master]
+    # Docs/planning-only pushes skip CI entirely — and therefore CD too (it fires on CI's
+    # `workflow_run`), so a README edit no longer redeploys byte-identical code to staging.
+    # push only, not pull_request: a filtered PR would leave required status checks pending.
+    paths-ignore: ['**/*.md', 'docs/**', 'claude_planning/**', '.vscode/**']
   pull_request:
     branches: [master]
 
@@ -38,8 +42,21 @@ jobs:
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?schema=public
 
+      - name: npm audit (fails the build — never auto-fixed here)
+        # High/critical vulnerabilities fail CI outright. Do NOT change this to `audit fix
+        # --force` in this workflow — that silently pulls in breaking major-version bumps.
+        # A real finding here is a devops/backend-dev decision, not something CI auto-resolves.
+        #
+        # Runs through audit-ci rather than bare `npm audit` so that documented, non-applicable
+        # transitive advisories can be allowlisted by id in .audit-ci.json without lowering the
+        # severity threshold for everything else. Matches easybook-app's audit gate convention.
+        # Runs before lint/typecheck/tests so a real advisory fails in seconds, not after Jest.
+        run: npx audit-ci --config .audit-ci.json
+
       - name: Lint
-        run: npm run lint
+        # lint:ci, NOT lint — `lint` carries `--fix`, which on this throwaway checkout would
+        # silently repair every auto-fixable violation and pass. lint:ci reports them instead.
+        run: npm run lint:ci
 
       - name: Typecheck
         run: npm run typecheck
@@ -49,17 +66,6 @@ jobs:
         env:
           DATABASE_URL: postgresql://ci:ci@localhost:5432/ci?schema=public
           REDIS_URL: redis://localhost:6379/0
-
-
-      - name: npm audit (fails the build — never auto-fixed here)
-        # High/critical vulnerabilities fail CI outright. Do NOT change this to `audit fix
-        # --force` in this workflow — that silently pulls in breaking major-version bumps.
-        # A real finding here is a devops/backend-dev decision, not something CI auto-resolves.
-        #
-        # Runs through audit-ci rather than bare `npm audit` so that documented, non-applicable
-        # transitive advisories can be allowlisted by id in .audit-ci.json without lowering the
-        # severity threshold for everything else. Matches easybook-app's audit gate convention.
-        run: npx audit-ci --config .audit-ci.json
 
 
   build-and-push:
@@ -114,8 +120,10 @@ jobs:
           # Immutable commit-SHA tag only — never `latest`. The CD workflow deploys this exact
           # tag, so a redeploy is always reproducible and traceable to a commit.
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Own scope per target: with the shared default scope, the migrator export below
+          # overwrote this one's cache manifest on every run.
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,mode=max,scope=runtime
 
       - name: Build & push migrator image (one-shot `prisma migrate deploy`)
         uses: docker/build-push-action@v5
@@ -124,5 +132,5 @@ jobs:
           target: migrator
           push: true
           tags: ghcr.io/${{ github.repository }}:${{ github.sha }}-migrator
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=migrator
+          cache-to: type=gha,mode=max,scope=migrator

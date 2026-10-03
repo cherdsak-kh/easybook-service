@@ -124,5 +124,7 @@ jobs:
             echo "Health check passed after ~${elapsed}s. Deploy of ${IMAGE_TAG} successful."
 
             echo "== Image retention: prune unused images older than 72h + build cache =="
-            docker image prune -a -f --filter "until=72h"
-            docker builder prune -f
+            # Best-effort housekeeping AFTER the health gate passed: under `set -e`, a busy
+            # daemon or prune lock would otherwise turn an already-healthy deploy red.
+            docker image prune -a -f --filter "until=72h" || true
+            docker builder prune -f || true
