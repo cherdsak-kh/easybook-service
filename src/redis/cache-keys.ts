@@ -181,3 +181,18 @@ export const HEALTH_R2_KEY = 'health:r2';
  * five minutes while an operator is actively trying to fix it and refreshing the page to check.
  */
 export const HEALTH_FAILURE_TTL_SECONDS = 60;
+
+/**
+ * Support-relay keys (`POST /system/support/incident`). LOGICAL names: `RedisService` prepends
+ * `SUPPORT_KEY_PREFIX`, so the real keys are `eb:support:incident-seq` and `eb:support:rate:<id>`.
+ *
+ * ⚠️ NOT cache keys, despite living in this file ("every key in one file"): neither is
+ * reconstructible from PostgreSQL and the sequence has no TTL, so they must never be reachable by
+ * `RedisService.del` (which only addresses `eb:cache:`).
+ *
+ * ⚠️ Debugging note: the real key prefix is `eb:support:…`, so `KEYS 'incident-seq'` finds nothing.
+ * The argument of `supportRateKey` is the `SystemUser.id` cuid.
+ */
+export const SUPPORT_INCIDENT_SEQ_KEY = 'incident-seq';
+export const supportRateKey = (systemUserId: string): string =>
+  `rate:${systemUserId}`;

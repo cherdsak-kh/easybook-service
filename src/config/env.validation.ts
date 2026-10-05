@@ -207,6 +207,14 @@ export function validateEnv(
     }
   }
 
+  /*
+   * `DISCORD_SUPPORT_WEBHOOK_URL` — the dev team's Discord webhook for `POST /system/support/incident`.
+   * OPTIONAL IN EVERY ENVIRONMENT, production included, and deliberately has NO error path here: an
+   * unset, blank or malformed value must never abort boot. `SupportRelayService` reads it per request
+   * and answers 503 SUPPORT_NOT_CONFIGURED (a malformed value logs one warning naming the variable,
+   * never the value). It is a CREDENTIAL — never echo it, not even in an error message.
+   */
+
   const sessionSecret = str(raw, 'SESSION_SECRET');
   const csrfSecret = str(raw, 'CSRF_SECRET');
   const cookieSecureRaw = str(raw, 'SESSION_COOKIE_SECURE');
