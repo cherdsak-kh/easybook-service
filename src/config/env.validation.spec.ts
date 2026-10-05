@@ -233,3 +233,32 @@ describe('validateEnv — API_EXTERNAL_URL', () => {
     ).not.toThrow();
   });
 });
+
+describe('validateEnv — DISCORD_SUPPORT_WEBHOOK_URL', () => {
+  it.each([
+    ['unset', undefined],
+    ['blank', '   '],
+    ['malformed', 'not a url'],
+    ['a sentinel', 'https://relay.invalid/hook'],
+  ])('never aborts boot when %s', (_label, value) => {
+    expect(() =>
+      validateEnv({ ...BASE, DISCORD_SUPPORT_WEBHOOK_URL: value }),
+    ).not.toThrow();
+  });
+
+  it('stays optional in production', () => {
+    expect(() =>
+      validateEnv({
+        ...BASE,
+        ...R2_OK,
+        NODE_ENV: 'production',
+        SESSION_SECRET: 'a'.repeat(32),
+        CSRF_SECRET: 'b'.repeat(32),
+        SESSION_COOKIE_SECURE: 'true',
+        CORS_ORIGIN: 'https://app.example.com',
+        LINE_LOGIN_CHANNEL_ID: '2006123442',
+        DISCORD_SUPPORT_WEBHOOK_URL: 'not a url',
+      }),
+    ).not.toThrow();
+  });
+});

@@ -13,6 +13,7 @@ import {
   CACHE_TTL_SECONDS,
   NOTIF_KEY_PREFIX,
   REDIS_CLIENT,
+  SUPPORT_KEY_PREFIX,
 } from './redis.constants';
 
 /**
@@ -210,6 +211,56 @@ export class RedisService implements OnModuleDestroy {
       }
     }
     return this.claimLocally(key, ttl);
+  }
+
+  /**
+   * `INCR eb:support:<key>` — a monotonic sequence with NO TTL (the support incident code). `null` when
+   * the client is not `ready` or the command fails: the caller picks a fallback, it never throws.
+   */
+  async incrementSequence(key: string): Promise<number | null> {
+    if (this.client.status !== 'ready') return null;
+    try {
+      return await this.client.incr(SUPPORT_KEY_PREFIX + key);
+    } catch (error) {
+      this.reportFailure('incrementSequence', error, key);
+      this.logger.debug(
+        `Sequence increment skipped. key=${key} reason=${error instanceof Error ? error.message : String(error)}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Fixed-window counter under `eb:support:`: `SET key 0 EX ttl NX` then `INCR`, in one `MULTI`, so the
+   * key never exists without a TTL (same shape as `RedisThrottlerStorage.increment`; needs no Redis 7
+   * `EXPIRE … NX`). Returns the post-increment count, or `null` when Redis is unavailable — the caller
+   * FAILS OPEN (the support channel matters most during an outage). NEVER throws.
+   */
+  async incrementWindow(
+    key: string,
+    ttlSeconds: number,
+  ): Promise<number | null> {
+    if (this.client.status !== 'ready') return null;
+    const ttl = Math.max(1, Math.floor(ttlSeconds));
+    const fullKey = SUPPORT_KEY_PREFIX + key;
+    try {
+      const results = await this.client
+        .multi()
+        .set(fullKey, 0, 'EX', ttl, 'NX')
+        .incr(fullKey)
+        .exec();
+      const incr = results?.[1];
+      if (!incr || incr[0]) {
+        throw incr?.[0] ?? new Error('MULTI returned no INCR result');
+      }
+      return typeof incr[1] === 'number' ? incr[1] : null;
+    } catch (error) {
+      this.reportFailure('incrementWindow', error, key);
+      this.logger.debug(
+        `Window increment skipped. key=${key} reason=${error instanceof Error ? error.message : String(error)}`,
+      );
+      return null;
+    }
   }
 
   /** The in-process fallback half of {@link claimOnce}. Prunes expired entries on every call. */

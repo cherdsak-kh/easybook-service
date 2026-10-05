@@ -69,3 +69,86 @@ describe('RedisService — claimOnce', () => {
     await expect(svc.claimOnce('a', 60)).resolves.toBe(false);
   });
 });
+
+/** Support relay primitives: both are NEVER-throw and answer `null` for "Redis unavailable". */
+describe('RedisService — incrementSequence / incrementWindow', () => {
+  const exec = jest.fn();
+  const chain = {
+    set: jest.fn().mockReturnThis(),
+    incr: jest.fn().mockReturnThis(),
+    exec,
+  };
+  const client = {
+    status: 'ready',
+    incr: jest.fn(),
+    multi: jest.fn(() => chain),
+  };
+
+  const service = () => new RedisService(client as never);
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    client.status = 'ready';
+  });
+
+  it('incrementSequence: INCR under eb:support: and returns the number', async () => {
+    client.incr.mockResolvedValue(43);
+    await expect(service().incrementSequence('incident-seq')).resolves.toBe(43);
+    expect(client.incr).toHaveBeenCalledWith('eb:support:incident-seq');
+  });
+
+  it('incrementSequence: not ready -> null without calling the client', async () => {
+    client.status = 'reconnecting';
+    await expect(
+      service().incrementSequence('incident-seq'),
+    ).resolves.toBeNull();
+    expect(client.incr).not.toHaveBeenCalled();
+  });
+
+  it('incrementSequence: a command error -> null, never a throw', async () => {
+    client.incr.mockRejectedValue(new Error('boom'));
+    await expect(
+      service().incrementSequence('incident-seq'),
+    ).resolves.toBeNull();
+  });
+
+  it('incrementWindow: SET 0 EX ttl NX then INCR in one MULTI, returns the INCR result', async () => {
+    exec.mockResolvedValue([
+      [null, 'OK'],
+      [null, 3],
+    ]);
+    await expect(service().incrementWindow('rate:u1', 600)).resolves.toBe(3);
+    expect(chain.set).toHaveBeenCalledWith(
+      'eb:support:rate:u1',
+      0,
+      'EX',
+      600,
+      'NX',
+    );
+    expect(chain.incr).toHaveBeenCalledWith('eb:support:rate:u1');
+  });
+
+  it('incrementWindow: not ready -> null', async () => {
+    client.status = 'end';
+    await expect(service().incrementWindow('rate:u1', 600)).resolves.toBeNull();
+    expect(client.multi).not.toHaveBeenCalled();
+  });
+
+  it('incrementWindow: exec rejects -> null', async () => {
+    exec.mockRejectedValue(new Error('boom'));
+    await expect(service().incrementWindow('rate:u1', 600)).resolves.toBeNull();
+  });
+
+  it('incrementWindow: a per-command error inside EXEC -> null', async () => {
+    exec.mockResolvedValue([
+      [null, 'OK'],
+      [new Error('WRONGTYPE'), null],
+    ]);
+    await expect(service().incrementWindow('rate:u1', 600)).resolves.toBeNull();
+  });
+
+  it('incrementWindow: a null EXEC (aborted transaction) -> null', async () => {
+    exec.mockResolvedValue(null);
+    await expect(service().incrementWindow('rate:u1', 600)).resolves.toBeNull();
+  });
+});

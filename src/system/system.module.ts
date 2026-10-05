@@ -4,6 +4,12 @@ import { LineModule } from '../line/line.module';
 import { StorageModule } from '../storage/storage.module';
 import { IntegrationsController } from './integrations.controller';
 import { IntegrationsService } from './integrations.service';
+import { SupportController } from './support.controller';
+import { SupportRelayService } from './support-relay.service';
+import {
+  FetchSupportWebhookTransport,
+  SupportWebhookTransport,
+} from './support-webhook.transport';
 import { SwaggerGateService } from './swagger-gate.service';
 import { SystemController } from './system.controller';
 import { SystemHealthController } from './system-health.controller';
@@ -31,8 +37,19 @@ import { SystemHealthService } from './system-health.service';
     SystemController,
     IntegrationsController,
     SystemHealthController,
+    SupportController,
   ],
-  providers: [SwaggerGateService, IntegrationsService, SystemHealthService],
+  providers: [
+    SwaggerGateService,
+    IntegrationsService,
+    SystemHealthService,
+    SupportRelayService,
+    // The outbound-HTTP seam: the e2e suite overrides this token so no test can reach Discord.
+    {
+      provide: SupportWebhookTransport,
+      useClass: FetchSupportWebhookTransport,
+    },
+  ],
   exports: [SwaggerGateService],
 })
 export class SystemModule {}

@@ -34,6 +34,15 @@ export const CACHE_TTL_SECONDS = 300;
 export const NOTIF_KEY_PREFIX = 'eb:notif:';
 
 /**
+ * Support-relay keyspace (`POST /system/support/incident`): the incident sequence (NO TTL) and the
+ * per-user rate window (600 s). DISJOINT from `eb:cache:` on purpose — that prefix means "300 s, no
+ * exceptions, DEL-reachable, reconstructible from PG", and a sequence must never expire and cannot
+ * be rebuilt from PostgreSQL. Same reasoning as `NOTIF_KEY_PREFIX`. Applied by `RedisService` itself.
+ * A Redis flush resets the sequence (codes restart at INC-1001): accepted, codes are references.
+ */
+export const SUPPORT_KEY_PREFIX = 'eb:support:';
+
+/**
  * Per-user index of live session ids (LOGIN-SESSIONS-1): `eb:user-sessions:<SystemUser.id>` → Set<sid>.
  * DISJOINT from `eb:sess:` on purpose: connect-redis SCANs `eb:sess:*` for ids()/all()/length()/clear(), and a Set
  * there would be returned as a fake sid and WRONGTYPE-fail `all()`'s MGET. Disjoint from `eb:cache:` because the
