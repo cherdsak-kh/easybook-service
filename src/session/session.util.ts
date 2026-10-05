@@ -4,7 +4,7 @@ import './session.types';
 
 const logger = new Logger('Session');
 
-const SESSION_STORE_UNAVAILABLE = 'Session store unavailable.';
+export const SESSION_STORE_UNAVAILABLE = 'Session store unavailable.';
 
 /**
  * Rotates the session id, discarding the old Redis key.

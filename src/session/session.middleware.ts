@@ -41,7 +41,7 @@ export const sessionCookieOptions = (config: ConfigService) => ({
   secure: isCookieSecure(config.get<string>('SESSION_COOKIE_SECURE')),
 });
 
-const sessionTtlSeconds = (config: ConfigService): number => {
+export const sessionTtlSeconds = (config: ConfigService): number => {
   const raw = Number(config.get<string>('SESSION_TTL_SECONDS'));
   return Number.isInteger(raw) && raw > 0 ? raw : DEFAULT_SESSION_TTL_SECONDS;
 };

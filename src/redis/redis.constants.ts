@@ -32,3 +32,14 @@ export const CACHE_TTL_SECONDS = 300;
  * Flagged for PO in the plan (Q-8); the default is to keep it disjoint rather than reuse `eb:cache:`.
  */
 export const NOTIF_KEY_PREFIX = 'eb:notif:';
+
+/**
+ * Per-user index of live session ids (LOGIN-SESSIONS-1): `eb:user-sessions:<SystemUser.id>` → Set<sid>.
+ * DISJOINT from `eb:sess:` on purpose: connect-redis SCANs `eb:sess:*` for ids()/all()/length()/clear(), and a Set
+ * there would be returned as a fake sid and WRONGTYPE-fail `all()`'s MGET. Disjoint from `eb:cache:` because the
+ * cache's write path is a DEL reachable by any caller. Written ONLY through `SessionTrackerService` on the raw client.
+ * Members are raw sids, i.e. bearer secrets: never log, return or KEYS/SCAN this family in app code.
+ */
+export const SESSION_INDEX_KEY_PREFIX = 'eb:user-sessions:';
+export const sessionIndexKey = (systemUserId: string): string =>
+  `${SESSION_INDEX_KEY_PREFIX}${systemUserId}`;

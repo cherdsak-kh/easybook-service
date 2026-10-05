@@ -31,6 +31,9 @@ import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { SessionGuard } from '../auth/guards/session.guard';
+import { RevokeSessionsResponseDto } from '../auth/sessions/dto/session.dto';
+import { StaffSessionSummaryDto } from '../auth/sessions/dto/staff-session-summary.dto';
+import { StaffSessionsService } from '../auth/sessions/staff-sessions.service';
 import { ErrorResponseDto } from '../common/dto/error-response.dto';
 import { CreateSystemUserDto } from './dto/create-system-user.dto';
 import { ListSystemUsersQueryDto } from './dto/list-system-users-query.dto';
@@ -66,7 +69,10 @@ const actorOf = (user: AuthenticatedSystemUser): Actor => ({
 @Controller('system-users')
 @UseGuards(SessionGuard, RolesGuard)
 export class SystemUsersController {
-  constructor(private readonly systemUsers: SystemUsersService) {}
+  constructor(
+    private readonly systemUsers: SystemUsersService,
+    private readonly staffSessions: StaffSessionsService,
+  ) {}
 
   @Post()
   @Roles(SystemRole.SUPER_ADMIN)
@@ -343,5 +349,80 @@ export class SystemUsersController {
     @Param('id') id: string,
   ): Promise<SystemUserWithTemporaryPasswordDto> {
     return this.systemUsers.resetPassword(actorOf(actor), id);
+  }
+
+  // LOGIN-SESSIONS-1. `GET :id/sessions` (3 segments) cannot collide with `GET :id` (2), and these are
+  // distinct third-segment literals beside `:id/restore` / `:id/reset-password`.
+  @Get(':id/sessions')
+  @Roles(SystemRole.SUPER_ADMIN)
+  @ApiOperation({
+    summary: "A user's live-session count and last sign-in (SUPER_ADMIN).",
+    description:
+      'Returns the number of live sessions (always 0 for a suspended account, which makes no Redis call), the last successful sign-in (device · time · IP, from the 90-day login history, falling back to `lastLoginAt` alone) and the time of the latest forced sign-out. The actor of a forced sign-out is never returned. Reading your own row is allowed. A soft-deleted id is a 404 identical to one that never existed.',
+  })
+  @ApiOkResponse({
+    description: 'The session summary.',
+    type: StaffSessionSummaryDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'No session.',
+    type: ErrorResponseDto,
+  })
+  @ApiForbiddenResponse({
+    description: 'Not a SUPER_ADMIN, or a password change is required.',
+    type: ErrorResponseDto,
+  })
+  @ApiNotFoundResponse({
+    description: 'Unknown or soft-deleted id.',
+    type: ErrorResponseDto,
+  })
+  @ApiServiceUnavailableResponse({
+    description: 'Session store unavailable.',
+    type: ErrorResponseDto,
+  })
+  sessionSummary(@Param('id') id: string): Promise<StaffSessionSummaryDto> {
+    return this.staffSessions.summary(id);
+  }
+
+  // @HttpCode(200) is MANDATORY — Nest defaults POST to 201 and this creates nothing.
+  @Post(':id/revoke-sessions')
+  @HttpCode(200)
+  @Roles(SystemRole.SUPER_ADMIN)
+  @ApiOperation({
+    summary: "Force sign-out of every one of a user's devices (SUPER_ADMIN).",
+    description:
+      "Ends EVERY live session of the target, including the one it is using now. It is NOT a suspension: `isActive` is untouched and the target can sign in again with the same password. Idempotent: with no live session it is a 200 with `revoked: 0` and writes nothing. When at least one session was ended, exactly one FORCE_REVOKED row is written to the target's login history (the actor is stored, never exposed to the target). You cannot force sign-out your own account (400): use `DELETE /auth/system/sessions/others`. A SUPER_ADMIN may force a peer SUPER_ADMIN, or their own creator. A suspended target is a valid target.",
+  })
+  @ApiHeader({ name: 'x-csrf-token', required: true })
+  @ApiOkResponse({
+    description: 'How many live sessions were ended.',
+    type: RevokeSessionsResponseDto,
+  })
+  @ApiBadRequestResponse({
+    description: 'The target is the caller.',
+    type: ErrorResponseDto,
+  })
+  @ApiUnauthorizedResponse({
+    description: 'No session.',
+    type: ErrorResponseDto,
+  })
+  @ApiForbiddenResponse({
+    description:
+      'Not a SUPER_ADMIN; CSRF failure; or a password change is required.',
+    type: ErrorResponseDto,
+  })
+  @ApiNotFoundResponse({
+    description: 'Unknown or soft-deleted id.',
+    type: ErrorResponseDto,
+  })
+  @ApiServiceUnavailableResponse({
+    description: 'Session store unavailable. Nothing was revoked.',
+    type: ErrorResponseDto,
+  })
+  revokeSessions(
+    @CurrentUser() actor: AuthenticatedSystemUser,
+    @Param('id') id: string,
+  ): Promise<RevokeSessionsResponseDto> {
+    return this.staffSessions.forceRevoke(actorOf(actor), id);
   }
 }

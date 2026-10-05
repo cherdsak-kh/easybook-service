@@ -704,6 +704,12 @@ model SystemUser {
   /// hard-deleted user. Never resolved as history.
   notificationReceipts AdminNotificationReceipt[] @relation("AdminNotificationReceiptOwner")
 
+  /// This account's login history (LOGIN-SESSIONS-1). Cascade-deleted with a hard-deleted user (PDPA).
+  loginLogs SystemUserLoginLog[] @relation("SystemUserLoginLogs")
+
+  /// FORCE_REVOKED rows this SUPER_ADMIN caused, against OTHER accounts. HISTORY: SetNull on hard delete.
+  forcedLogouts SystemUserLoginLog[] @relation("SystemUserLoginLogActor")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -718,6 +724,71 @@ model SystemUser {
   @@index([isActive])
   @@index([lastName, firstName])
   @@map("system_users")
+}
+
+/// Outcome of one sign-in-related event on a back-office account (LOGIN-SESSIONS-1).
+/// A closed, presentational set, so it is an enum (`AdminNotificationTone` precedent). A new kind is a design change
+/// and should cost a migration.
+///   SUCCESS              — POST /auth/system/login created a session.
+///   FAILED_BAD_PASSWORD  — the email matched a SystemUser row, and the login was rejected (wrong password, OR the
+///                          account is suspended/deleted. The three are deliberately indistinguishable, R-8).
+///                          Unknown emails are NEVER persisted (OQ-6 ruling, 2026-10-04).
+///   FORCE_REVOKED        — a SUPER_ADMIN ended every session of this account (POST /system-users/:id/revoke-sessions)
+///                          and at least one was live. Self-service revocations (E2/E3) and logout are NOT logged.
+enum LoginEventStatus {
+  SUCCESS
+  FAILED_BAD_PASSWORD
+  FORCE_REVOKED
+}
+
+/// Login history of one back-office account (LOGIN-SESSIONS-1). The data behind
+/// GET /auth/system/login-history (own rows only) and the last-login line of GET /system-users/:id/sessions.
+///
+/// IMMUTABLE AFTER INSERT. Written only by `LoginLogService` (login success, recognised-account failure, force
+/// sign-out). Deleted only by `LoginLogPurgeCron` (createdAt < now − 90 d) and by a SystemUser hard delete (Cascade).
+/// Every READ also filters createdAt >= now − 90 d, so a late purge can never surface a 91-day row (AC-19).
+///
+/// PDPA: ipAddress + userAgent are personal data. Purpose: account security. Retention: 90 days. NEVER exported by any
+/// report, never an incident, never part of ประวัติการทำรายการ (GET /reports/activity). Never log a row's IP/UA.
+model SystemUserLoginLog {
+  id String @id @default(cuid())
+
+  /// The account the event is ABOUT, for FORCE_REVOKED too (it is the target, OQ-7). REQUIRED: unknown emails get no
+  /// row (OQ-6). `Cascade`: the history is the user's own personal data and goes with a hard-deleted user
+  /// (AUTH-ERASURE). Users are normally soft-deleted, so in production this fires only for the e2e fixture purge, which
+  /// a `Restrict` here would BREAK in every suite.
+  systemUserId String
+  systemUser   SystemUser @relation("SystemUserLoginLogs", fields: [systemUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  status LoginEventStatus
+
+  /// `resolveIp(req)` at the time of the event, truncated to 64 chars. NULL for FORCE_REVOKED: the actor's address
+  /// is not the target's business (R-10).
+  ipAddress String?
+
+  /// Raw User-Agent, control characters stripped, truncated to 512 chars. Parsed at READ time by `parseUserAgent`
+  /// (no parsed columns: one parser for live sessions and history alike). NULL for FORCE_REVOKED.
+  userAgent String?
+
+  /// SUCCESS rows only: the opaque session HANDLE (never the raw sid) of the session this login created. Lets E4 mark
+  /// "· อุปกรณ์นี้" (OQ-9). Never returned on the wire; E4 returns a boolean.
+  sessionRef String?
+
+  /// FORCE_REVOKED rows only: the SUPER_ADMIN who acted (OQ-7). Never exposed to the target. `SetNull`: a hard-deleted
+  /// actor keeps the row.
+  actorId String?
+  actor   SystemUser? @relation("SystemUserLoginLogActor", fields: [actorId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  createdAt DateTime @default(now())
+
+  /// E4: WHERE systemUserId = $me AND createdAt >= $cutoff ORDER BY createdAt DESC, id DESC. Also E5's latest
+  /// SUCCESS / FORCE_REVOKED lookups, and the scan the Cascade performs.
+  @@index([systemUserId, createdAt, id])
+  /// The daily purge: DELETE … WHERE createdAt < $cutoff.
+  @@index([createdAt])
+  /// The scan the SetNull FK performs on an actor hard delete (FeedbackLog.authorId precedent).
+  @@index([actorId])
+  @@map("system_user_login_logs")
 }
 
 /// Lifecycle of a BookingRequest (D-C13, PO 2026-08-26; `EXPIRED` added by #ISSUE-06, PO 2026-09-14).

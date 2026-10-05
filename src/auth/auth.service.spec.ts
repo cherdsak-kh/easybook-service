@@ -5,6 +5,7 @@ import { AuthService } from './auth.service';
 import { INVALID_CREDENTIALS } from './auth.constants';
 import { loginIpEmailKey } from './login-throttle.key';
 import { PasswordService } from './password.service';
+import { LoginLogService } from './sessions/login-log.service';
 
 /** Captures a rejected `HttpException` as a plain, comparable value. */
 const captureHttpError = async (
@@ -41,6 +42,7 @@ describe('AuthService', () => {
   const update = jest.fn();
   const del = jest.fn();
   const verify = jest.fn();
+  const recordFailure = jest.fn();
 
   const prisma = {
     systemUser: { findUnique, update },
@@ -50,10 +52,12 @@ describe('AuthService', () => {
     dummyHash: () => Promise.resolve(DUMMY_HASH),
   } as unknown as PasswordService;
   const redis = { del } as unknown as import('ioredis').Redis;
+  const loginLog = { recordFailure } as unknown as LoginLogService;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    service = new AuthService(prisma, password, redis);
+    recordFailure.mockResolvedValue(undefined);
+    service = new AuthService(prisma, password, redis, loginLog);
   });
 
   describe('validateCredentials', () => {
@@ -158,6 +162,102 @@ describe('AuthService', () => {
       expect(logged).toContain('ada@easybook.local');
       expect(logged).toContain(IP);
       expect(logged).not.toContain('hunter2');
+    });
+  });
+
+  // LOGIN-SESSIONS-1 / AC-17, AC-18 — the failed-login row is fire-and-forget (R-8).
+  describe('failed-login recording', () => {
+    const UA = 'Mozilla/5.0 (X11; Linux x86_64) Firefox/129.0';
+
+    it.each([
+      ['wrong password', activeUser],
+      ['suspended user', { ...activeUser, isActive: false }],
+      ['soft-deleted user', { ...activeUser, deletedAt: new Date() }],
+    ])(
+      'records one failure for a matched account — %s — with the ip and ua',
+      async (_label, row) => {
+        findUnique.mockResolvedValue(row);
+        verify.mockResolvedValue(false);
+
+        await expect(
+          service.validateCredentials('ada@easybook.local', 'x', IP, UA),
+        ).rejects.toThrow(UnauthorizedException);
+
+        expect(recordFailure).toHaveBeenCalledTimes(1);
+        expect(recordFailure).toHaveBeenCalledWith('user-1', IP, UA);
+      },
+    );
+
+    it('records NOTHING for an unknown email (OQ-6)', async () => {
+      findUnique.mockResolvedValue(null);
+      verify.mockResolvedValue(false);
+
+      await expect(
+        service.validateCredentials('nobody@easybook.local', 'x', IP, UA),
+      ).rejects.toThrow(UnauthorizedException);
+
+      expect(recordFailure).not.toHaveBeenCalled();
+    });
+
+    it('defaults the user agent to an empty string when the caller passes none', async () => {
+      findUnique.mockResolvedValue(activeUser);
+      verify.mockResolvedValue(false);
+
+      await expect(
+        service.validateCredentials('ada@easybook.local', 'x', IP),
+      ).rejects.toThrow(UnauthorizedException);
+
+      expect(recordFailure).toHaveBeenCalledWith('user-1', IP, '');
+    });
+
+    it.each([
+      ['wrong password', activeUser],
+      ['suspended user', { ...activeUser, isActive: false }],
+    ])(
+      'still rejects 401 promptly when the insert NEVER settles — %s (R-8: nothing is awaited)',
+      async (_label, row) => {
+        findUnique.mockResolvedValue(row);
+        verify.mockResolvedValue(false);
+        recordFailure.mockReturnValue(new Promise(() => undefined));
+
+        await expect(
+          captureHttpError(
+            service.validateCredentials('ada@easybook.local', 'x', IP, UA),
+          ),
+        ).resolves.toEqual({ status: 401, message: INVALID_CREDENTIALS });
+      },
+    );
+
+    it('answers the same message and does the same verify work on every rejection branch (AC-18)', async () => {
+      const branches: unknown[] = [
+        null,
+        { ...activeUser, deletedAt: new Date() },
+        { ...activeUser, isActive: false },
+        activeUser,
+      ];
+      const seen: Array<{
+        status: number;
+        message: unknown;
+        verifies: number;
+      }> = [];
+
+      for (const row of branches) {
+        jest.clearAllMocks();
+        recordFailure.mockResolvedValue(undefined);
+        findUnique.mockResolvedValue(row);
+        verify.mockResolvedValue(false);
+        const result = await captureHttpError(
+          service.validateCredentials('ada@easybook.local', 'x', IP, UA),
+        );
+        seen.push({ ...result, verifies: verify.mock.calls.length });
+      }
+
+      expect(new Set(seen.map((s) => JSON.stringify(s))).size).toBe(1);
+      expect(seen[0]).toEqual({
+        status: 401,
+        message: INVALID_CREDENTIALS,
+        verifies: 1,
+      });
     });
   });
 

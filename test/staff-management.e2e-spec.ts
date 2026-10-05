@@ -300,7 +300,7 @@ describe('Staff Management (e2e)', () => {
         .expect(200);
 
       // Same agent, same cookie, no re-login: SessionGuard's per-request DB re-read is what makes
-      // this work — and is why no session-revocation machinery exists.
+      // this work (no re-login needed).
       // Assert on `/auth/system/me`, which is one of the six routes the gate exempts.
       const me = await agent.get(url('/auth/system/me')).expect(200);
       expect((me.body as UserBody).mustChangePassword).toBe(false);

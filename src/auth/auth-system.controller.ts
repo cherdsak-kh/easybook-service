@@ -69,6 +69,10 @@ import {
   LOGIN_IP_THROTTLER,
   resolveIp,
 } from './login-throttle.key';
+import { IP_MAX_LENGTH } from './sessions/sessions.constants';
+import { LoginLogService } from './sessions/login-log.service';
+import { SessionTrackerService } from './sessions/session-tracker.service';
+import { sanitizeUa } from './sessions/user-agent';
 
 /**
  * Back-office authentication actions. Route prefix: `/api/v1/auth/system`.
@@ -76,7 +80,8 @@ import {
  * **STANDING RULE: this controller has NO parameterised route, and must never gain one.** Every path
  * is a literal (`csrf`, `login`, `logout`, `me`, `password`, `me/avatar`), so nothing can shadow
  * anything (`GET me` and `PATCH me` differ by method). If a `@Get(':id')`-style route is ever needed
- * here, it MUST be declared after every literal — otherwise it swallows them.
+ * here, it MUST be declared after every literal — otherwise it swallows them. Session routes that need a
+ * parameter live in `AuthSessionsController` for exactly this reason.
  *
  * **The forced-reset gate:** `@AllowPasswordChangeGate()` marks the EXACTLY THREE session-guarded
  * handlers that stay reachable while `mustChangePassword` is true — `logout`, `GET me`,
@@ -93,6 +98,8 @@ export class AuthSystemController {
     private readonly config: ConfigService,
     private readonly systemUsers: SystemUsersService,
     private readonly avatars: AvatarUploadService,
+    private readonly tracker: SessionTrackerService,
+    private readonly loginLog: LoginLogService,
   ) {}
 
   @Get('csrf')
@@ -148,12 +155,23 @@ export class AuthSystemController {
     @Body() dto: LoginDto,
     @Req() req: Request,
   ): Promise<LoginResponseDto> {
-    const ip = resolveIp(req);
+    // `throttleIp` is what `LoginThrottleGuard` keyed on; `ip` is the same value clipped for storage
+    // (LOGIN-SESSIONS-1). They differ only for an address longer than 64 chars, which cannot happen.
+    const throttleIp = resolveIp(req);
+    const ip = throttleIp.slice(0, IP_MAX_LENGTH);
+    const userAgent = sanitizeUa(req.get('user-agent'));
     const user = await this.auth.validateCredentials(
       dto.email,
       dto.password,
       ip,
+      userAgent,
     );
+
+    // The session this login replaces, if the request already carried a signed-in one. Captured BEFORE
+    // regenerate() destroys the old key, so its index entry can be removed in the same MULTI.
+    const previous = req.session?.systemUserId
+      ? { userId: req.session.systemUserId, sid: req.sessionID }
+      : null;
 
     // Session fixation defence (AC-8): rotate the id BEFORE assigning, because regenerate()
     // wipes the session payload. Then save() explicitly, so a Redis outage surfaces as 503
@@ -161,10 +179,21 @@ export class AuthSystemController {
     await regenerateSession(req);
     req.session.systemUserId = user.id;
     req.session.createdAt = Date.now();
+    // Descriptive only (the sessions page) — never an authentication input.
+    req.session.ip = ip;
+    req.session.userAgent = userAgent;
     await saveSession(req);
 
+    // Both best-effort and never throw: the session is already saved, and prune-on-read heals the index.
+    await this.tracker.track(user.id, req.sessionID, previous);
     await this.auth.touchLastLogin(user.id);
-    await this.auth.clearLoginThrottle(ip, dto.email);
+    await this.loginLog.recordSuccess(
+      user.id,
+      ip,
+      userAgent,
+      this.tracker.handleOf(req.sessionID),
+    );
+    await this.auth.clearLoginThrottle(throttleIp, dto.email);
 
     return user;
   }
@@ -201,8 +230,12 @@ export class AuthSystemController {
   async logout(
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
+    @CurrentUser() user: AuthenticatedSystemUser,
   ): Promise<{ success: true }> {
+    // Captured first: destroy() clears the session object. Logging out is not written to the login log.
+    const sid = req.sessionID;
     await destroySession(req);
+    await this.tracker.untrack(user.id, sid); // best-effort — never throws
     // The clear options must mirror the set options or the browser ignores them.
     res.clearCookie(
       sessionCookieName(this.config),
