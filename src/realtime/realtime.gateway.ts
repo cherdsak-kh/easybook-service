@@ -316,15 +316,16 @@ export class RealtimeGateway
    * **Fact E's resolution.** A socket has no next request, so a suspended, demoted or soft-deleted
    * admin would otherwise keep receiving PII until they closed the tab.
    *
-   * This is NOT new revocation machinery: there is no token-version column, no
-   * `userId → sessionIds` index, no revocation list. The existing model — "the DB is the authority;
-   * re-read it" — is preserved verbatim. Only the *trigger* changes: for HTTP it is the next
-   * request, for a socket it is this timer, and the predicate is the same `isRealtimeEligible` over
-   * the same columns.
+   * The sweep adds no machinery of its own: the existing model — "the store and the DB are the
+   * authority; re-read them" — is preserved verbatim. Only the *trigger* changes: for HTTP it is the
+   * next request, for a socket it is this timer, and the predicate is the same `isRealtimeEligible`
+   * over the same columns. The `userId → sid` index now exists (LOGIN-SESSIONS-1), but the gateway
+   * never reads it: a revoked session's key is gone, and step 2 already closes its sockets.
    *
    * **Stated maximum exposure window after a revoking write commits: 35 seconds** — a 30 s period
-   * plus a 5 s execution budget. Applies uniformly to deletion, suspension, demotion, forced reset
-   * and logout. It also bounds how long a demoted SUPER_ADMIN stays in `ADMIN_SUPER_ROOM`
+   * plus a 5 s execution budget. Applies uniformly to deletion, suspension, demotion, forced reset,
+   * logout and session revocation (`DELETE /auth/system/sessions/*`,
+   * `POST /system-users/:id/revoke-sessions`). It also bounds how long a demoted SUPER_ADMIN stays in `ADMIN_SUPER_ROOM`
    * (`NOTIF-RT-1`).
    *
    * `.unref()` so Jest never hangs on an open handle and `app.close()` always resolves.
@@ -380,9 +381,10 @@ export class RealtimeGateway
   /**
    * Step 2 — dedupe by `sid` and re-read the SESSION STORE.
    *
-   * This step, and only this step, covers **explicit logout**: `POST /auth/system/logout` destroys
-   * the Redis key while leaving the `SystemUser` row perfectly valid, so a DB-only check would
-   * leave the socket alive. Idle-TTL expiry and an evicted key land here too.
+   * This step, and only this step, covers **explicit logout** and **session revocation**
+   * (`DELETE /auth/system/sessions/*`, `POST /system-users/:id/revoke-sessions`): each destroys the
+   * Redis key while leaving the `SystemUser` row perfectly valid, so a DB-only check would leave the
+   * socket alive. Idle-TTL expiry and an evicted key land here too.
    *
    * A store error DISCONNECTS. Fail closed — Redis being down must never mean "assume the socket is
    * still fine" — but with `STORE_UNAVAILABLE` so the client heals once Redis recovers.

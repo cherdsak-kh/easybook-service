@@ -22,9 +22,13 @@ import { resolveSessionUser } from '../session-user.resolver';
  *
  * D-9: the `SystemUser` is re-read from the database on **every** authenticated request, so a
  * deleted, suspended, or demoted user loses access on their next request rather than at session
- * expiry. That per-request indexed PK read is what makes session-revocation machinery — a
- * token-version column, a Redis `userId → sessionIds` index, a revocation list, a scan of the
- * session keyspace — unnecessary, and it is why none of it exists.
+ * expiry. That per-request indexed PK read REMAINS the mechanism for deletion, suspension and demotion.
+ *
+ * Since LOGIN-SESSIONS-1 (PO, 2026-10-04) a TARGETED revocation path also exists alongside it
+ * (`SessionTrackerService`, the `eb:user-sessions:<id>` index, `/auth/system/sessions` and
+ * `POST /system-users/:id/revoke-sessions`). This guard DELIBERATELY DOES NOT MAINTAIN that index: it must
+ * depend only on global providers (five modules use it without importing `AuthModule`), and the keys it
+ * destroys below are pruned from the index on the next read.
  *
  * `deletedAt` is **selected in order to be checked, then stripped**. A soft-deleted user is
  * normally still `isActive: true`, so checking `isActive` alone would authenticate a deleted

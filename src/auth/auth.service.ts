@@ -16,6 +16,7 @@ import {
 import { LoginResponseDto } from './dto/login-response.dto';
 import { loginIpEmailKey, normaliseEmail } from './login-throttle.key';
 import { PasswordService } from './password.service';
+import { LoginLogService } from './sessions/login-log.service';
 
 @Injectable()
 export class AuthService {
@@ -25,6 +26,7 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly password: PasswordService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
+    private readonly loginLog: LoginLogService,
   ) {}
 
   /**
@@ -38,11 +40,18 @@ export class AuthService {
    * The lookup deliberately does not filter `deletedAt: null`. Filtering would also produce a
    * uniform response, but it would collapse "deleted" into "not found" before the state is known,
    * making the timing guarantee an accident of query planning rather than a reviewable property.
+   *
+   * LOGIN-SESSIONS-1: when the email matched a row and the login is rejected (wrong password, suspended or
+   * deleted — indistinguishable on purpose), one `FAILED_BAD_PASSWORD` row is written FIRE-AND-FORGET
+   * (`void`, never awaited, and `recordFailure` never rejects), so no branch gains an `await` on the
+   * response path (R-8). An unknown email persists nothing (OQ-6). The 4th parameter is the sanitised
+   * User-Agent for that row.
    */
   async validateCredentials(
     email: string,
     password: string,
     ip: string,
+    userAgent?: string,
   ): Promise<LoginResponseDto> {
     const normalised = normaliseEmail(email);
 
@@ -52,11 +61,13 @@ export class AuthService {
 
     if (!user || user.deletedAt !== null || !user.isActive) {
       await this.password.verify(await this.password.dummyHash(), password);
+      if (user) void this.loginLog.recordFailure(user.id, ip, userAgent ?? '');
       this.logFailure(normalised, ip);
       throw new UnauthorizedException(INVALID_CREDENTIALS);
     }
 
     if (!(await this.password.verify(user.passwordHash, password))) {
+      void this.loginLog.recordFailure(user.id, ip, userAgent ?? '');
       this.logFailure(normalised, ip);
       throw new UnauthorizedException(INVALID_CREDENTIALS);
     }
@@ -108,7 +119,9 @@ export class AuthService {
    *
    * Clearing `mustChangePassword` needs no session machinery: `SessionGuard`'s per-request DB re-read
    * means it takes effect on the caller's very NEXT request, automatically (AC-B9). The session is
-   * deliberately NOT destroyed — no session-revocation machinery exists, or may be added.
+   * deliberately NOT destroyed, **and other sessions are NOT revoked**: changing a password does not sign
+   * other devices out (PO, prototype copy L4032). A user who wants that ends them from
+   * `/backend/profile/sessions` (`DELETE /auth/system/sessions/others`).
    *
    * No rate limit, considered and rejected: the only throttled route is `login`, via a bespoke guard,
    * and there is no `APP_GUARD` — a limiter here means new machinery. The threat it would blunt (a

@@ -1,10 +1,11 @@
 /**
  * Is anything SCHEDULED at all? — the ONE guard every cron registration in this app reads.
  *
- * ⚠️ THREE REGISTRATION SITES READ THIS ONE CONSTANT, and none may re-type the expression:
- * `AppModule` (`ScheduleModule.forRoot()`), `StorageModule` (`OrphanPhotoSweeperCron`) and
- * `BookingsModule` (`BookingExpiryCron`, #ISSUE-06). A copy in a fourth place is a copy that can
- * disagree.
+ * ⚠️ EVERY REGISTRATION SITE READS THIS ONE CONSTANT, and none may re-type the expression:
+ * `AppModule` (`ScheduleModule.forRoot()`), `StorageModule` (`OrphanPhotoSweeperCron`),
+ * `BookingsModule` (`BookingExpiryCron` #ISSUE-06 and `BookingReminderCron`), `NotificationsModule`
+ * (`VersionAnnouncer`) and `AuthModule` (`LoginLogPurgeCron`, LOGIN-SESSIONS-1). A copy in a further place is a copy that can
+ * disagree — add the new site to this list when one appears.
  *
  * ⚠️ THE GUARD IS ON REGISTRATION, NOT ON THE HANDLER BODY, and the difference is the whole point.
  * `test/e2e-app.ts` boots the REAL `AppModule`, so an unconditional `ScheduleModule.forRoot()` would

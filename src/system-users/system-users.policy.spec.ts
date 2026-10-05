@@ -6,6 +6,7 @@ import {
   CANNOT_CHANGE_OWN_ROLE,
   CANNOT_DELETE_OWN_ACCOUNT,
   CANNOT_MANAGE_OWN_CREATOR,
+  CANNOT_REVOKE_OWN_SESSIONS,
   INSUFFICIENT_ROLE,
   ONLY_SUPER_ADMIN_MAY_CHANGE_ROLE,
   ONLY_SUPER_ADMIN_MAY_DELETE,
@@ -14,6 +15,7 @@ import {
   canDelete,
   canPatch,
   canResetPassword,
+  canRevokeSessions,
   mayUseSystemReservedOptions,
 } from './system-users.policy';
 
@@ -483,4 +485,36 @@ describe('system-users.policy', () => {
       );
     });
   });
+});
+
+describe('canRevokeSessions (LOGIN-SESSIONS-1)', () => {
+  it('denies targeting yourself, with the self-revoke message the service maps to a 400 (OQ-5)', () => {
+    expect(
+      canRevokeSessions(actor(SystemRole.SUPER_ADMIN, 'me'), { id: 'me' }),
+    ).toEqual({ allowed: false, reason: CANNOT_REVOKE_OWN_SESSIONS });
+  });
+
+  it('allows a SUPER_ADMIN to force-sign-out another SUPER_ADMIN (OQ-5)', () => {
+    expect(
+      canRevokeSessions(actor(SystemRole.SUPER_ADMIN, 'a'), { id: 'peer' }),
+    ).toEqual({ allowed: true });
+  });
+
+  it('allows a SUPER_ADMIN to force-sign-out their OWN creator — no STAFF-CREATOR-1 here (OQ-5)', () => {
+    expect(
+      canRevokeSessions(actor(SystemRole.SUPER_ADMIN, 'a', 'creator'), {
+        id: 'creator',
+      }),
+    ).toEqual({ allowed: true });
+  });
+
+  it.each([SystemRole.ADMIN, SystemRole.VIEWER])(
+    'denies a %s (defence in depth behind @Roles)',
+    (role) => {
+      expect(canRevokeSessions(actor(role), { id: 'other' })).toEqual({
+        allowed: false,
+        reason: INSUFFICIENT_ROLE,
+      });
+    },
+  );
 });

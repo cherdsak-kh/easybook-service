@@ -31,6 +31,7 @@ import { io, type Socket } from 'socket.io-client';
 import request from 'supertest';
 import type { App } from 'supertest/types';
 import { PasswordService } from '../src/auth/password.service';
+import { SessionTrackerService } from '../src/auth/sessions/session-tracker.service';
 import { API_BASE_PATH } from '../src/common/api.constants';
 import { LineService } from '../src/line/line.service';
 import { PrismaService } from '../src/prisma/prisma.service';
@@ -737,6 +738,59 @@ describe('Realtime gateway (e2e)', () => {
       expect(payload).toEqual({ reason: SESSION_CLOSED_REASONS.revoked });
       expect(socket.connected).toBe(false);
       expect(elapsedMs).toBeLessThan(REVOCATION_BUDGET_MS);
+    });
+
+    /**
+     * AC-11 (LOGIN-SESSIONS-1) — revoking ONE session closes exactly that session's sockets.
+     *
+     * No gateway change backs this: `DELETE /auth/system/sessions/:handle` destroys `eb:sess:<sid>`, and
+     * the sweep's step 2 already closes any socket whose sid no longer resolves. ADMIN, not VIEWER:
+     * a VIEWER cannot hold an `/admin` socket at all. Device B is addressed by the handle derived from
+     * ITS sid (this suite's earlier tests leave other live ADMIN sessions in the user's index, so
+     * "the only other session" is not a safe assumption).
+     */
+    it('AC-11 — revoking session B by handle closes only that socket with session.closed { REVOKED }, and the other device stays connected', async () => {
+      const a = await login(ADMIN);
+      const b = await login(ADMIN);
+      const socketA = connectSocket({ cookie: a.cookie });
+      const socketB = connectSocket({ cookie: b.cookie });
+      await Promise.all([waitForConnect(socketA), waitForConnect(socketB)]);
+
+      const aCloses: unknown[] = [];
+      socketA.on(REALTIME_EVENTS.sessionClosed, (p: unknown) =>
+        aCloses.push(p),
+      );
+      const closed = nextEvent<{ reason: string }>(
+        socketB,
+        REALTIME_EVENTS.sessionClosed,
+      );
+      const disconnected = nextEvent<string>(socketB, 'disconnect');
+
+      const sidOfB = decodeURIComponent(b.cookie.split('=')[1])
+        .replace(/^s:/, '')
+        .replace(/\.[^.]*$/, '');
+      const handleOfB = app.get(SessionTrackerService).handleOf(sidOfB);
+
+      const startedAt = Date.now();
+      const res = await a.agent
+        .delete(url(`/auth/system/sessions/${handleOfB}`))
+        .set('x-csrf-token', a.token)
+        .expect(200);
+      expect(res.body).toEqual({ revoked: 1 });
+
+      const payload = await closed;
+      await disconnected;
+      const elapsedMs = Date.now() - startedAt;
+      revocationTimings.push(['session revocation (AC-11)', elapsedMs]);
+
+      expect(payload).toEqual({ reason: SESSION_CLOSED_REASONS.revoked });
+      expect(socketB.connected).toBe(false);
+      expect(elapsedMs).toBeLessThan(REVOCATION_BUDGET_MS);
+
+      // A's socket must survive several further sweep periods (500 ms each).
+      await settle(1_500);
+      expect(aCloses).toEqual([]);
+      expect(socketA.connected).toBe(true);
     });
 
     it('a healthy admin is never swept, and keeps receiving events across several sweep periods', async () => {

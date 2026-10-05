@@ -125,8 +125,9 @@ included). Re-providing `SystemUsersService` in `AuthModule` instead would mint 
 and is exactly the drift `PUBLIC_FIELDS` exists to prevent. `StorageModule` is imported by `AuthModule`
 and `VenuesModule`. **Scheduling is split in two:** the single `ScheduleModule.forRoot()` lives in
 `AppModule`. Each job is a provider in its own module: `OrphanPhotoSweeperCron` in `StorageModule`
-(daily 03:00 `venues/_new/` sweep) and `BookingExpiryCron` in `BookingsModule` (every minute,
-`PENDING` → `EXPIRED` at `firstStartAt`, #ISSUE-06). **All three registrations read one constant**,
+(daily 03:00 `venues/_new/` sweep), `BookingExpiryCron` in `BookingsModule` (every minute,
+`PENDING` → `EXPIRED` at `firstStartAt`, #ISSUE-06) and `LoginLogPurgeCron` in `AuthModule` (daily 03:30,
+90-day login-history purge, `LOGIN-SESSIONS-1`). **Every registration reads one constant**,
 `SCHEDULING_ENABLED` in `src/common/scheduling.constants.ts`. Under jest (`NODE_ENV=test` /
 `JEST_WORKER_ID` set) none of them is added to the module graph, because `test/e2e-app.ts` boots the
 real `AppModule` and a registered `CronJob` is an open handle in every e2e suite. Guarding inside the
@@ -309,9 +310,26 @@ two domains share **no session and no authentication surface**.
   values. `prisma.systemUser.findUnique({ where: { lineUserId: event.source.userId } })` type-checks
   and returns `null` forever. The FK is a notification address ("reachable at"), never an identity
   ("is"); no route may authenticate a `SystemUser` via their LINE account.
-- No session-revocation machinery exists, or may be added: `SessionGuard` re-reads the user from the
-  DB on every authenticated request, so deletion, suspension and demotion all take effect on the
-  victim's *next* request.
+- **Session revocation.** `SessionGuard` re-reads the user from the DB on every authenticated request,
+  and that is **still the mechanism** for deletion, suspension and demotion: they take effect on the
+  victim's *next* request. **Targeted revocation exists since `LOGIN-SESSIONS-1` (PO, 2026-10-04)**,
+  which reversed the earlier ban on any revocation path:
+  - `eb:user-sessions:<SystemUser.id>` is a **Set of raw sids** (`SessionTrackerService`, the **raw**
+    `REDIS_CLIENT` only, TTL 24 h + 60 s re-armed at login, pruned on read). The members are bearer
+    secrets: **never `KEYS`/`SCAN` that family, never log or return one**. It is disjoint from `eb:sess:`
+    on purpose (connect-redis scans `eb:sess:*`). **`SessionGuard` does not maintain it** (it may only use
+    global providers); the keys the guard destroys are pruned on the next read.
+  - The API never shows a sid: an **opaque handle** (HKDF-separated HMAC of `SESSION_SECRET`, 22 base64url
+    chars) stands in for it. `ip` and `userAgent` ride inside the session JSON — descriptive only, never an
+    authentication input.
+  - `AuthSessionsController` (`auth/system`): `GET sessions`, `DELETE sessions/others` (**declared above**
+    `DELETE sessions/:handle`), `DELETE sessions/:handle`, `GET login-history`. `SystemUsersController`:
+    `GET :id/sessions`, `POST :id/revoke-sessions` (SUPER_ADMIN; self → 400). Revoked devices get 401 on
+    their next request and `/admin` sockets close on the next revalidation sweep.
+  - `system_user_login_logs` keeps 90 days of sign-in history (`SUCCESS` / `FAILED_BAD_PASSWORD` for
+    recognised accounts only / `FORCE_REVOKED`); every read filters on the cutoff and `LoginLogPurgeCron`
+    deletes daily at 03:30. IP and User-Agent are personal data: ids only in log lines, never exported.
+  - Changing a password still does **not** sign other devices out.
 
 **Validation & docs**: global `ValidationPipe` uses `whitelist: true` + `forbidNonWhitelisted:
 true` — DTOs are the strict transport-boundary contract, unknown/extra fields are rejected. This is

@@ -200,6 +200,28 @@ export function canResetPassword(actor: Actor, target: Target): PolicyResult {
   return allow();
 }
 
+export const CANNOT_REVOKE_OWN_SESSIONS =
+  'You cannot force sign-out your own account. Use the sessions page to end your other devices.';
+
+/**
+ * `POST /system-users/:id/revoke-sessions` (LOGIN-SESSIONS-1). SUPER_ADMIN-only (enforced coarsely by
+ * `@Roles`); the one target-dependent rule is "not yourself" — and the CALLER maps that deny to a 400, not
+ * the 403 every other deny here becomes (OQ-5 ruling: the plan and the PO set it, unlike `canDelete`).
+ *
+ * SA → SA and SA → their own CREATOR are both ALLOWED (OQ-5, 2026-10-04). That is why there is deliberately
+ * NO `mayNotManageOwnCreator` here: a force sign-out changes no privilege and suspends nothing — the target
+ * signs straight back in with the same password.
+ */
+export function canRevokeSessions(
+  actor: Actor,
+  target: Pick<Target, 'id'>,
+): PolicyResult {
+  if (actor.id === target.id) return deny(CANNOT_REVOKE_OWN_SESSIONS);
+  // Unreachable: @Roles(SUPER_ADMIN) fires before the target is even loaded. Defence in depth.
+  if (actor.role !== SystemRole.SUPER_ADMIN) return deny(INSUFFICIENT_ROLE);
+  return allow();
+}
+
 /**
  * `GET /system/health` (Reports Phase 1, D-15/DV-3). May the caller see the NUMERIC telemetry —
  * DB latency, LINE quota, R2 probe latency — rather than the one-word SUMMARY every role gets?
