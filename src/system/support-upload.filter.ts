@@ -1,5 +1,6 @@
 import {
   ArgumentsHost,
+  BadRequestException,
   Catch,
   ExceptionFilter,
   HttpException,
@@ -17,7 +18,13 @@ import { SUPPORT_FILE_TOO_LARGE_MSG } from './support.constants';
  *
  * `FilesInterceptor` maps multer's `LIMIT_FILE_SIZE` to `PayloadTooLargeException` BEFORE any filter
  * runs (see the note on `MulterErrorTo400Filter`), so `PayloadTooLargeException` is what arrives here;
- * `MulterError` is kept in `@Catch` as defence in depth.
+ * a raw `MulterError` with `LIMIT_FILE_SIZE` is handled the same way as defence in depth.
+ *
+ * ⚠️ Nest's `transformException()` compares `error.message` with its own constants, so it misses
+ * anything multer renames or adds (multer 2.4.0: 'Unexpected file field', `LIMIT_FIELD_ARRAY_INDEX`,
+ * `INVALID_FIELD_NAME`, `STREAM_DESTROYED`) and the raw `MulterError` lands here. This filter
+ * therefore branches on `error.code` — never on message text: `LIMIT_FILE_SIZE` is the 413, and every
+ * OTHER `MulterError` (a part not named `files`, too many files, …) is a plain 400.
  *
  * ⚠️ The handler's own coded 413 (`SUPPORT_ATTACHMENTS_TOO_LARGE`) is a `PayloadTooLargeException` too
  * and is caught here as well, so an exception whose body already carries a `code` is written back
@@ -41,11 +48,20 @@ export class SupportUploadErrorFilter implements ExceptionFilter {
       }
     }
 
+    if (error instanceof MulterError && error.code !== 'LIMIT_FILE_SIZE') {
+      // The filename is attacker-controlled — log the code only, never the name.
+      this.logger.warn(
+        `Support upload rejected: malformed upload. code=${error.code}`,
+      );
+      response
+        .status(400)
+        .json(new BadRequestException(error.message).getResponse());
+      return;
+    }
+
     // The filename is attacker-controlled — log the code only, never the name.
     this.logger.warn(
-      `Support upload rejected: too large. code=${
-        error instanceof MulterError ? error.code : 'LIMIT_FILE_SIZE'
-      }`,
+      'Support upload rejected: too large. code=LIMIT_FILE_SIZE',
     );
     response.status(413).json({
       statusCode: 413,

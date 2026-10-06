@@ -71,11 +71,10 @@ describe('AvatarUploadService', () => {
     expect(AVATAR_MAX_BYTES).toBe(2 * 1024 * 1024);
   });
 
-  it('the multer limit is AVATAR_MAX_BYTES + 1, because busboy s limit is EXCLUSIVE', () => {
-    // busboy emits 'limit' when fileSize === limits.fileSize, so handing it 2 MiB would reject a
-    // file of exactly 2 MiB and make the real ceiling 2 MiB - 1 — contradicting the error message
-    // and the client-side pre-check. Pinned so nobody "tidies" the +1 away.
-    expect(AVATAR_MULTER_SIZE_LIMIT).toBe(AVATAR_MAX_BYTES + 1);
+  it('the multer limit is AVATAR_MAX_BYTES, because multer >= 2.4.0 adds busboy s +1 itself', () => {
+    // multer >= 2.4.0 hands busboy `limits.fileSize + 1`, so the value we pass is the inclusive max.
+    // A further +1 here would make the real ceiling 2 MiB + 1. Pinned so nobody re-adds it.
+    expect(AVATAR_MULTER_SIZE_LIMIT).toBe(AVATAR_MAX_BYTES);
   });
 
   // ───────────────────────── validation (AC-B13) ─────────────────────────

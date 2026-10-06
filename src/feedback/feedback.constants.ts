@@ -146,14 +146,14 @@ export const isFeedbackPhotoType = (
 export const FEEDBACK_PHOTO_MAX_BYTES = 5 * 1024 * 1024;
 
 /**
- * What multer is actually handed: `FEEDBACK_PHOTO_MAX_BYTES + 1`.
+ * What multer is handed: `FEEDBACK_PHOTO_MAX_BYTES`, the INCLUSIVE maximum.
  *
- * ⚠️ NOT A FUDGE — busboy's `limits.fileSize` is EXCLUSIVE (it emits `'limit'` when the byte count
- * `===` the limit), so passing 5 MiB would reject a file of exactly 5 MiB and make the real ceiling
- * 5 MiB − 1, contradicting the message below and the client's pre-check. The trap is in busboy, not
- * in the avatar or venue code, which is why it repeats here.
+ * multer >= 2.4.0 adds the `+ 1` busboy's exclusive limit needs internally, so a file of exactly
+ * 5 MiB is accepted and 5 MiB + 1 is rejected. Do NOT add `+ 1` here (that was right for multer
+ * 2.2.0): it would make the real ceiling 5 MiB + 1 and contradict the message below and the
+ * client's pre-check. See `AVATAR_MULTER_SIZE_LIMIT`.
  */
-export const FEEDBACK_PHOTO_MULTER_SIZE_LIMIT = FEEDBACK_PHOTO_MAX_BYTES + 1;
+export const FEEDBACK_PHOTO_MULTER_SIZE_LIMIT = FEEDBACK_PHOTO_MAX_BYTES;
 
 export const FEEDBACK_PHOTO_REQUIRED =
   'A photo file is required (form field "file").';

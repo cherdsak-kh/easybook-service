@@ -13,18 +13,16 @@ import type { AuthenticatedSystemUser } from './auth.types';
 export const AVATAR_MAX_BYTES = 2 * 1024 * 1024;
 
 /**
- * What we actually hand multer: `AVATAR_MAX_BYTES + 1`.
+ * What we hand multer: `AVATAR_MAX_BYTES`, the INCLUSIVE maximum.
  *
- * NOT a fudge — busboy's limit is EXCLUSIVE. It emits `'limit'` when the byte count `===`
- * `limits.fileSize` (`busboy/lib/types/multipart.js`: `if (fileSize === fileSizeLimit) … emit('limit')`),
- * so passing 2 MiB would reject a file of exactly 2 MiB and make the real ceiling 2 MiB − 1. That
- * would contradict our own `AVATAR_TOO_LARGE` message ("2 MB or smaller") and the client-side
- * pre-check (`<= 2 MB`), which would pass a 2 MiB file straight into a server 400.
- *
- * With +1: exactly 2 MiB is accepted, 2 MiB + 1 aborts the stream and becomes a 400 (AC-B13). The
- * process still never buffers more than ~2 MiB + 1 byte.
+ * busboy's own `limits.fileSize` is exclusive (it emits `'limit'` when the byte count `===` the
+ * limit), but multer >= 2.4.0 adds the `+ 1` for busboy internally (`lib/make-middleware.js`). So the
+ * value passed here is the inclusive max: a file of exactly 2 MiB is accepted and 2 MiB + 1 aborts the
+ * stream and becomes a 400 (AC-B13). Do NOT add `+ 1` here — that was right for multer 2.2.0 and
+ * would now make the real ceiling 2 MiB + 1, silently contradicting `AVATAR_TOO_LARGE` and the
+ * client-side pre-check (`<= 2 MB`). The constant stays so the interceptor's limit is named in one place.
  */
-export const AVATAR_MULTER_SIZE_LIMIT = AVATAR_MAX_BYTES + 1;
+export const AVATAR_MULTER_SIZE_LIMIT = AVATAR_MAX_BYTES;
 
 /**
  * Orchestrates `POST /auth/system/me/avatar`: validate → put → DB write → best-effort cleanup.

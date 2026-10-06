@@ -16,7 +16,7 @@ import {
  *
  * ── WHY THIS IS A NEW ROUTE RATHER THAN `POST /venues/photos` ──
  * That one is `@Roles(SUPER_ADMIN, ADMIN)` behind `SessionGuard` and is unreachable with a LINE ID
- * token. Everything else about it is copied deliberately: memory storage, the exclusive multer
+ * token. Everything else about it is copied deliberately: memory storage, the inclusive multer
  * limit, the 400-not-413 filter, and the magic-byte sniff below.
  *
  * ── WHAT IS DELIBERATELY MISSING ──

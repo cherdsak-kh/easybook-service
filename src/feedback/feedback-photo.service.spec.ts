@@ -73,12 +73,12 @@ describe('FeedbackPhotoService', () => {
     service = new FeedbackPhotoService(storage, prisma);
   });
 
-  it('the multer limit is FEEDBACK_PHOTO_MAX_BYTES + 1, because busboy’s limit is EXCLUSIVE', () => {
-    // busboy emits 'limit' when the byte count === limits.fileSize, so handing it 5 MiB would
-    // reject a file of exactly 5 MiB and make the real ceiling 5 MiB − 1 — contradicting both the
-    // error message and the client's pre-check (AC-20). Pinned so nobody "tidies" the +1 away.
+  it('the multer limit is FEEDBACK_PHOTO_MAX_BYTES, because multer >= 2.4.0 adds busboy’s +1 itself', () => {
+    // multer >= 2.4.0 hands busboy `limits.fileSize + 1`, so the value we pass is the inclusive max.
+    // A further +1 here would make the real ceiling 5 MiB + 1, contradicting the error message and
+    // the client's pre-check (AC-20). Pinned so nobody re-adds it.
     expect(FEEDBACK_PHOTO_MAX_BYTES).toBe(5 * 1024 * 1024);
-    expect(FEEDBACK_PHOTO_MULTER_SIZE_LIMIT).toBe(FEEDBACK_PHOTO_MAX_BYTES + 1);
+    expect(FEEDBACK_PHOTO_MULTER_SIZE_LIMIT).toBe(FEEDBACK_PHOTO_MAX_BYTES);
   });
 
   // ───────────────────────── who (D-A6) ─────────────────────────
