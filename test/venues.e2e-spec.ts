@@ -657,9 +657,9 @@ describe('Venues (e2e)', () => {
     /**
      * AC-S9 — 400, not the 413 the stack produces by default.
      *
-     * ⚠️ `MAX + 1` IS THE TRIPWIRE, and `MAX` EXACTLY MUST STILL PASS. busboy's limit is exclusive,
-     * so the interceptor is handed `MAX + 1`; getting that wrong makes the real ceiling `MAX - 1`
-     * and nothing fails loudly. Both halves are asserted here for that reason.
+     * ⚠️ `MAX + 1` IS THE TRIPWIRE, and `MAX` EXACTLY MUST STILL PASS. multer >= 2.4.0 adds busboy's
+     * exclusive `+ 1` itself, so the interceptor is handed `MAX`; a stray extra `+ 1` makes the real
+     * ceiling `MAX + 1` and nothing fails loudly. Both halves are asserted here for that reason.
      */
     it('AC-S9 · exactly 5 MB is accepted and 5 MB + 1 is 400 (not 413)', async () => {
       const s = await login(ADMIN);

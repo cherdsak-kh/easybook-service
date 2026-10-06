@@ -24,8 +24,11 @@ export const SUPPORT_DESCRIPTION_MAX = 1000;
 export const SUPPORT_DIAGNOSTICS_MAX = 2000;
 export const SUPPORT_FILES_MAX = 3;
 export const SUPPORT_FILE_MAX_BYTES = 5 * 1024 * 1024;
-/** busboy's `limits.fileSize` is EXCLUSIVE (feedback precedent), so hand the interceptor max + 1. */
-export const SUPPORT_FILE_MULTER_SIZE_LIMIT = SUPPORT_FILE_MAX_BYTES + 1;
+/**
+ * What multer is handed: the INCLUSIVE maximum. multer >= 2.4.0 adds busboy's `+ 1` internally, so a
+ * file of exactly 5 MiB is accepted and 5 MiB + 1 is rejected. Do NOT add `+ 1` here.
+ */
+export const SUPPORT_FILE_MULTER_SIZE_LIMIT = SUPPORT_FILE_MAX_BYTES;
 /** Total of all file bytes: 10 MiB (Discord's unboosted default) minus 0.5 MiB for JSON + framing. */
 export const SUPPORT_DISCORD_UPLOAD_BUDGET_BYTES = 9.5 * 1024 * 1024;
 export const SUPPORT_RELAY_TIMEOUT_MS = 10_000;

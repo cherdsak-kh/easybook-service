@@ -363,8 +363,8 @@ export class AuthSystemController {
   @UseInterceptors(
     FileInterceptor('file', {
       storage: memoryStorage(),
-      // AVATAR_MULTER_SIZE_LIMIT is AVATAR_MAX_BYTES + 1 — busboy's limit is exclusive. See the
-      // constant's doc-comment; passing 2 MiB here would reject a file of exactly 2 MiB.
+      // AVATAR_MULTER_SIZE_LIMIT is AVATAR_MAX_BYTES, the inclusive max: multer >= 2.4.0 adds the
+      // `+ 1` busboy needs itself. See the constant's doc-comment; do not add another `+ 1` here.
       limits: { fileSize: AVATAR_MULTER_SIZE_LIMIT, files: 1 },
     }),
   )

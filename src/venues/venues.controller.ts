@@ -120,8 +120,8 @@ export class VenuesController {
   @UseInterceptors(
     FileInterceptor('file', {
       storage: memoryStorage(),
-      // `VENUE_PHOTO_MAX_BYTES + 1` — busboy's limit is EXCLUSIVE. See the constant's doc comment;
-      // passing 5 MiB here would reject a file of exactly 5 MiB (AC-S9).
+      // `VENUE_PHOTO_MAX_BYTES`, the inclusive max: multer >= 2.4.0 adds the `+ 1` busboy needs
+      // itself. See the constant's doc comment; do not add another `+ 1` here (AC-S9).
       limits: { fileSize: VENUE_PHOTO_MULTER_SIZE_LIMIT, files: 1 },
     }),
   )

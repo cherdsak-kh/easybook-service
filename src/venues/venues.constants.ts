@@ -55,14 +55,14 @@ export const VENUE_PHOTOS_MAX = 10;
 export const VENUE_PHOTO_MAX_BYTES = 5 * 1024 * 1024;
 
 /**
- * What multer is actually handed: `VENUE_PHOTO_MAX_BYTES + 1`.
+ * What multer is handed: `VENUE_PHOTO_MAX_BYTES`, the INCLUSIVE maximum.
  *
- * ⚠️ NOT A FUDGE — busboy's `limits.fileSize` is EXCLUSIVE (it emits `'limit'` when the byte count
- * `===` the limit), so passing 5 MiB would reject a file of exactly 5 MiB and make the real ceiling
- * 5 MiB − 1. That would contradict the message below and the client-side pre-check. This is the
- * avatar path's trap, repeated here because the trap is in busboy, not in the avatar code.
+ * multer >= 2.4.0 adds the `+ 1` busboy's exclusive limit needs internally, so a file of exactly
+ * 5 MiB is accepted and 5 MiB + 1 is rejected. Do NOT add `+ 1` here (that was right for multer
+ * 2.2.0): it would make the real ceiling 5 MiB + 1 and contradict the message below and the
+ * client-side pre-check. See `AVATAR_MULTER_SIZE_LIMIT`.
  */
-export const VENUE_PHOTO_MULTER_SIZE_LIMIT = VENUE_PHOTO_MAX_BYTES + 1;
+export const VENUE_PHOTO_MULTER_SIZE_LIMIT = VENUE_PHOTO_MAX_BYTES;
 
 export const VENUE_PHOTO_REQUIRED =
   'A photo file is required (form field "file").';

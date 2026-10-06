@@ -294,8 +294,10 @@ two domains share **no session and no authentication surface**.
   object, guarded by "the old URL must start with `${R2_PUBLIC_BASE_URL}/avatars/`" (an admin may have
   set an arbitrary external URL; never derive a delete target from a foreign URL). Two traps:
   multer's size limit surfaces as **413**, but AC-B13 demands **400** — `MulterErrorTo400Filter` is
-  what makes that true; and busboy's `limits.fileSize` is **exclusive**, so the interceptor is handed
-  `AVATAR_MAX_BYTES + 1`. Avatars are a **second data store of PII** and are in `AUTH-ERASURE`'s scope.
+  what makes that true; and busboy's `limits.fileSize` is exclusive, but **multer >= 2.4.0 adds the `+ 1` itself**, so the
+  interceptor is handed the inclusive `AVATAR_MAX_BYTES` (a stray extra `+ 1` makes the ceiling MAX + 1).
+  Both upload filters branch on `MulterError.code`, never on `error.message` — Nest's own
+  `transformException` switches on message text and silently misses codes/messages multer renames. Avatars are a **second data store of PII** and are in `AUTH-ERASURE`'s scope.
 - **R2 environment (exactly five vars):** `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
   `R2_BUCKET`, `R2_PUBLIC_BASE_URL`. There is deliberately **no `R2_REGION`** (R2 accepts only `auto`
   — a code constant) and **no `R2_ENDPOINT`** (derived: `https://<account id>.r2.cloudflarestorage.com`).
